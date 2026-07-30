@@ -1,0 +1,8 @@
+* text=auto
+*.json text eol=lf
+*.pbxproj text eol=lf
+*.plist text eol=lf
+*.swift text eol=lf
+*.xcscheme text eol=lf
+*.yml text eol=lf
+

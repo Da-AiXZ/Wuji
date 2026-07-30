@@ -1,0 +1,63 @@
+name: S0 Apple Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Unsigned build and unit tests
+    runs-on: macos-15
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out exact candidate
+        uses: actions/checkout@v4
+
+      - name: Verify Apple toolchain and exact head
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Build unsigned Wuji app
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          xcodebuild \
+            -project Wuji.xcodeproj \
+            -scheme Wuji \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "generic/platform=iOS Simulator" \
+            clean build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: Select an available iPad simulator
+        id: simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          simulator_id="$({ xcrun simctl list devices available -j; } | /usr/bin/python3 -c 'import json, sys; groups = json.load(sys.stdin)["devices"]; devices = [device for group in groups.values() for device in group if device.get("isAvailable") and "iPad" in device.get("name", "")]; print(devices[0]["udid"] if devices else "")')"
+          test -n "$simulator_id"
+          echo "id=$simulator_id" >> "$GITHUB_OUTPUT"
+
+      - name: Run S0 unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          xcodebuild \
+            -project Wuji.xcodeproj \
+            -scheme Wuji \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.id }}" \
+            test \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
