@@ -39,8 +39,19 @@ final class ISHExecutor: ISHSelfTestExecuting, @unchecked Sendable {
         }
 
         return await Task.detached(priority: .userInitiated) {
+            let nativeTestCase: WujiISHSelfTestCase
+            switch testCase {
+            case .success:
+                nativeTestCase = WUJI_ISH_CASE_SUCCESS
+            case .nonzero:
+                nativeTestCase = WUJI_ISH_CASE_NONZERO
+            case .truncation:
+                nativeTestCase = WUJI_ISH_CASE_TRUNCATION
+            case .cancellation:
+                nativeTestCase = WUJI_ISH_CASE_CANCELLATION
+            }
             guard let rawResult = wuji_ish_run_self_test(
-                WujiISHSelfTestCase(rawValue: testCase.rawValue),
+                nativeTestCase,
                 numericCast(max(0, outputLimit))
             ) else {
                 return self.unknownObservation("结果分配失败")
