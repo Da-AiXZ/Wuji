@@ -95,6 +95,53 @@ jobs:
           printf 'case\tmethod\texit_code\tduration_seconds\tstarted_utc\tended_utc\n' \
             > "$evidence_root/results.tsv"
 
+          contract_dir="$evidence_root/contract"
+          contract_bundle="$contract_dir/contract.xcresult"
+          mkdir -p "$contract_dir"
+          contract_started_epoch="$(date +%s)"
+          contract_started_utc="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          set +e
+          WUJI_ISH_BUILD_DIR="$RUNNER_TEMP/wuji-ish" xcodebuild \
+            -project Wuji.xcodeproj \
+            -scheme Wuji \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.id }}" \
+            -resultBundlePath "$contract_bundle" \
+            -only-testing:"WujiTests/WujiExecutorContractTests" \
+            test \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee "$contract_dir/xcodebuild.log"
+          contract_status="${PIPESTATUS[0]}"
+          set -e
+          contract_ended_epoch="$(date +%s)"
+          contract_ended_utc="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          contract_duration="$((contract_ended_epoch - contract_started_epoch))"
+          printf '%s\n' "$contract_status" > "$contract_dir/exit-code.txt"
+          printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            'contract' 'WujiExecutorContractTests' "$contract_status" "$contract_duration" \
+            "$contract_started_utc" "$contract_ended_utc" \
+            >> "$evidence_root/results.tsv"
+          if [[ -d "$contract_bundle" ]]; then
+            set +e
+            xcrun xcresulttool get test-results summary \
+              --path "$contract_bundle" --format json \
+              > "$contract_dir/xcresult-summary.json" \
+              2> "$contract_dir/xcresult-summary.stderr"
+            printf '%s\n' "$?" > "$contract_dir/xcresult-summary-exit-code.txt"
+            xcrun xcresulttool get test-results tests \
+              --path "$contract_bundle" --format json \
+              > "$contract_dir/xcresult-tests.json" \
+              2> "$contract_dir/xcresult-tests.stderr"
+            printf '%s\n' "$?" > "$contract_dir/xcresult-tests-exit-code.txt"
+            set -e
+          fi
+          if [[ "$contract_status" -ne 0 ]]; then
+            overall_status=1
+          fi
+
           for entry in "${guest_cases[@]}"; do
             case_name="${entry%%:*}"
             method="${entry#*:}"
@@ -210,8 +257,8 @@ jobs:
           fi
 
           {
-            echo 'Scope: four isolated Wuji S1 guest tests only.'
-            echo 'Contains: per-test xcodebuild log, exit code, timing, xcresult, relevant simulator log, and new Wuji/xctest crash reports.'
+            echo 'Scope: Wuji S1 contract suite plus four isolated guest tests only.'
+            echo 'Contains: contract and per-guest xcodebuild logs, exit codes, timings, xcresults, relevant simulator logs, and new Wuji/xctest crash reports.'
             echo "Text absolute-path findings: $absolute_path_count."
             echo 'Expected absolute paths are ephemeral GitHub runner, Xcode, DerivedData, CoreSimulator, and result-bundle paths required by original Apple diagnostics.'
             echo 'Text evidence passed the credential/private-key scan. Raw xcresult is structured Apple evidence and cannot be redacted without changing the original diagnostic bundle.'

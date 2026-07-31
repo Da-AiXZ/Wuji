@@ -18,6 +18,9 @@
 #include "kernel/task.h"
 #include "tools/fakefs.h"
 
+extern const char *uname_hostname_override;
+static const char wuji_hostname_override[] = "wuji";
+
 struct bounded_stream {
     int fd;
     char *bytes;
@@ -73,6 +76,8 @@ int wuji_ish_prepare(const char *archive_path,
         pthread_mutex_unlock(&g_boot_lock);
         return 0;
     }
+
+    uname_hostname_override = wuji_hostname_override;
 
     char metadata_path[4096];
     snprintf(metadata_path, sizeof(metadata_path), "%s/meta.db", root_path);
