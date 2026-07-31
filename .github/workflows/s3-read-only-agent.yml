@@ -2,6 +2,7 @@ name: S3 Read-Only Agent
 
 on:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -257,6 +258,59 @@ jobs:
           provider_attempts = read_jsonl("provider-attempts.jsonl")
 
           if summary["result_category"] != "completed":
+              diagnostic_keys = {
+                  "reason", "toolCallCount", "finishReasonPresent", "finishReasonByteCount",
+                  "assistantContentPresent", "assistantContentByteCount",
+                  "envelopeTypeIsFunction", "toolCallIDPresent", "toolCallIDByteCount",
+                  "toolNamePresent", "toolNameByteCount", "argumentsPresent", "argumentsByteCount",
+              }
+              allowed_reasons = {
+                  "no_tool_calls_with_invalid_finish_or_content",
+                  "tool_call_count",
+                  "envelope_type",
+                  "id_missing_or_invalid",
+                  "tool_name_missing_or_invalid",
+                  "tool_name_not_allowed",
+                  "arguments_missing",
+                  "arguments_too_large",
+                  "assistant_content_too_large",
+              }
+              diagnostics = [
+                  (item, item["toolExchangeDiagnostic"])
+                  for item in provider_attempts
+                  if item.get("toolExchangeDiagnostic") is not None
+              ]
+              if len(diagnostics) > 1:
+                  raise SystemExit("tool exchange diagnostic identity is not unique")
+              diagnostic_item, diagnostic = diagnostics[0] if diagnostics else (None, None)
+              if diagnostic is not None:
+                  if set(diagnostic) != diagnostic_keys:
+                      raise SystemExit("unexpected tool exchange diagnostic shape")
+                  if diagnostic["reason"] not in allowed_reasons:
+                      raise SystemExit("unexpected tool exchange diagnostic reason")
+                  if diagnostic["reason"] == "tool_name_not_allowed":
+                      if diagnostic_item.get("phase") != "succeeded" or diagnostic_item.get("resultCategory") != "tool_call":
+                          raise SystemExit("tool name diagnostic context malformed")
+                  elif diagnostic_item.get("phase") != "failed" or diagnostic_item.get("resultCategory") != "invalid_tool_exchange":
+                      raise SystemExit("tool exchange rejection context malformed")
+                  for key in [
+                      "finishReasonPresent", "assistantContentPresent", "envelopeTypeIsFunction",
+                      "toolCallIDPresent", "toolNamePresent", "argumentsPresent",
+                  ]:
+                      if not isinstance(diagnostic[key], bool):
+                          raise SystemExit("tool exchange diagnostic boolean malformed")
+                  bounds = {
+                      "toolCallCount": 2,
+                      "finishReasonByteCount": 65,
+                      "assistantContentByteCount": 8193,
+                      "toolCallIDByteCount": 129,
+                      "toolNameByteCount": 65,
+                      "argumentsByteCount": 1025,
+                  }
+                  for key, maximum in bounds.items():
+                      value = diagnostic[key]
+                      if isinstance(value, bool) or not isinstance(value, int) or not (0 <= value <= maximum):
+                          raise SystemExit("tool exchange diagnostic count malformed")
               bounded_failure = {
                   "result_category": summary["result_category"],
                   "provider_intent_count": sum(
@@ -277,6 +331,7 @@ jobs:
                       for item in provider_attempts
                       if item.get("phase") != "intent_recorded"
                   ],
+                  "tool_exchange_diagnostic": diagnostic,
               }
               print("S3_REAL_LOOP_FAILURE_SUMMARY=" + json.dumps(
                   bounded_failure,
@@ -388,7 +443,11 @@ jobs:
           import json
           import sys
           jobs = json.load(open(sys.argv[1], encoding="utf-8"))["jobs"]
-          matches = [job["id"] for job in jobs if job["name"] == "Apple build, S3 tests, real iSH, and real loop"]
+          matches = [
+              job["id"]
+              for job in jobs
+              if job["name"].endswith("Apple build, S3 tests, real iSH, and real loop")
+          ]
           if len(matches) != 1:
               raise SystemExit("S3 validation job identity is not unique")
           print(matches[0])

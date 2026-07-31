@@ -1,0 +1,13 @@
+name: S3-ROUTE-DIAGNOSTIC-1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  diagnostic:
+    uses: ./.github/workflows/s3-read-only-agent.yml
+    secrets: inherit

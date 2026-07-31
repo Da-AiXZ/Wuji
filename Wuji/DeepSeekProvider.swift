@@ -548,30 +548,14 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
         }
 
         let choice = decoded.choices[0]
-        if !choice.message.toolCalls.isEmpty {
-            guard choice.message.toolCalls.count == ProviderLimits.maximumToolCalls,
-                  let envelope = choice.message.toolCalls.first,
-                  envelope.type == "function",
-                  validIdentifier(envelope.id, maximumBytes: ProviderLimits.maximumToolCallIDBytes),
-                  validToolName(envelope.function.name),
-                  !envelope.function.arguments.isEmpty,
-                  envelope.function.arguments.utf8.count <= ProviderLimits.maximumToolArgumentsBytes,
-                  choice.message.content.map({ $0.utf8.count <= ProviderLimits.maximumOutputBytes }) ?? true else {
-                return await finishInferenceFailure(
-                    .invalidToolExchange,
-                    category: .invalidToolExchange,
-                    requestID: requestID,
-                    attemptID: attemptID
-                )
-            }
-            let call = ProviderTurnToolCall(
-                id: envelope.id,
-                name: envelope.function.name,
-                arguments: envelope.function.arguments
-            )
+        switch classifyToolExchange(
+            choice,
+            allowedToolNames: Set(request.tools.map(\.name))
+        ) {
+        case let .toolCall(call, assistantContent, diagnostic):
             let assistant = ProviderTurnMessage(
                 role: .assistant,
-                content: choice.message.content,
+                content: assistantContent,
                 toolCalls: [call]
             )
             let argumentData = Data(call.arguments.utf8)
@@ -579,35 +563,132 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
                 requestID: requestID,
                 attemptID: attemptID,
                 category: .toolCall,
-                data: argumentData
+                data: argumentData,
+                toolExchangeDiagnostic: diagnostic
             ) else {
                 return .failure(.evidenceWriteFailed)
             }
             return .decision(.toolCall(assistant, call))
-        }
-
-        guard choice.finishReason == "stop",
-              let content = choice.message.content,
-              !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              content.utf8.count <= ProviderLimits.maximumOutputBytes else {
+        case let .finish(content):
+            let assistant = ProviderTurnMessage(role: .assistant, content: content)
+            let contentData = Data(content.utf8)
+            guard await recordInferenceSuccess(
+                requestID: requestID,
+                attemptID: attemptID,
+                category: .finish,
+                data: contentData
+            ) else {
+                return .failure(.evidenceWriteFailed)
+            }
+            return .decision(.finish(assistant))
+        case let .rejected(diagnostic):
             return await finishInferenceFailure(
                 .invalidToolExchange,
                 category: .invalidToolExchange,
                 requestID: requestID,
-                attemptID: attemptID
+                attemptID: attemptID,
+                toolExchangeDiagnostic: diagnostic
             )
         }
-        let assistant = ProviderTurnMessage(role: .assistant, content: content)
-        let contentData = Data(content.utf8)
-        guard await recordInferenceSuccess(
-            requestID: requestID,
-            attemptID: attemptID,
-            category: .finish,
-            data: contentData
-        ) else {
-            return .failure(.evidenceWriteFailed)
+    }
+
+    private func classifyToolExchange(
+        _ choice: OpenAIChatChoice,
+        allowedToolNames: Set<String>
+    ) -> OpenAIToolExchangeClassification {
+        let calls = choice.message.toolCalls
+        guard !calls.isEmpty else {
+            guard choice.finishReason == "stop",
+                  let content = choice.message.content,
+                  !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  content.utf8.count <= ProviderLimits.maximumOutputBytes else {
+                return .rejected(diagnostic(
+                    .noToolCallsWithInvalidFinishOrContent,
+                    choice: choice,
+                    envelope: nil
+                ))
+            }
+            return .finish(content)
         }
-        return .decision(.finish(assistant))
+
+        guard calls.count == ProviderLimits.maximumToolCalls,
+              let envelope = calls.first else {
+            return .rejected(diagnostic(.toolCallCount, choice: choice, envelope: calls.first))
+        }
+        guard envelope.type == "function" else {
+            return .rejected(diagnostic(.envelopeType, choice: choice, envelope: envelope))
+        }
+        guard let id = envelope.id,
+              validIdentifier(id, maximumBytes: ProviderLimits.maximumToolCallIDBytes) else {
+            return .rejected(diagnostic(.idMissingOrInvalid, choice: choice, envelope: envelope))
+        }
+        guard let name = envelope.function?.name,
+              validToolName(name) else {
+            return .rejected(diagnostic(.toolNameMissingOrInvalid, choice: choice, envelope: envelope))
+        }
+        guard let arguments = envelope.function?.arguments,
+              !arguments.isEmpty else {
+            return .rejected(diagnostic(.argumentsMissing, choice: choice, envelope: envelope))
+        }
+        guard arguments.utf8.count <= ProviderLimits.maximumToolArgumentsBytes else {
+            return .rejected(diagnostic(.argumentsTooLarge, choice: choice, envelope: envelope))
+        }
+        guard choice.message.content.map({ $0.utf8.count <= ProviderLimits.maximumOutputBytes }) ?? true else {
+            return .rejected(diagnostic(.assistantContentTooLarge, choice: choice, envelope: envelope))
+        }
+        let compatibilityDiagnostic = allowedToolNames.contains(name)
+            ? nil
+            : diagnostic(.toolNameNotAllowed, choice: choice, envelope: envelope)
+        return .toolCall(
+            ProviderTurnToolCall(id: id, name: name, arguments: arguments),
+            assistantContent: choice.message.content,
+            diagnostic: compatibilityDiagnostic
+        )
+    }
+
+    private func diagnostic(
+        _ reason: ProviderToolExchangeRejectionReason,
+        choice: OpenAIChatChoice,
+        envelope: OpenAIResponseToolCallEnvelope?
+    ) -> ProviderToolExchangeDiagnostic {
+        let function = envelope?.function
+        return ProviderToolExchangeDiagnostic(
+            reason: reason,
+            toolCallCount: capped(
+                choice.message.toolCalls.count,
+                maximum: ProviderLimits.maximumToolCalls
+            ),
+            finishReasonPresent: choice.finishReason != nil,
+            finishReasonByteCount: capped(
+                choice.finishReason?.utf8.count ?? 0,
+                maximum: ProviderLimits.maximumToolNameBytes
+            ),
+            assistantContentPresent: choice.message.content != nil,
+            assistantContentByteCount: capped(
+                choice.message.content?.utf8.count ?? 0,
+                maximum: ProviderLimits.maximumOutputBytes
+            ),
+            envelopeTypeIsFunction: envelope?.type == "function",
+            toolCallIDPresent: envelope?.id != nil,
+            toolCallIDByteCount: capped(
+                envelope?.id?.utf8.count ?? 0,
+                maximum: ProviderLimits.maximumToolCallIDBytes
+            ),
+            toolNamePresent: function?.name != nil,
+            toolNameByteCount: capped(
+                function?.name?.utf8.count ?? 0,
+                maximum: ProviderLimits.maximumToolNameBytes
+            ),
+            argumentsPresent: function?.arguments != nil,
+            argumentsByteCount: capped(
+                function?.arguments?.utf8.count ?? 0,
+                maximum: ProviderLimits.maximumToolArgumentsBytes
+            )
+        )
+    }
+
+    private func capped(_ value: Int, maximum: Int) -> Int {
+        min(value, maximum + 1)
     }
 
     private func validate(_ request: ProviderInferenceRequest) -> Bool {
@@ -685,14 +766,16 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
         _ failure: ProviderFailure,
         category: ProviderAttemptResultCategory,
         requestID: UUID,
-        attemptID: UUID
+        attemptID: UUID,
+        toolExchangeDiagnostic: ProviderToolExchangeDiagnostic? = nil
     ) async -> ProviderInferenceOutcome {
         do {
             try await attemptStore.record(evidence(
                 requestID: requestID,
                 attemptID: attemptID,
                 phase: .failed,
-                resultCategory: category
+                resultCategory: category,
+                toolExchangeDiagnostic: toolExchangeDiagnostic
             ))
             return .failure(failure)
         } catch {
@@ -704,7 +787,8 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
         requestID: UUID,
         attemptID: UUID,
         category: ProviderAttemptResultCategory,
-        data: Data
+        data: Data,
+        toolExchangeDiagnostic: ProviderToolExchangeDiagnostic? = nil
     ) async -> Bool {
         do {
             try await attemptStore.record(evidence(
@@ -713,7 +797,8 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
                 phase: .succeeded,
                 resultCategory: category,
                 responseByteCount: data.count,
-                responseSHA256: ProviderDigest.sha256Hex(data)
+                responseSHA256: ProviderDigest.sha256Hex(data),
+                toolExchangeDiagnostic: toolExchangeDiagnostic
             ))
             return true
         } catch {
@@ -746,7 +831,8 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
         phase: ProviderAttemptPhase,
         resultCategory: ProviderAttemptResultCategory,
         responseByteCount: Int? = nil,
-        responseSHA256: String? = nil
+        responseSHA256: String? = nil,
+        toolExchangeDiagnostic: ProviderToolExchangeDiagnostic? = nil
     ) -> ProviderAttemptEvidence {
         ProviderAttemptEvidence(
             requestID: requestID,
@@ -757,7 +843,8 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
             phase: phase,
             resultCategory: resultCategory,
             responseByteCount: responseByteCount,
-            responseSHA256: responseSHA256
+            responseSHA256: responseSHA256,
+            toolExchangeDiagnostic: toolExchangeDiagnostic
         )
     }
 }
@@ -834,7 +921,7 @@ private struct OpenAIChatChoice: Decodable {
 private struct OpenAIChatResponseMessage: Decodable {
     let role: String
     let content: String?
-    let toolCalls: [OpenAIToolCallEnvelope]
+    let toolCalls: [OpenAIResponseToolCallEnvelope]
 
     enum CodingKeys: String, CodingKey {
         case role
@@ -846,7 +933,7 @@ private struct OpenAIChatResponseMessage: Decodable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         role = try container.decode(String.self, forKey: .role)
         content = try container.decodeIfPresent(String.self, forKey: .content)
-        toolCalls = try container.decodeIfPresent([OpenAIToolCallEnvelope].self, forKey: .toolCalls) ?? []
+        toolCalls = try container.decodeIfPresent([OpenAIResponseToolCallEnvelope].self, forKey: .toolCalls) ?? []
     }
 }
 
@@ -861,7 +948,28 @@ private struct OpenAIToolCallEnvelope: Codable {
     let function: OpenAIToolFunction
 }
 
+private struct OpenAIResponseToolCallEnvelope: Decodable {
+    let id: String?
+    let type: String?
+    let function: OpenAIResponseToolFunction?
+}
+
+private struct OpenAIResponseToolFunction: Decodable {
+    let name: String?
+    let arguments: String?
+}
+
 private struct OpenAIToolFunction: Codable {
     let name: String
     let arguments: String
+}
+
+private enum OpenAIToolExchangeClassification {
+    case toolCall(
+        ProviderTurnToolCall,
+        assistantContent: String?,
+        diagnostic: ProviderToolExchangeDiagnostic?
+    )
+    case finish(String)
+    case rejected(ProviderToolExchangeDiagnostic)
 }

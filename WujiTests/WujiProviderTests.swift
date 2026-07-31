@@ -9,6 +9,9 @@ import FoundationNetworking
 final class WujiProviderTests: XCTestCase {
     private let apiKey = "s2-test-key-never-persist"
     private let model = "deepseek-test"
+    private let diagnosticResponseText = "diagnostic-response-text-never-persist"
+    private let diagnosticID = "diagnostic-call-id-never-persist"
+    private let diagnosticArguments = "{\"path\":\"diagnostic-arguments-never-persist\"}"
 
     override func tearDown() {
         S2MockURLProtocol.handler = nil
@@ -259,6 +262,153 @@ final class WujiProviderTests: XCTestCase {
         XCTAssertFalse(durable.contains(Data(call.arguments.utf8)))
     }
 
+    func testDiagnosticReasonNoToolCallsWithInvalidFinishOrContent() async throws {
+        let diagnostic = try await assertRejectedToolExchange(
+            body: diagnosticResponseBody(toolCalls: [], finishReason: "length"),
+            reason: .noToolCallsWithInvalidFinishOrContent,
+            toolNameValue: ""
+        )
+        XCTAssertEqual(diagnostic.toolCallCount, 0)
+        XCTAssertTrue(diagnostic.assistantContentPresent)
+        XCTAssertEqual(diagnostic.assistantContentByteCount, diagnosticResponseText.utf8.count)
+    }
+
+    func testDiagnosticReasonToolCallCount() async throws {
+        let diagnostic = try await assertRejectedToolExchange(
+            body: diagnosticResponseBody(toolCalls: [diagnosticToolCall(), diagnosticToolCall()]),
+            reason: .toolCallCount,
+            toolNameValue: "list"
+        )
+        XCTAssertEqual(diagnostic.toolCallCount, ProviderLimits.maximumToolCalls + 1)
+    }
+
+    func testDiagnosticReasonEnvelopeType() async throws {
+        let diagnostic = try await assertRejectedToolExchange(
+            body: diagnosticResponseBody(toolCalls: [diagnosticToolCall(type: "not_function")]),
+            reason: .envelopeType,
+            toolNameValue: "list"
+        )
+        XCTAssertFalse(diagnostic.envelopeTypeIsFunction)
+    }
+
+    func testDiagnosticReasonIDMissingOrInvalid() async throws {
+        let diagnostic = try await assertRejectedToolExchange(
+            body: diagnosticResponseBody(toolCalls: [diagnosticToolCall(id: nil)]),
+            reason: .idMissingOrInvalid,
+            toolNameValue: "list"
+        )
+        XCTAssertFalse(diagnostic.toolCallIDPresent)
+        XCTAssertEqual(diagnostic.toolCallIDByteCount, 0)
+    }
+
+    func testDiagnosticReasonToolNameMissingOrInvalid() async throws {
+        let diagnostic = try await assertRejectedToolExchange(
+            body: diagnosticResponseBody(toolCalls: [diagnosticToolCall(name: nil)]),
+            reason: .toolNameMissingOrInvalid,
+            toolNameValue: ""
+        )
+        XCTAssertFalse(diagnostic.toolNamePresent)
+        XCTAssertEqual(diagnostic.toolNameByteCount, 0)
+    }
+
+    func testDiagnosticReasonToolNameNotAllowed() async throws {
+        let toolName = "network"
+        let transport = MockProviderTransport(mode: .response(
+            ProviderHTTPResponse(
+                statusCode: 200,
+                body: diagnosticResponseBody(toolCalls: [diagnosticToolCall(name: toolName)])
+            )
+        ))
+        let store = RecordingAttemptStore()
+        let provider = try makeProvider(transport: transport, store: store)
+        let request = ProviderInferenceRequest(
+            messages: [
+                ProviderTurnMessage(role: .system, content: "fixed system"),
+                ProviderTurnMessage(role: .user, content: "fixed goal")
+            ],
+            tools: S3ToolPolicy.toolDefinitions,
+            requireTool: true
+        )
+
+        let outcome = await provider.infer(request: request, requestID: UUID())
+
+        guard case let .decision(.toolCall(_, call)) = outcome else {
+            return XCTFail("expected typed tool decision")
+        }
+        XCTAssertEqual(call.name, toolName)
+        let sendCount = await transport.sendCount
+        XCTAssertEqual(sendCount, 1)
+        let records = await store.records
+        XCTAssertEqual(records.map(\.phase), [.intentRecorded, .succeeded])
+        XCTAssertEqual(records.last?.resultCategory, .toolCall)
+        let diagnostic = try XCTUnwrap(records.last?.toolExchangeDiagnostic)
+        XCTAssertEqual(diagnostic.reason, .toolNameNotAllowed)
+        XCTAssertTrue(diagnostic.toolNamePresent)
+        XCTAssertEqual(diagnostic.toolNameByteCount, toolName.utf8.count)
+
+        let workspaceRoot = temporaryDirectory()
+        try FileManager.default.createDirectory(at: workspaceRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspaceRoot) }
+        let policy = S3ToolPolicy(workspace: try S3ApprovedWorkspace(rootURL: workspaceRoot))
+        XCTAssertThrowsError(try policy.authorize(call)) { error in
+            XCTAssertEqual(error as? S3PolicyError, .unknownTool)
+        }
+
+        let encoded = try JSONEncoder().encode(records)
+        let durableText = String(decoding: encoded, as: UTF8.self)
+        let descriptionText = String(describing: records)
+        for value in [
+            apiKey,
+            diagnosticResponseText,
+            "diagnostic-response-id-never-persist",
+            diagnosticID,
+            toolName,
+            diagnosticArguments
+        ] {
+            XCTAssertFalse(durableText.contains(value), "forbidden durable value present")
+            XCTAssertFalse(descriptionText.contains(value), "forbidden diagnostic value present")
+        }
+    }
+
+    func testDiagnosticReasonArgumentsMissing() async throws {
+        let diagnostic = try await assertRejectedToolExchange(
+            body: diagnosticResponseBody(toolCalls: [diagnosticToolCall(arguments: nil)]),
+            reason: .argumentsMissing,
+            toolNameValue: "list"
+        )
+        XCTAssertFalse(diagnostic.argumentsPresent)
+        XCTAssertEqual(diagnostic.argumentsByteCount, 0)
+    }
+
+    func testDiagnosticReasonArgumentsTooLarge() async throws {
+        let oversized = diagnosticArguments
+            + String(repeating: "x", count: ProviderLimits.maximumToolArgumentsBytes + 1)
+        let diagnostic = try await assertRejectedToolExchange(
+            body: diagnosticResponseBody(toolCalls: [diagnosticToolCall(arguments: oversized)]),
+            reason: .argumentsTooLarge,
+            toolNameValue: "list",
+            argumentsValue: oversized
+        )
+        XCTAssertTrue(diagnostic.argumentsPresent)
+        XCTAssertEqual(diagnostic.argumentsByteCount, ProviderLimits.maximumToolArgumentsBytes + 1)
+    }
+
+    func testDiagnosticReasonAssistantContentTooLarge() async throws {
+        let oversized = diagnosticResponseText
+            + String(repeating: "x", count: ProviderLimits.maximumOutputBytes + 1)
+        let diagnostic = try await assertRejectedToolExchange(
+            body: diagnosticResponseBody(
+                toolCalls: [diagnosticToolCall()],
+                content: oversized
+            ),
+            reason: .assistantContentTooLarge,
+            toolNameValue: "list",
+            responseTextValue: oversized
+        )
+        XCTAssertTrue(diagnostic.assistantContentPresent)
+        XCTAssertEqual(diagnostic.assistantContentByteCount, ProviderLimits.maximumOutputBytes + 1)
+    }
+
     func testUncertainTransportResultRequiresReconciliationAndNeverRetries() async throws {
         let transport = MockProviderTransport(mode: .networkFailure)
         let store = RecordingAttemptStore()
@@ -317,6 +467,92 @@ final class WujiProviderTests: XCTestCase {
             attemptStore: store,
             now: { Date(timeIntervalSince1970: 1_000) }
         )
+    }
+
+    private func assertRejectedToolExchange(
+        body: Data,
+        reason: ProviderToolExchangeRejectionReason,
+        toolNameValue: String,
+        argumentsValue: String? = nil,
+        responseTextValue: String? = nil
+    ) async throws -> ProviderToolExchangeDiagnostic {
+        let transport = MockProviderTransport(mode: .response(
+            ProviderHTTPResponse(statusCode: 200, body: body)
+        ))
+        let store = RecordingAttemptStore()
+        let provider = try makeProvider(transport: transport, store: store)
+        let request = ProviderInferenceRequest(
+            messages: [
+                ProviderTurnMessage(role: .system, content: "fixed system"),
+                ProviderTurnMessage(role: .user, content: "fixed goal")
+            ],
+            tools: S3ToolPolicy.toolDefinitions,
+            requireTool: true
+        )
+
+        let outcome = await provider.infer(request: request, requestID: UUID())
+
+        XCTAssertEqual(outcome, .failure(.invalidToolExchange))
+        let sendCount = await transport.sendCount
+        XCTAssertEqual(sendCount, 1)
+        let records = await store.records
+        XCTAssertEqual(records.map(\.phase), [.intentRecorded, .failed])
+        XCTAssertEqual(records.last?.resultCategory, .invalidToolExchange)
+        let diagnostic = try XCTUnwrap(records.last?.toolExchangeDiagnostic)
+        XCTAssertEqual(diagnostic.reason, reason)
+
+        let encoded = try JSONEncoder().encode(records)
+        let durableText = String(decoding: encoded, as: UTF8.self)
+        let descriptionText = String(describing: records)
+        let forbidden = [
+            apiKey,
+            responseTextValue ?? diagnosticResponseText,
+            "diagnostic-response-id-never-persist",
+            diagnosticID,
+            toolNameValue,
+            argumentsValue ?? diagnosticArguments
+        ].filter { !$0.isEmpty }
+        for value in forbidden {
+            XCTAssertFalse(durableText.contains(value), "forbidden durable value present")
+            XCTAssertFalse(descriptionText.contains(value), "forbidden diagnostic value present")
+        }
+        return diagnostic
+    }
+
+    private func diagnosticToolCall(
+        id: String? = "diagnostic-call-id-never-persist",
+        type: String? = "function",
+        name: String? = "list",
+        arguments: String? = "{\"path\":\"diagnostic-arguments-never-persist\"}"
+    ) -> [String: Any] {
+        var function: [String: Any] = [:]
+        if let name { function["name"] = name }
+        if let arguments { function["arguments"] = arguments }
+        var call: [String: Any] = ["function": function]
+        if let id { call["id"] = id }
+        if let type { call["type"] = type }
+        return call
+    }
+
+    private func diagnosticResponseBody(
+        toolCalls: [[String: Any]],
+        content: Any? = nil,
+        finishReason: String = "tool_calls"
+    ) -> Data {
+        let message: [String: Any] = [
+            "role": "assistant",
+            "content": content ?? diagnosticResponseText,
+            "tool_calls": toolCalls
+        ]
+        let object: [String: Any] = [
+            "id": "diagnostic-response-id-never-persist",
+            "choices": [[
+                "index": 0,
+                "message": message,
+                "finish_reason": finishReason
+            ]]
+        ]
+        return try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
 
     private func responseBody(content: String) -> Data {

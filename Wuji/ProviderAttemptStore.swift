@@ -34,6 +34,7 @@ struct ProviderAttemptEvidence: Codable, Equatable, Sendable {
     let resultCategory: ProviderAttemptResultCategory
     let responseByteCount: Int?
     let responseSHA256: String?
+    let toolExchangeDiagnostic: ProviderToolExchangeDiagnostic?
 }
 
 protocol ProviderAttemptRecording: Sendable {
@@ -64,7 +65,9 @@ actor FileProviderAttemptStore: ProviderAttemptRecording {
         guard evidence.providerID.utf8.count <= 32,
               evidence.modelSHA256.count == 64,
               evidence.responseByteCount.map({ $0 >= 0 && $0 <= ProviderLimits.maximumOutputBytes }) ?? true,
-              evidence.responseSHA256.map({ $0.count == 64 }) ?? true else {
+              evidence.responseSHA256.map({ $0.count == 64 }) ?? true,
+              Self.valid(evidence.toolExchangeDiagnostic),
+              Self.validDiagnosticContext(evidence) else {
             throw ProviderAttemptStoreError.invalidEvidence
         }
 
@@ -86,5 +89,23 @@ actor FileProviderAttemptStore: ProviderAttemptRecording {
         } catch {
             throw ProviderAttemptStoreError.persistenceFailed
         }
+    }
+
+    private static func valid(_ diagnostic: ProviderToolExchangeDiagnostic?) -> Bool {
+        guard let diagnostic else { return true }
+        return (0...(ProviderLimits.maximumToolCalls + 1)).contains(diagnostic.toolCallCount)
+            && (0...(ProviderLimits.maximumToolNameBytes + 1)).contains(diagnostic.finishReasonByteCount)
+            && (0...(ProviderLimits.maximumOutputBytes + 1)).contains(diagnostic.assistantContentByteCount)
+            && (0...(ProviderLimits.maximumToolCallIDBytes + 1)).contains(diagnostic.toolCallIDByteCount)
+            && (0...(ProviderLimits.maximumToolNameBytes + 1)).contains(diagnostic.toolNameByteCount)
+            && (0...(ProviderLimits.maximumToolArgumentsBytes + 1)).contains(diagnostic.argumentsByteCount)
+    }
+
+    private static func validDiagnosticContext(_ evidence: ProviderAttemptEvidence) -> Bool {
+        guard let diagnostic = evidence.toolExchangeDiagnostic else { return true }
+        if diagnostic.reason == .toolNameNotAllowed {
+            return evidence.phase == .succeeded && evidence.resultCategory == .toolCall
+        }
+        return evidence.phase == .failed && evidence.resultCategory == .invalidToolExchange
     }
 }

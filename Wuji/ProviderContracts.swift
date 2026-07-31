@@ -104,6 +104,34 @@ enum ProviderFailure: Equatable, Sendable, CustomStringConvertible {
     }
 }
 
+enum ProviderToolExchangeRejectionReason: String, Codable, Equatable, Sendable {
+    case noToolCallsWithInvalidFinishOrContent = "no_tool_calls_with_invalid_finish_or_content"
+    case toolCallCount = "tool_call_count"
+    case envelopeType = "envelope_type"
+    case idMissingOrInvalid = "id_missing_or_invalid"
+    case toolNameMissingOrInvalid = "tool_name_missing_or_invalid"
+    case toolNameNotAllowed = "tool_name_not_allowed"
+    case argumentsMissing = "arguments_missing"
+    case argumentsTooLarge = "arguments_too_large"
+    case assistantContentTooLarge = "assistant_content_too_large"
+}
+
+struct ProviderToolExchangeDiagnostic: Codable, Equatable, Sendable {
+    let reason: ProviderToolExchangeRejectionReason
+    let toolCallCount: Int
+    let finishReasonPresent: Bool
+    let finishReasonByteCount: Int
+    let assistantContentPresent: Bool
+    let assistantContentByteCount: Int
+    let envelopeTypeIsFunction: Bool
+    let toolCallIDPresent: Bool
+    let toolCallIDByteCount: Int
+    let toolNamePresent: Bool
+    let toolNameByteCount: Int
+    let argumentsPresent: Bool
+    let argumentsByteCount: Int
+}
+
 enum ProviderUnknown: Equatable, Sendable, CustomStringConvertible {
     case reconciliationRequired
 
