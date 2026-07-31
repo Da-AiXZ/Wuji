@@ -78,7 +78,7 @@ final class WujiProviderTests: XCTestCase {
         XCTAssertEqual(request.httpMethod, "POST")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer \(apiKey)")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
-        let body = try XCTUnwrap(request.httpBody)
+        let body = try XCTUnwrap(capture.body)
         XCTAssertFalse(body.contains(Data(apiKey.utf8)))
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
         XCTAssertEqual(object["model"] as? String, model)
@@ -280,6 +280,7 @@ final class WujiProviderTests: XCTestCase {
 private final class URLRequestCapture: @unchecked Sendable {
     private let lock = NSLock()
     private var storedRequest: URLRequest?
+    private var storedBody: Data?
 
     var request: URLRequest? {
         lock.lock()
@@ -287,10 +288,32 @@ private final class URLRequestCapture: @unchecked Sendable {
         return storedRequest
     }
 
+    var body: Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedBody
+    }
+
     func store(_ request: URLRequest) {
         lock.lock()
         storedRequest = request
+        storedBody = request.httpBody ?? Self.readBodyStream(request.httpBodyStream)
         lock.unlock()
+    }
+
+    private static func readBodyStream(_ stream: InputStream?) -> Data? {
+        guard let stream else { return nil }
+        stream.open()
+        defer { stream.close() }
+
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4_096)
+        while true {
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            if count < 0 { return nil }
+            if count == 0 { return data }
+            data.append(contentsOf: buffer.prefix(count))
+        }
     }
 }
 
