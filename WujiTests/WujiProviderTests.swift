@@ -239,9 +239,11 @@ final class WujiProviderTests: XCTestCase {
 
         let outcome = await provider.infer(request: request, requestID: UUID())
 
-        guard case let .decision(.toolCall(assistant, call)) = outcome else {
+        guard case let .decision(.toolCalls(assistant, calls)) = outcome,
+              let call = calls.first else {
             return XCTFail("expected typed tool call, got \(outcome)")
         }
+        XCTAssertEqual(calls.count, 1)
         XCTAssertEqual(call.id, "call-list")
         XCTAssertEqual(call.name, "list")
         XCTAssertEqual(call.arguments, "{\"path\":\"\"}")
@@ -262,6 +264,141 @@ final class WujiProviderTests: XCTestCase {
         XCTAssertFalse(durable.contains(Data(call.arguments.utf8)))
     }
 
+    func testZeroToolCallsUseExistingFinishBranch() async throws {
+        let transport = MockProviderTransport(mode: .response(ProviderHTTPResponse(
+            statusCode: 200,
+            body: diagnosticResponseBody(
+                toolCalls: [],
+                content: "bounded finish",
+                finishReason: "stop"
+            )
+        )))
+        let provider = try makeProvider(transport: transport, store: RecordingAttemptStore())
+
+        let outcome = await provider.infer(request: structuredRequest(), requestID: UUID())
+
+        guard case let .decision(.finish(message)) = outcome else {
+            return XCTFail("expected no-tool finish, got \(outcome)")
+        }
+        XCTAssertEqual(message.content, "bounded finish")
+        let sendCount = await transport.sendCount
+        XCTAssertEqual(sendCount, 1)
+    }
+
+    func testTwoAndThreeToolCallsPreserveArrayOrderDespiteFinishReasonStop() async throws {
+        for count in [2, 3] {
+            let responseCalls = (0..<count).map { index in
+                diagnosticToolCall(
+                    id: "ordered-call-\(index)",
+                    name: ["list", "search", "read"][index],
+                    arguments: index == 1
+                        ? "{\"path\":\"\",\"query\":\"marker\"}"
+                        : "{\"path\":\"\"}"
+                )
+            }
+            let transport = MockProviderTransport(mode: .response(ProviderHTTPResponse(
+                statusCode: 200,
+                body: diagnosticResponseBody(
+                    toolCalls: responseCalls,
+                    content: NSNull(),
+                    finishReason: "stop"
+                )
+            )))
+            let store = RecordingAttemptStore()
+            let provider = try makeProvider(transport: transport, store: store)
+
+            let outcome = await provider.infer(request: structuredRequest(), requestID: UUID())
+
+            guard case let .decision(.toolCalls(assistant, calls)) = outcome else {
+                return XCTFail("expected ordered batch of \(count), got \(outcome)")
+            }
+            XCTAssertEqual(calls.map(\.id), (0..<count).map { "ordered-call-\($0)" })
+            XCTAssertEqual(calls.map(\.name), Array(["list", "search", "read"].prefix(count)))
+            XCTAssertEqual(assistant.toolCalls, calls)
+            let sendCount = await transport.sendCount
+            XCTAssertEqual(sendCount, 1)
+            let outcomeDescription = String(describing: outcome)
+            let records = await store.records
+            let durableText = String(decoding: try JSONEncoder().encode(records), as: UTF8.self)
+            for call in calls {
+                XCTAssertFalse(outcomeDescription.contains(call.id))
+                XCTAssertFalse(outcomeDescription.contains(call.name))
+                XCTAssertFalse(outcomeDescription.contains(call.arguments))
+                XCTAssertFalse(durableText.contains(call.id))
+                XCTAssertFalse(durableText.contains(call.name))
+                XCTAssertFalse(durableText.contains(call.arguments))
+            }
+            XCTAssertFalse(durableText.contains(apiKey))
+        }
+    }
+
+    func testToolResultHistoryRequiresUniqueExactIDPairingBeforeNetwork() async throws {
+        let first = ProviderTurnToolCall(id: "pair-1", name: "list", arguments: "{\"path\":\"\"}")
+        let second = ProviderTurnToolCall(id: "pair-2", name: "read", arguments: "{\"path\":\"records/target.txt\"}")
+        let validMessages = [
+            ProviderTurnMessage(role: .system, content: "fixed system"),
+            ProviderTurnMessage(role: .user, content: "fixed goal"),
+            ProviderTurnMessage(role: .assistant, toolCalls: [first, second]),
+            ProviderTurnMessage(role: .tool, content: "first result", toolCallID: first.id),
+            ProviderTurnMessage(role: .tool, content: "second result", toolCallID: second.id)
+        ]
+        let validTransport = MockProviderTransport(mode: .response(ProviderHTTPResponse(
+            statusCode: 200,
+            body: diagnosticResponseBody(toolCalls: [], content: "done", finishReason: "stop")
+        )))
+        let validProvider = try makeProvider(
+            transport: validTransport,
+            store: RecordingAttemptStore()
+        )
+        let validOutcome = await validProvider.infer(
+            request: structuredRequest(messages: validMessages),
+            requestID: UUID()
+        )
+        guard case .decision(.finish) = validOutcome else {
+            return XCTFail("expected paired history acceptance")
+        }
+        let validSendCount = await validTransport.sendCount
+        XCTAssertEqual(validSendCount, 1)
+
+        let invalidHistories = [
+            Array(validMessages.dropLast()),
+            [
+                ProviderTurnMessage(role: .system, content: "fixed system"),
+                ProviderTurnMessage(role: .user, content: "fixed goal"),
+                ProviderTurnMessage(role: .assistant, toolCalls: [first, first]),
+                ProviderTurnMessage(role: .tool, content: "first result", toolCallID: first.id)
+            ],
+            [
+                ProviderTurnMessage(role: .system, content: "fixed system"),
+                ProviderTurnMessage(role: .user, content: "fixed goal"),
+                ProviderTurnMessage(role: .assistant, toolCalls: [first]),
+                ProviderTurnMessage(role: .tool, content: "wrong result", toolCallID: second.id)
+            ],
+            [
+                ProviderTurnMessage(role: .system, content: "fixed system"),
+                ProviderTurnMessage(role: .user, content: "fixed goal"),
+                ProviderTurnMessage(role: .assistant, toolCalls: [first]),
+                ProviderTurnMessage(role: .tool, content: "first result", toolCallID: first.id),
+                ProviderTurnMessage(role: .assistant, toolCalls: [first]),
+                ProviderTurnMessage(role: .tool, content: "reused result", toolCallID: first.id)
+            ]
+        ]
+        for messages in invalidHistories {
+            let transport = MockProviderTransport(mode: .response(ProviderHTTPResponse(
+                statusCode: 200,
+                body: diagnosticResponseBody(toolCalls: [], content: "unused", finishReason: "stop")
+            )))
+            let provider = try makeProvider(transport: transport, store: RecordingAttemptStore())
+            let outcome = await provider.infer(
+                request: structuredRequest(messages: messages),
+                requestID: UUID()
+            )
+            XCTAssertEqual(outcome, .failure(.invalidInput))
+            let sendCount = await transport.sendCount
+            XCTAssertEqual(sendCount, 0)
+        }
+    }
+
     func testDiagnosticReasonNoToolCallsWithInvalidFinishOrContent() async throws {
         let diagnostic = try await assertRejectedToolExchange(
             body: diagnosticResponseBody(toolCalls: [], finishReason: "length"),
@@ -274,8 +411,11 @@ final class WujiProviderTests: XCTestCase {
     }
 
     func testDiagnosticReasonToolCallCount() async throws {
+        let calls = (0...ProviderLimits.maximumToolCalls).map {
+            diagnosticToolCall(id: "diagnostic-call-\($0)")
+        }
         let diagnostic = try await assertRejectedToolExchange(
-            body: diagnosticResponseBody(toolCalls: [diagnosticToolCall(), diagnosticToolCall()]),
+            body: diagnosticResponseBody(toolCalls: calls),
             reason: .toolCallCount,
             toolNameValue: "list"
         )
@@ -299,6 +439,19 @@ final class WujiProviderTests: XCTestCase {
         )
         XCTAssertFalse(diagnostic.toolCallIDPresent)
         XCTAssertEqual(diagnostic.toolCallIDByteCount, 0)
+    }
+
+    func testDiagnosticReasonDuplicateID() async throws {
+        let diagnostic = try await assertRejectedToolExchange(
+            body: diagnosticResponseBody(toolCalls: [
+                diagnosticToolCall(id: diagnosticID),
+                diagnosticToolCall(id: diagnosticID, name: "read")
+            ]),
+            reason: .idDuplicate,
+            toolNameValue: "read"
+        )
+        XCTAssertTrue(diagnostic.toolCallIDPresent)
+        XCTAssertEqual(diagnostic.toolCallCount, 2)
     }
 
     func testDiagnosticReasonToolNameMissingOrInvalid() async throws {
@@ -332,7 +485,8 @@ final class WujiProviderTests: XCTestCase {
 
         let outcome = await provider.infer(request: request, requestID: UUID())
 
-        guard case let .decision(.toolCall(_, call)) = outcome else {
+        guard case let .decision(.toolCalls(_, calls)) = outcome,
+              let call = calls.first else {
             return XCTFail("expected typed tool decision")
         }
         XCTAssertEqual(call.name, toolName)
@@ -378,6 +532,19 @@ final class WujiProviderTests: XCTestCase {
         )
         XCTAssertFalse(diagnostic.argumentsPresent)
         XCTAssertEqual(diagnostic.argumentsByteCount, 0)
+    }
+
+    func testInvalidSecondEnvelopeRejectsWholeProviderBatch() async throws {
+        let diagnostic = try await assertRejectedToolExchange(
+            body: diagnosticResponseBody(toolCalls: [
+                diagnosticToolCall(id: "valid-first"),
+                diagnosticToolCall(id: "invalid-second", name: "read", arguments: nil)
+            ]),
+            reason: .argumentsMissing,
+            toolNameValue: "read"
+        )
+        XCTAssertEqual(diagnostic.toolCallCount, 2)
+        XCTAssertFalse(diagnostic.argumentsPresent)
     }
 
     func testDiagnosticReasonArgumentsTooLarge() async throws {
@@ -466,6 +633,19 @@ final class WujiProviderTests: XCTestCase {
             transport: transport,
             attemptStore: store,
             now: { Date(timeIntervalSince1970: 1_000) }
+        )
+    }
+
+    private func structuredRequest(
+        messages: [ProviderTurnMessage]? = nil
+    ) -> ProviderInferenceRequest {
+        ProviderInferenceRequest(
+            messages: messages ?? [
+                ProviderTurnMessage(role: .system, content: "fixed system"),
+                ProviderTurnMessage(role: .user, content: "fixed goal")
+            ],
+            tools: S3ToolPolicy.toolDefinitions,
+            requireTool: true
         )
     }
 

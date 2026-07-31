@@ -12,7 +12,7 @@ enum ProviderLimits {
     static let maximumTurnMessages = 24
     static let maximumTurnMessageBytes = 8_192
     static let maximumToolDefinitions = 3
-    static let maximumToolCalls = 1
+    static let maximumToolCalls = 3
     static let maximumToolNameBytes = 64
     static let maximumToolArgumentsBytes = 1_024
     static let maximumToolCallIDBytes = 128
@@ -109,6 +109,7 @@ enum ProviderToolExchangeRejectionReason: String, Codable, Equatable, Sendable {
     case toolCallCount = "tool_call_count"
     case envelopeType = "envelope_type"
     case idMissingOrInvalid = "id_missing_or_invalid"
+    case idDuplicate = "id_duplicate"
     case toolNameMissingOrInvalid = "tool_name_missing_or_invalid"
     case toolNameNotAllowed = "tool_name_not_allowed"
     case argumentsMissing = "arguments_missing"
@@ -241,13 +242,13 @@ struct ProviderInferenceRequest: Equatable, Sendable, CustomStringConvertible {
 }
 
 enum ProviderInferenceDecision: Equatable, Sendable, CustomStringConvertible {
-    case toolCall(ProviderTurnMessage, ProviderTurnToolCall)
+    case toolCalls(ProviderTurnMessage, [ProviderTurnToolCall])
     case finish(ProviderTurnMessage)
 
     var description: String {
         switch self {
-        case let .toolCall(_, call):
-            return "provider selected tool \(call.name) with \(call.arguments.utf8.count) argument bytes"
+        case let .toolCalls(_, calls):
+            return "provider selected \(calls.count) typed tool calls"
         case let .finish(message):
             return "provider finished with \(message.content?.utf8.count ?? 0) content bytes"
         }

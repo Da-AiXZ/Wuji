@@ -5,7 +5,7 @@ enum S3TaskContract {
     static let value = "read-only-loop-pass"
     static let goal = "In the approved fixture workspace, find the unique marker WUJI_S3_TARGET=read-only-loop-pass and report its normalized relative path and value."
     static let systemPrompt = """
-    You are selecting read-only operations for one fixed fixture task. Use exactly one typed tool call per turn. Only list, search, and read are available. Never propose shell, network, write, edit, delete, rename, package, or Git operations. First list the fixture root using path \"\". Then search path \"\" for the exact literal WUJI_S3_TARGET=read-only-loop-pass. Then read the single normalized relative path returned by search. After all three observations agree, respond with a short final answer and no tool call. Tool observations are evidence, but only the Swift Harness decides completion.
+    You are selecting read-only operations for one fixed fixture task. You may return up to three typed tool calls in one response; the Swift Harness validates the whole batch and executes admitted calls serially in array order. Only list, search, and read are available. Never propose shell, network, write, edit, delete, rename, package, or Git operations. First list the fixture root using path \"\". Then search path \"\" for the exact literal WUJI_S3_TARGET=read-only-loop-pass. Then read the single normalized relative path returned by search. After all three observations agree, respond with a short final answer and no tool call. Tool observations are evidence, but only the Swift Harness decides completion.
     """
 }
 
@@ -150,98 +150,124 @@ final class S3ReadOnlyAgent: @unchecked Sendable {
                 }
 
                 switch decision {
-                case let .toolCall(assistantMessage, call):
-                    guard toolExecutionCount < S3Limits.maximumToolExecutions else {
+                case let .toolCalls(assistantMessage, calls):
+                    guard !calls.isEmpty,
+                          toolExecutionCount + calls.count <= S3Limits.maximumToolExecutions else {
                         return .failure(.limitsExceeded)
                     }
-                    let authorized: S3AuthorizedTool
+                    let authorizedBatch: [S3AuthorizedToolCall]
                     do {
-                        authorized = try policy.authorize(call)
+                        let previouslyUsedIDs = Set(messages.flatMap {
+                            $0.toolCalls.map(\.id)
+                        })
+                        authorizedBatch = try policy.authorizeBatch(
+                            calls,
+                            previouslyUsedIDs: previouslyUsedIDs
+                        )
                     } catch {
                         return .failure(.policyRejected)
                     }
                     messages.append(assistantMessage)
 
-                    let executorOperationID = makeUUID()
-                    let executorAttemptID = makeUUID()
-                    do {
-                        try await attemptStore.record(evidence(
-                            taskID: taskID,
-                            operationID: executorOperationID,
-                            attemptID: executorAttemptID,
-                            ioKind: .executor,
-                            providerID: nil,
-                            toolName: authorized.name.rawValue,
-                            inputSHA256: authorized.inputSHA256,
-                            phase: .intentRecorded,
-                            category: .none
-                        ))
-                    } catch {
-                        return .failure(.evidenceUnavailable)
-                    }
-
-                    toolExecutionCount += 1
-                    let executorOutcome = await executor.execute(authorized)
-                    switch executorOutcome {
-                    case let .observation(observation):
-                        let modelContent: String
+                    for authorizedCall in authorizedBatch {
+                        let authorized = authorizedCall.tool
+                        let executorOperationID = makeUUID()
+                        let executorAttemptID = makeUUID()
                         do {
-                            modelContent = try observation.modelContent()
+                            try await attemptStore.record(evidence(
+                                taskID: taskID,
+                                operationID: executorOperationID,
+                                attemptID: executorAttemptID,
+                                ioKind: .executor,
+                                providerID: nil,
+                                toolName: authorized.name.rawValue,
+                                inputSHA256: authorized.inputSHA256,
+                                phase: .intentRecorded,
+                                category: .none
+                            ))
                         } catch {
+                            return toolExecutionCount == 0
+                                ? .failure(.evidenceUnavailable)
+                                : .reconciliationRequired
+                        }
+
+                        toolExecutionCount += 1
+                        let executorOutcome = await executor.execute(authorized)
+                        switch executorOutcome {
+                        case let .observation(observation):
+                            let modelContent: String
+                            do {
+                                modelContent = try observation.modelContent()
+                            } catch {
+                                let terminalRecorded = await recordTerminal(
+                                    taskID: taskID,
+                                    operationID: executorOperationID,
+                                    attemptID: executorAttemptID,
+                                    ioKind: .executor,
+                                    providerID: nil,
+                                    toolName: authorized.name.rawValue,
+                                    inputSHA256: authorized.inputSHA256,
+                                    phase: .failed,
+                                    category: .executorFailure,
+                                    result: nil
+                                )
+                                return terminalRecorded
+                                    ? .failure(.executorFailure)
+                                    : .reconciliationRequired
+                            }
+                            let result = Data(modelContent.utf8)
+                            guard await recordTerminal(
+                                taskID: taskID,
+                                operationID: executorOperationID,
+                                attemptID: executorAttemptID,
+                                ioKind: .executor,
+                                providerID: nil,
+                                toolName: authorized.name.rawValue,
+                                inputSHA256: authorized.inputSHA256,
+                                phase: .succeeded,
+                                category: .observation,
+                                result: result
+                            ) else {
+                                return .reconciliationRequired
+                            }
+                            observations.append(observation)
+                            messages.append(ProviderTurnMessage(
+                                role: .tool,
+                                content: modelContent,
+                                toolCallID: authorizedCall.toolCallID
+                            ))
+                        case .failure:
+                            let terminalRecorded = await recordTerminal(
+                                taskID: taskID,
+                                operationID: executorOperationID,
+                                attemptID: executorAttemptID,
+                                ioKind: .executor,
+                                providerID: nil,
+                                toolName: authorized.name.rawValue,
+                                inputSHA256: authorized.inputSHA256,
+                                phase: .failed,
+                                category: .executorFailure,
+                                result: nil
+                            )
+                            guard terminalRecorded else {
+                                return .reconciliationRequired
+                            }
                             return .failure(.executorFailure)
-                        }
-                        let result = Data(modelContent.utf8)
-                        guard await recordTerminal(
-                            taskID: taskID,
-                            operationID: executorOperationID,
-                            attemptID: executorAttemptID,
-                            ioKind: .executor,
-                            providerID: nil,
-                            toolName: authorized.name.rawValue,
-                            inputSHA256: authorized.inputSHA256,
-                            phase: .succeeded,
-                            category: .observation,
-                            result: result
-                        ) else {
+                        case .unknown:
+                            _ = await recordTerminal(
+                                taskID: taskID,
+                                operationID: executorOperationID,
+                                attemptID: executorAttemptID,
+                                ioKind: .executor,
+                                providerID: nil,
+                                toolName: authorized.name.rawValue,
+                                inputSHA256: authorized.inputSHA256,
+                                phase: .reconciliationRequired,
+                                category: .executorUnknown,
+                                result: nil
+                            )
                             return .reconciliationRequired
                         }
-                        observations.append(observation)
-                        messages.append(ProviderTurnMessage(
-                            role: .tool,
-                            content: modelContent,
-                            toolCallID: call.id
-                        ))
-                    case .failure:
-                        let terminalRecorded = await recordTerminal(
-                            taskID: taskID,
-                            operationID: executorOperationID,
-                            attemptID: executorAttemptID,
-                            ioKind: .executor,
-                            providerID: nil,
-                            toolName: authorized.name.rawValue,
-                            inputSHA256: authorized.inputSHA256,
-                            phase: .failed,
-                            category: .executorFailure,
-                            result: nil
-                        )
-                        guard terminalRecorded else {
-                            return .reconciliationRequired
-                        }
-                        return .failure(.executorFailure)
-                    case .unknown:
-                        _ = await recordTerminal(
-                            taskID: taskID,
-                            operationID: executorOperationID,
-                            attemptID: executorAttemptID,
-                            ioKind: .executor,
-                            providerID: nil,
-                            toolName: authorized.name.rawValue,
-                            inputSHA256: authorized.inputSHA256,
-                            phase: .reconciliationRequired,
-                            category: .executorUnknown,
-                            result: nil
-                        )
-                        return .reconciliationRequired
                     }
                 case let .finish(assistantMessage):
                     messages.append(assistantMessage)
@@ -257,7 +283,7 @@ final class S3ReadOnlyAgent: @unchecked Sendable {
                     }
                     messages.append(ProviderTurnMessage(
                         role: .user,
-                        content: "Completion rejected by the Harness because required list, exact search, and read observations are missing or inconsistent. Continue with one allowed typed tool."
+                        content: "Completion rejected by the Harness because required list, exact search, and read observations are missing or inconsistent. Continue with one or more allowed typed tools."
                     ))
                 }
             case let .failure(failure):

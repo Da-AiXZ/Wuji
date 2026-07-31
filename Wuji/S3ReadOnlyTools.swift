@@ -99,6 +99,11 @@ enum S3AuthorizedTool: Equatable, Sendable, CustomStringConvertible {
     }
 }
 
+struct S3AuthorizedToolCall: Equatable, Sendable {
+    let toolCallID: String
+    let tool: S3AuthorizedTool
+}
+
 struct S3ToolPolicy: Sendable {
     private let workspace: S3ApprovedWorkspace
     private let fileManager: FileManager
@@ -137,6 +142,35 @@ struct S3ToolPolicy: Sendable {
             let path = try string(object, key: "path")
             return .read(path: try resolve(path, kind: .regularFile, recursive: false))
         }
+    }
+
+    func authorizeBatch(
+        _ calls: [ProviderTurnToolCall],
+        previouslyUsedIDs: Set<String> = []
+    ) throws -> [S3AuthorizedToolCall] {
+        guard !calls.isEmpty, calls.count <= ProviderLimits.maximumToolCalls else {
+            throw S3PolicyError.invalidArguments
+        }
+        var ids = Set<String>()
+        var authorized: [S3AuthorizedToolCall] = []
+        authorized.reserveCapacity(calls.count)
+        for call in calls {
+            let idBytes = call.id.utf8.count
+            guard idBytes > 0,
+                  idBytes <= ProviderLimits.maximumToolCallIDBytes,
+                  call.id.unicodeScalars.allSatisfy({
+                      !CharacterSet.controlCharacters.contains($0)
+                  }),
+                  !previouslyUsedIDs.contains(call.id),
+                  ids.insert(call.id).inserted else {
+                throw S3PolicyError.invalidArguments
+            }
+            authorized.append(S3AuthorizedToolCall(
+                toolCallID: call.id,
+                tool: try authorize(call)
+            ))
+        }
+        return authorized
     }
 
     static var toolDefinitions: [ProviderToolDefinition] {

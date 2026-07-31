@@ -269,6 +269,7 @@ jobs:
                   "tool_call_count",
                   "envelope_type",
                   "id_missing_or_invalid",
+                  "id_duplicate",
                   "tool_name_missing_or_invalid",
                   "tool_name_not_allowed",
                   "arguments_missing",
@@ -300,7 +301,7 @@ jobs:
                       if not isinstance(diagnostic[key], bool):
                           raise SystemExit("tool exchange diagnostic boolean malformed")
                   bounds = {
-                      "toolCallCount": 2,
+                      "toolCallCount": 4,
                       "finishReasonByteCount": 65,
                       "assistantContentByteCount": 8193,
                       "toolCallIDByteCount": 129,

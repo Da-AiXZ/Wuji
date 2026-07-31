@@ -75,6 +75,174 @@ final class WujiS3AgentTests: XCTestCase {
         XCTAssertFalse(String(describing: records).contains(S3TaskContract.marker))
     }
 
+    func testTwoAndThreeCallBatchesExecuteSeriallyWithIndependentEvidenceAndIDHistory() async throws {
+        for batchSize in [2, 3] {
+            let calls = [
+                call(id: "batch-list", name: "list", arguments: ["path": ""]),
+                call(id: "batch-search", name: "search", arguments: [
+                    "path": "",
+                    "query": S3TaskContract.marker
+                ]),
+                call(id: "batch-read", name: "read", arguments: [
+                    "path": "records/target.txt"
+                ])
+            ]
+            var outcomes = [batchDecision(Array(calls.prefix(batchSize)))]
+            if batchSize == 2 {
+                outcomes.append(batchDecision([calls[2]]))
+            }
+            outcomes.append(.decision(.finish(
+                ProviderTurnMessage(role: .assistant, content: "finished")
+            )))
+            let events = S3EventRecorder()
+            let provider = S3ScriptedProvider(outcomes: outcomes, events: events)
+            let executor = S3MockExecutor(events: events)
+            let store = S3RecordingAttemptStore(events: events)
+            let agent = try makeAgent(provider: provider, executor: executor, store: store)
+
+            let outcome = await agent.run(taskID: UUID())
+
+            guard case let .completed(completion) = outcome else {
+                return XCTFail("expected completion for batch size \(batchSize), got \(outcome)")
+            }
+            XCTAssertEqual(completion.toolExecutionCount, 3)
+            let executed = await executor.executedTools
+            XCTAssertEqual(executed.map(\.name), [.list, .search, .read])
+
+            let records = await store.storedRecords
+            let executorRecords = records.filter { $0.ioKind == .executor }
+            XCTAssertEqual(executorRecords.count, 6)
+            let operations = Dictionary(grouping: executorRecords, by: \.operationID)
+            XCTAssertEqual(operations.count, 3)
+            XCTAssertEqual(Set(executorRecords.map(\.attemptID)).count, 3)
+            XCTAssertEqual(
+                executorRecords.filter { $0.phase == .intentRecorded }.compactMap(\.toolName),
+                ["list", "search", "read"]
+            )
+            for operation in operations.values {
+                XCTAssertEqual(operation.map(\.phase), [.intentRecorded, .succeeded])
+                XCTAssertEqual(Set(operation.map(\.attemptID)).count, 1)
+            }
+
+            let requests = await provider.requests
+            guard requests.count >= 2 else {
+                return XCTFail("expected a follow-up Provider request")
+            }
+            let followUp = requests[1].messages
+            let assistant = try XCTUnwrap(followUp.last(where: { $0.role == .assistant }))
+            XCTAssertEqual(assistant.toolCalls.map(\.id), Array(calls.prefix(batchSize)).map(\.id))
+            let pairedIDs = followUp.filter { $0.role == .tool }.compactMap(\.toolCallID)
+            XCTAssertEqual(pairedIDs, Array(calls.prefix(batchSize)).map(\.id))
+
+            let values = await events.values
+            for index in values.indices where values[index] == "io:executor" {
+                XCTAssertGreaterThan(index, 0)
+                XCTAssertEqual(values[index - 1], "intent:executor")
+            }
+        }
+    }
+
+    func testInvalidBatchMemberOrExcessCountRejectsWholeBatchBeforeExecutor() async throws {
+        let valid = call(id: "valid-list", name: "list", arguments: ["path": ""])
+        let link = workspaceRoot.appendingPathComponent("batch-escape")
+        try FileManager.default.createSymbolicLink(
+            at: link,
+            withDestinationURL: outsideRoot.appendingPathComponent("secret.txt")
+        )
+        let invalidBatches: [[ProviderTurnToolCall]] = [
+            [valid, call(id: "bad-name", name: "network", arguments: ["path": ""])],
+            [valid, ProviderTurnToolCall(id: "bad-json", name: "read", arguments: "not-json")],
+            [valid, call(id: "bad-path", name: "read", arguments: ["path": "../outside/secret.txt"])],
+            [valid, call(id: "bad-symlink", name: "read", arguments: ["path": "batch-escape"])],
+            [valid, call(id: "", name: "read", arguments: ["path": "records/target.txt"])],
+            [valid, call(id: valid.id, name: "read", arguments: ["path": "records/target.txt"])],
+            [
+                valid,
+                call(id: "extra-1", name: "list", arguments: ["path": ""]),
+                call(id: "extra-2", name: "list", arguments: ["path": ""]),
+                call(id: "extra-3", name: "list", arguments: ["path": ""])
+            ]
+        ]
+
+        for batch in invalidBatches {
+            let provider = S3ScriptedProvider(outcomes: [batchDecision(batch)])
+            let executor = S3MockExecutor()
+            let agent = try makeAgent(
+                provider: provider,
+                executor: executor,
+                store: S3RecordingAttemptStore()
+            )
+
+            let outcome = await agent.run(taskID: UUID())
+
+            XCTAssertEqual(outcome, .failure(.policyRejected))
+            let executorCalls = await executor.callCount
+            XCTAssertEqual(executorCalls, 0)
+        }
+    }
+
+    func testSecondCallUnknownStopsThirdCallAndRequiresReconciliation() async throws {
+        let calls = [
+            call(id: "unknown-list", name: "list", arguments: ["path": ""]),
+            call(id: "unknown-search", name: "search", arguments: [
+                "path": "",
+                "query": S3TaskContract.marker
+            ]),
+            call(id: "never-read", name: "read", arguments: [
+                "path": "records/target.txt"
+            ])
+        ]
+        let provider = S3ScriptedProvider(outcomes: [batchDecision(calls)])
+        let executor = S3MockExecutor(mode: .unknownAt(2))
+        let store = S3RecordingAttemptStore()
+        let agent = try makeAgent(provider: provider, executor: executor, store: store)
+
+        let outcome = await agent.run(taskID: UUID())
+
+        XCTAssertEqual(outcome, .reconciliationRequired)
+        let providerCalls = await provider.callCount
+        let executorCalls = await executor.callCount
+        let executed = await executor.executedTools
+        XCTAssertEqual(providerCalls, 1)
+        XCTAssertEqual(executorCalls, 2)
+        XCTAssertEqual(executed.map(\.name), [.list, .search])
+        let storedRecords = await store.storedRecords
+        let executorRecords = storedRecords.filter { $0.ioKind == .executor }
+        XCTAssertEqual(executorRecords.map(\.phase), [
+            .intentRecorded, .succeeded, .intentRecorded, .reconciliationRequired
+        ])
+    }
+
+    func testIDReusedByLaterBatchIsRejectedBeforeThatBatchExecutes() async throws {
+        let reusedID = "reused-across-batches"
+        let provider = S3ScriptedProvider(outcomes: [
+            toolDecision(id: reusedID, name: "list", arguments: ["path": ""]),
+            batchDecision([
+                call(id: reusedID, name: "search", arguments: [
+                    "path": "",
+                    "query": S3TaskContract.marker
+                ]),
+                call(id: "new-read", name: "read", arguments: [
+                    "path": "records/target.txt"
+                ])
+            ])
+        ])
+        let executor = S3MockExecutor()
+        let agent = try makeAgent(
+            provider: provider,
+            executor: executor,
+            store: S3RecordingAttemptStore()
+        )
+
+        let outcome = await agent.run(taskID: UUID())
+
+        XCTAssertEqual(outcome, .failure(.policyRejected))
+        let providerCalls = await provider.callCount
+        let executorCalls = await executor.callCount
+        XCTAssertEqual(providerCalls, 2)
+        XCTAssertEqual(executorCalls, 1)
+    }
+
     func testUnknownWriteShellAndNetworkToolsFailClosedBeforeExecutor() async throws {
         for name in ["unknown", "write", "shell", "network", "delete"] {
             let provider = S3ScriptedProvider(outcomes: [
@@ -216,10 +384,17 @@ final class WujiS3AgentTests: XCTestCase {
     }
 
     func testExecutorTerminalEvidenceFailureRequiresReconciliation() async throws {
-        let provider = S3ScriptedProvider(outcomes: [
-            toolDecision(id: "call-list", name: "list", arguments: ["path": ""])
-        ])
-        let executor = S3MockExecutor(mode: .failure)
+        let provider = S3ScriptedProvider(outcomes: [batchDecision([
+            call(id: "call-list", name: "list", arguments: ["path": ""]),
+            call(id: "call-search", name: "search", arguments: [
+                "path": "",
+                "query": S3TaskContract.marker
+            ]),
+            call(id: "call-read", name: "read", arguments: [
+                "path": "records/target.txt"
+            ])
+        ])])
+        let executor = S3MockExecutor()
         let store = S3RecordingAttemptStore(failOnRecordNumber: 4)
         let agent = try makeAgent(provider: provider, executor: executor, store: store)
 
@@ -302,9 +477,18 @@ final class WujiS3AgentTests: XCTestCase {
         arguments: [String: String]
     ) -> ProviderInferenceOutcome {
         let call = call(id: id, name: name, arguments: arguments)
-        return .decision(.toolCall(
+        return .decision(.toolCalls(
             ProviderTurnMessage(role: .assistant, toolCalls: [call]),
-            call
+            [call]
+        ))
+    }
+
+    private func batchDecision(
+        _ calls: [ProviderTurnToolCall]
+    ) -> ProviderInferenceOutcome {
+        .decision(.toolCalls(
+            ProviderTurnMessage(role: .assistant, toolCalls: calls),
+            calls
         ))
     }
 
@@ -364,6 +548,7 @@ private actor S3ScriptedProvider: AgentInferenceProvider {
     private var outcomes: [ProviderInferenceOutcome]
     private let events: S3EventRecorder?
     private(set) var callCount = 0
+    private(set) var requests: [ProviderInferenceRequest] = []
 
     init(outcomes: [ProviderInferenceOutcome], events: S3EventRecorder? = nil) {
         self.outcomes = outcomes
@@ -372,6 +557,7 @@ private actor S3ScriptedProvider: AgentInferenceProvider {
 
     func infer(request: ProviderInferenceRequest, requestID: UUID) async -> ProviderInferenceOutcome {
         callCount += 1
+        requests.append(request)
         await events?.append("io:provider")
         guard !outcomes.isEmpty else { return .failure(.invalidToolExchange) }
         return outcomes.removeFirst()
@@ -379,11 +565,12 @@ private actor S3ScriptedProvider: AgentInferenceProvider {
 }
 
 private actor S3MockExecutor: S3ReadOnlyExecuting {
-    enum Mode { case observations, failure, unknown }
+    enum Mode { case observations, failure, unknown, unknownAt(Int) }
 
     private let mode: Mode
     private let events: S3EventRecorder?
     private(set) var callCount = 0
+    private(set) var executedTools: [S3AuthorizedTool] = []
 
     init(mode: Mode = .observations, events: S3EventRecorder? = nil) {
         self.mode = mode
@@ -392,8 +579,10 @@ private actor S3MockExecutor: S3ReadOnlyExecuting {
 
     func execute(_ tool: S3AuthorizedTool) async -> S3ExecutorOutcome {
         callCount += 1
+        executedTools.append(tool)
         await events?.append("io:executor")
         if case .unknown = mode { return .unknown }
+        if case let .unknownAt(index) = mode, callCount == index { return .unknown }
         if case .failure = mode { return .failure(.nonzeroExit) }
         let facts = S3ExecutorFacts(
             rootExitObserved: true,

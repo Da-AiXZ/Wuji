@@ -552,23 +552,30 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
             choice,
             allowedToolNames: Set(request.tools.map(\.name))
         ) {
-        case let .toolCall(call, assistantContent, diagnostic):
+        case let .toolCalls(calls, assistantContent, diagnostic):
             let assistant = ProviderTurnMessage(
                 role: .assistant,
                 content: assistantContent,
-                toolCalls: [call]
+                toolCalls: calls
             )
-            let argumentData = Data(call.arguments.utf8)
+            guard let batchData = try? JSONEncoder().encode(calls) else {
+                return await finishInferenceFailure(
+                    .invalidToolExchange,
+                    category: .invalidToolExchange,
+                    requestID: requestID,
+                    attemptID: attemptID
+                )
+            }
             guard await recordInferenceSuccess(
                 requestID: requestID,
                 attemptID: attemptID,
                 category: .toolCall,
-                data: argumentData,
+                data: batchData,
                 toolExchangeDiagnostic: diagnostic
             ) else {
                 return .failure(.evidenceWriteFailed)
             }
-            return .decision(.toolCall(assistant, call))
+            return .decision(.toolCalls(assistant, calls))
         case let .finish(content):
             let assistant = ProviderTurnMessage(role: .assistant, content: content)
             let contentData = Data(content.utf8)
@@ -611,36 +618,49 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
             return .finish(content)
         }
 
-        guard calls.count == ProviderLimits.maximumToolCalls,
-              let envelope = calls.first else {
+        guard calls.count <= ProviderLimits.maximumToolCalls else {
             return .rejected(diagnostic(.toolCallCount, choice: choice, envelope: calls.first))
         }
-        guard envelope.type == "function" else {
-            return .rejected(diagnostic(.envelopeType, choice: choice, envelope: envelope))
-        }
-        guard let id = envelope.id,
-              validIdentifier(id, maximumBytes: ProviderLimits.maximumToolCallIDBytes) else {
-            return .rejected(diagnostic(.idMissingOrInvalid, choice: choice, envelope: envelope))
-        }
-        guard let name = envelope.function?.name,
-              validToolName(name) else {
-            return .rejected(diagnostic(.toolNameMissingOrInvalid, choice: choice, envelope: envelope))
-        }
-        guard let arguments = envelope.function?.arguments,
-              !arguments.isEmpty else {
-            return .rejected(diagnostic(.argumentsMissing, choice: choice, envelope: envelope))
-        }
-        guard arguments.utf8.count <= ProviderLimits.maximumToolArgumentsBytes else {
-            return .rejected(diagnostic(.argumentsTooLarge, choice: choice, envelope: envelope))
-        }
         guard choice.message.content.map({ $0.utf8.count <= ProviderLimits.maximumOutputBytes }) ?? true else {
-            return .rejected(diagnostic(.assistantContentTooLarge, choice: choice, envelope: envelope))
+            return .rejected(diagnostic(.assistantContentTooLarge, choice: choice, envelope: calls.first))
         }
-        let compatibilityDiagnostic = allowedToolNames.contains(name)
-            ? nil
-            : diagnostic(.toolNameNotAllowed, choice: choice, envelope: envelope)
-        return .toolCall(
-            ProviderTurnToolCall(id: id, name: name, arguments: arguments),
+        var ids = Set<String>()
+        var typedCalls: [ProviderTurnToolCall] = []
+        typedCalls.reserveCapacity(calls.count)
+        var compatibilityDiagnostic: ProviderToolExchangeDiagnostic?
+        for envelope in calls {
+            guard envelope.type == "function" else {
+                return .rejected(diagnostic(.envelopeType, choice: choice, envelope: envelope))
+            }
+            guard let id = envelope.id,
+                  validIdentifier(id, maximumBytes: ProviderLimits.maximumToolCallIDBytes) else {
+                return .rejected(diagnostic(.idMissingOrInvalid, choice: choice, envelope: envelope))
+            }
+            guard ids.insert(id).inserted else {
+                return .rejected(diagnostic(.idDuplicate, choice: choice, envelope: envelope))
+            }
+            guard let name = envelope.function?.name,
+                  validToolName(name) else {
+                return .rejected(diagnostic(.toolNameMissingOrInvalid, choice: choice, envelope: envelope))
+            }
+            guard let arguments = envelope.function?.arguments,
+                  !arguments.isEmpty else {
+                return .rejected(diagnostic(.argumentsMissing, choice: choice, envelope: envelope))
+            }
+            guard arguments.utf8.count <= ProviderLimits.maximumToolArgumentsBytes else {
+                return .rejected(diagnostic(.argumentsTooLarge, choice: choice, envelope: envelope))
+            }
+            if compatibilityDiagnostic == nil, !allowedToolNames.contains(name) {
+                compatibilityDiagnostic = diagnostic(
+                    .toolNameNotAllowed,
+                    choice: choice,
+                    envelope: envelope
+                )
+            }
+            typedCalls.append(ProviderTurnToolCall(id: id, name: name, arguments: arguments))
+        }
+        return .toolCalls(
+            typedCalls,
             assistantContent: choice.message.content,
             diagnostic: compatibilityDiagnostic
         )
@@ -710,6 +730,8 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
                 return false
             }
         }
+        var pendingToolCallIDs = Set<String>()
+        var seenToolCallIDs = Set<String>()
         for message in request.messages {
             guard message.content.map({ $0.utf8.count <= ProviderLimits.maximumTurnMessageBytes }) ?? true,
                   message.toolCalls.count <= ProviderLimits.maximumToolCalls else {
@@ -717,31 +739,39 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
             }
             switch message.role {
             case .system, .user:
-                guard message.content?.isEmpty == false,
+                guard pendingToolCallIDs.isEmpty,
+                      message.content?.isEmpty == false,
                       message.toolCalls.isEmpty,
                       message.toolCallID == nil else { return false }
             case .assistant:
-                guard message.toolCallID == nil,
+                guard pendingToolCallIDs.isEmpty,
+                      message.toolCallID == nil,
                       message.content?.isEmpty == false || !message.toolCalls.isEmpty else {
                     return false
                 }
+                var assistantIDs = Set<String>()
                 for call in message.toolCalls {
                     guard validIdentifier(call.id, maximumBytes: ProviderLimits.maximumToolCallIDBytes),
+                          assistantIDs.insert(call.id).inserted,
+                          seenToolCallIDs.insert(call.id).inserted,
                           validToolName(call.name),
                           !call.arguments.isEmpty,
                           call.arguments.utf8.count <= ProviderLimits.maximumToolArgumentsBytes else {
                         return false
                     }
                 }
+                pendingToolCallIDs = assistantIDs
             case .tool:
                 guard message.content?.isEmpty == false,
                       message.toolCalls.isEmpty,
-                      message.toolCallID.map({ validIdentifier($0, maximumBytes: ProviderLimits.maximumToolCallIDBytes) }) == true else {
+                      let toolCallID = message.toolCallID,
+                      validIdentifier(toolCallID, maximumBytes: ProviderLimits.maximumToolCallIDBytes),
+                      pendingToolCallIDs.remove(toolCallID) != nil else {
                     return false
                 }
             }
         }
-        return true
+        return pendingToolCallIDs.isEmpty
     }
 
     private func validToolName(_ value: String) -> Bool {
@@ -965,8 +995,8 @@ private struct OpenAIToolFunction: Codable {
 }
 
 private enum OpenAIToolExchangeClassification {
-    case toolCall(
-        ProviderTurnToolCall,
+    case toolCalls(
+        [ProviderTurnToolCall],
         assistantContent: String?,
         diagnostic: ProviderToolExchangeDiagnostic?
     )
