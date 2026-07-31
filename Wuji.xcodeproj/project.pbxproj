@@ -18,6 +18,10 @@
 		010000000000000000000009 /* rootfs.tar.gz in Resources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000000C /* rootfs.tar.gz */; };
 		01000000000000000000000A /* WujiExecutorContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000000D /* WujiExecutorContractTests.swift */; };
 		01000000000000000000000B /* WujiISHGuestIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000000E /* WujiISHGuestIntegrationTests.swift */; };
+		01000000000000000000000C /* ProviderContracts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000000F /* ProviderContracts.swift */; };
+		01000000000000000000000D /* ProviderAttemptStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000010 /* ProviderAttemptStore.swift */; };
+		01000000000000000000000E /* DeepSeekProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000011 /* DeepSeekProvider.swift */; };
+		01000000000000000000000F /* WujiProviderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000012 /* WujiProviderTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -45,6 +49,10 @@
 		02000000000000000000000C /* rootfs.tar.gz */ = {isa = PBXFileReference; lastKnownFileType = archive.gzip; path = Resources/rootfs.tar.gz; sourceTree = "<group>"; };
 		02000000000000000000000D /* WujiExecutorContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiExecutorContractTests.swift; sourceTree = "<group>"; };
 		02000000000000000000000E /* WujiISHGuestIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiISHGuestIntegrationTests.swift; sourceTree = "<group>"; };
+		02000000000000000000000F /* ProviderContracts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderContracts.swift; sourceTree = "<group>"; };
+		020000000000000000000010 /* ProviderAttemptStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderAttemptStore.swift; sourceTree = "<group>"; };
+		020000000000000000000011 /* DeepSeekProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepSeekProvider.swift; sourceTree = "<group>"; };
+		020000000000000000000012 /* WujiProviderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiProviderTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -92,6 +100,9 @@
 				020000000000000000000009 /* ExecutorContracts.swift */,
 				02000000000000000000000A /* ISHExecutor.swift */,
 				02000000000000000000000B /* ExecutorSelfTestView.swift */,
+				02000000000000000000000F /* ProviderContracts.swift */,
+				020000000000000000000010 /* ProviderAttemptStore.swift */,
+				020000000000000000000011 /* DeepSeekProvider.swift */,
 				02000000000000000000000C /* rootfs.tar.gz */,
 				020000000000000000000004 /* Assets.xcassets */,
 				020000000000000000000005 /* Info.plist */,
@@ -105,6 +116,7 @@
 				020000000000000000000007 /* WujiSkeletonTests.swift */,
 				02000000000000000000000D /* WujiExecutorContractTests.swift */,
 				02000000000000000000000E /* WujiISHGuestIntegrationTests.swift */,
+				020000000000000000000012 /* WujiProviderTests.swift */,
 			);
 			path = WujiTests;
 			sourceTree = "<group>";
@@ -215,6 +227,9 @@
 				010000000000000000000006 /* ExecutorContracts.swift in Sources */,
 				010000000000000000000007 /* ISHExecutor.swift in Sources */,
 				010000000000000000000008 /* ExecutorSelfTestView.swift in Sources */,
+				01000000000000000000000C /* ProviderContracts.swift in Sources */,
+				01000000000000000000000D /* ProviderAttemptStore.swift in Sources */,
+				01000000000000000000000E /* DeepSeekProvider.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -225,6 +240,7 @@
 				010000000000000000000005 /* WujiSkeletonTests.swift in Sources */,
 				01000000000000000000000A /* WujiExecutorContractTests.swift in Sources */,
 				01000000000000000000000B /* WujiISHGuestIntegrationTests.swift in Sources */,
+				01000000000000000000000F /* WujiProviderTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

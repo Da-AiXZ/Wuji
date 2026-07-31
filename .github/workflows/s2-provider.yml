@@ -1,0 +1,313 @@
+name: S2 Cloud Provider
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  provider-validation:
+    name: Apple compile, mock tests, and real request
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out exact candidate without recursive submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Fail closed unless all S2 secrets are configured
+        shell: bash
+        env:
+          DEEPSEEK_BASE_URL: ${{ secrets.DEEPSEEK_BASE_URL }}
+          DEEPSEEK_MODEL: ${{ secrets.DEEPSEEK_MODEL }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          set -euo pipefail
+          set +x
+          [[ -n "${DEEPSEEK_BASE_URL:-}" ]] || { echo '::error::DEEPSEEK_BASE_URL is not configured'; exit 1; }
+          [[ -n "${DEEPSEEK_MODEL:-}" ]] || { echo '::error::DEEPSEEK_MODEL is not configured'; exit 1; }
+          [[ -n "${DEEPSEEK_API_KEY:-}" ]] || { echo '::error::DEEPSEEK_API_KEY is not configured'; exit 1; }
+          echo 'S2_SECRET_PREFLIGHT=PASS'
+
+      - name: Verify exact head and initialize approved source only
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git submodule update --init ThirdParty/ish
+          git -C ThirdParty/ish submodule update --init deps/libarchive
+          Scripts/verify-source-lock.sh
+
+      - name: Install fixed-source build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake meson ninja llvm lld
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
+
+      - name: Verify rootfs before any use
+        shell: bash
+        run: Scripts/fetch-rootfs.sh
+
+      - name: Build fixed iSH static closure
+        shell: bash
+        run: Scripts/build-ish.sh "$RUNNER_TEMP/wuji-ish"
+
+      - name: Verify Apple toolchain
+        shell: bash
+        run: xcodebuild -version
+
+      - name: Build exact-head unsigned Wuji app
+        shell: bash
+        run: |
+          set -euo pipefail
+          WUJI_ISH_BUILD_DIR="$RUNNER_TEMP/wuji-ish" xcodebuild \
+            -project Wuji.xcodeproj \
+            -scheme Wuji \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "generic/platform=iOS Simulator" \
+            clean build \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: Select an ARM64 iPad simulator
+        id: simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          simulator_id="$({ xcrun simctl list devices available -j; } | /usr/bin/python3 -c 'import json, sys; groups = json.load(sys.stdin)["devices"]; devices = [device for group in groups.values() for device in group if device.get("isAvailable") and "iPad" in device.get("name", "")]; print(devices[0]["udid"] if devices else "")')"
+          test -n "$simulator_id"
+          echo "id=$simulator_id" >> "$GITHUB_OUTPUT"
+
+      - name: Run S2 mock and boundary tests without secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "${DEEPSEEK_BASE_URL:-}"
+          test -z "${DEEPSEEK_MODEL:-}"
+          test -z "${DEEPSEEK_API_KEY:-}"
+          WUJI_ISH_BUILD_DIR="$RUNNER_TEMP/wuji-ish" xcodebuild \
+            -project Wuji.xcodeproj \
+            -scheme Wuji \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.id }}" \
+            -resultBundlePath "$RUNNER_TEMP/wuji-s2-tests.xcresult" \
+            -only-testing:"WujiTests/WujiProviderTests" \
+            test \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee "$RUNNER_TEMP/wuji-s2-xcodebuild.log"
+
+      - name: Compile the real-request probe from production Provider sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "${DEEPSEEK_BASE_URL:-}"
+          test -z "${DEEPSEEK_MODEL:-}"
+          test -z "${DEEPSEEK_API_KEY:-}"
+          xcrun swiftc -parse-as-library \
+            Wuji/ProviderContracts.swift \
+            Wuji/ProviderAttemptStore.swift \
+            Wuji/DeepSeekProvider.swift \
+            Scripts/s2-real-provider-probe.swift \
+            -o "$RUNNER_TEMP/wuji-s2-provider-probe"
+
+      - name: Send one real request and emit only bounded evidence
+        id: real_request
+        shell: bash
+        env:
+          DEEPSEEK_BASE_URL: ${{ secrets.DEEPSEEK_BASE_URL }}
+          DEEPSEEK_MODEL: ${{ secrets.DEEPSEEK_MODEL }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          set -euo pipefail
+          set +x
+          evidence_dir="$RUNNER_TEMP/wuji-s2-real-evidence"
+          summary_file="$RUNNER_TEMP/wuji-s2-real-summary.json"
+          stderr_file="$RUNNER_TEMP/wuji-s2-real-stderr.log"
+          mkdir -p "$evidence_dir"
+
+          set +e
+          "$RUNNER_TEMP/wuji-s2-provider-probe" "$evidence_dir" \
+            > "$summary_file" 2> "$stderr_file"
+          probe_status="$?"
+          set -e
+
+          export WUJI_S2_EVIDENCE_DIR="$evidence_dir"
+          export WUJI_S2_SUMMARY_FILE="$summary_file"
+          export WUJI_S2_STDERR_FILE="$stderr_file"
+          /usr/bin/python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+
+          secret = os.environ["DEEPSEEK_API_KEY"].encode()
+          if not secret:
+              raise SystemExit("secret unavailable to scanner")
+
+          workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          roots = [
+              pathlib.Path(os.environ["WUJI_S2_EVIDENCE_DIR"]),
+              pathlib.Path(os.environ["WUJI_S2_SUMMARY_FILE"]),
+              pathlib.Path(os.environ["WUJI_S2_STDERR_FILE"]),
+              pathlib.Path(os.environ["RUNNER_TEMP"]) / "wuji-s2-xcodebuild.log",
+              pathlib.Path(os.environ["RUNNER_TEMP"]) / "wuji-s2-tests.xcresult",
+              pathlib.Path(os.environ["RUNNER_TEMP"]) / "wuji-s2-provider-probe",
+          ]
+          tracked = subprocess.check_output(
+              ["git", "ls-files", "-z"], cwd=workspace
+          ).split(b"\0")
+          paths = [workspace / raw.decode() for raw in tracked if raw]
+          for root in roots:
+              if root.is_dir():
+                  paths.extend(path for path in root.rglob("*") if path.is_file())
+              elif root.is_file():
+                  paths.append(root)
+
+          def contains(path, needle):
+              overlap = max(0, len(needle) - 1)
+              tail = b""
+              with path.open("rb") as handle:
+                  while True:
+                      chunk = handle.read(1024 * 1024)
+                      if not chunk:
+                          return False
+                      block = tail + chunk
+                      if needle in block:
+                          return True
+                      tail = block[-overlap:] if overlap else b""
+
+          if any(path.is_file() and contains(path, secret) for path in paths):
+              raise SystemExit("secret found in S2 evidence surface")
+
+          summary_path = pathlib.Path(os.environ["WUJI_S2_SUMMARY_FILE"])
+          summary = json.loads(summary_path.read_text(encoding="utf-8"))
+          expected_summary_keys = {
+              "request_id", "result_category", "response_byte_count", "response_sha256"
+          }
+          if set(summary) != expected_summary_keys:
+              raise SystemExit("unexpected real-request summary shape")
+          if summary["result_category"] != "response":
+              raise SystemExit("real provider request did not return a response")
+          if not (0 < summary["response_byte_count"] <= 8192):
+              raise SystemExit("invalid response length summary")
+          if not re.fullmatch(r"[0-9a-f]{64}", summary["response_sha256"]):
+              raise SystemExit("invalid response hash summary")
+
+          attempt_path = pathlib.Path(os.environ["WUJI_S2_EVIDENCE_DIR"]) / "provider-attempts.jsonl"
+          attempts = [json.loads(line) for line in attempt_path.read_text(encoding="utf-8").splitlines()]
+          allowed_attempt_keys = {
+              "requestID", "attemptID", "providerID", "modelSHA256", "recordedAt",
+              "phase", "resultCategory", "responseByteCount", "responseSHA256"
+          }
+          if len(attempts) != 2 or any(set(item) != allowed_attempt_keys for item in attempts):
+              raise SystemExit("unexpected durable evidence shape")
+          if [item["phase"] for item in attempts] != ["intent_recorded", "succeeded"]:
+              raise SystemExit("durable intent/result ordering invalid")
+          if attempts[0]["requestID"] != summary["request_id"]:
+              raise SystemExit("request identity mismatch")
+          if attempts[1]["responseByteCount"] != summary["response_byte_count"]:
+              raise SystemExit("response length evidence mismatch")
+          if attempts[1]["responseSHA256"] != summary["response_sha256"]:
+              raise SystemExit("response hash evidence mismatch")
+          PY
+
+          if [[ "$probe_status" -ne 0 ]]; then
+            echo "::error::Real Provider probe failed with exit code $probe_status"
+            exit "$probe_status"
+          fi
+          echo "S2_REAL_REQUEST_SUMMARY=$(tr -d '\n' < "$summary_file")"
+
+      - name: Confirm forbidden capabilities and publication are absent
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test ! -e Wuji.ipa
+          test ! -d Payload
+          if grep -Ein \
+            'tool[_ -]?execution|agent[_ -]?loop|list/read/search|shell[_ -]?tool|edit[_ -]?tool' \
+            Wuji/ProviderContracts.swift Wuji/ProviderAttemptStore.swift Wuji/DeepSeekProvider.swift; then
+            echo '::error::Forbidden S3/S4 capability marker found in S2 production source'
+            exit 1
+          fi
+          echo 'S2_FORBIDDEN_CAPABILITY_SCAN=PASS'
+
+  raw-log-audit:
+    name: Exact secret scan of provider job raw log
+    needs: provider-validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Download the completed provider job raw log
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          jobs_json="$RUNNER_TEMP/s2-jobs.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" > "$jobs_json"
+          job_id="$(python3 - "$jobs_json" <<'PY'
+          import json
+          import sys
+          jobs = json.load(open(sys.argv[1], encoding="utf-8"))["jobs"]
+          matches = [job["id"] for job in jobs if job["name"] == "Apple compile, mock tests, and real request"]
+          if len(matches) != 1:
+              raise SystemExit("provider job identity is not unique")
+          print(matches[0])
+          PY
+          )"
+          gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$job_id/logs" > "$RUNNER_TEMP/s2-provider-job.log"
+
+      - name: Scan raw log for the exact API key and required evidence markers
+        shell: bash
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          set -euo pipefail
+          set +x
+          export WUJI_S2_RAW_LOG="$RUNNER_TEMP/s2-provider-job.log"
+          /usr/bin/python3 <<'PY'
+          import os
+          import pathlib
+
+          secret = os.environ["DEEPSEEK_API_KEY"].encode()
+          log = pathlib.Path(os.environ["WUJI_S2_RAW_LOG"]).read_bytes()
+          if not secret:
+              raise SystemExit("secret unavailable to raw-log scanner")
+          if secret in log:
+              raise SystemExit("exact API key found in provider job raw log")
+          for marker in [
+              b"** BUILD SUCCEEDED **",
+              b"** TEST SUCCEEDED **",
+              b"S2_REAL_REQUEST_SUMMARY=",
+              b'"result_category":"response"',
+          ]:
+              if marker not in log:
+                  raise SystemExit("required bounded evidence marker missing")
+          PY
+          echo 'S2_RAW_LOG_SECRET_SCAN=PASS'
+
+      - name: Confirm this run published no artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --jq '.total_count')" = "0"
+          echo 'S2_ARTIFACT_COUNT=0'
