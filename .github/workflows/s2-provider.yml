@@ -209,11 +209,14 @@ jobs:
 
           attempt_path = pathlib.Path(os.environ["WUJI_S2_EVIDENCE_DIR"]) / "provider-attempts.jsonl"
           attempts = [json.loads(line) for line in attempt_path.read_text(encoding="utf-8").splitlines()]
-          allowed_attempt_keys = {
+          common_attempt_keys = {
               "requestID", "attemptID", "providerID", "modelSHA256", "recordedAt",
-              "phase", "resultCategory", "responseByteCount", "responseSHA256"
+              "phase", "resultCategory"
           }
-          if len(attempts) != 2 or any(set(item) != allowed_attempt_keys for item in attempts):
+          success_attempt_keys = common_attempt_keys | {"responseByteCount", "responseSHA256"}
+          if len(attempts) != 2:
+              raise SystemExit("unexpected durable evidence record count")
+          if set(attempts[0]) != common_attempt_keys or set(attempts[1]) != success_attempt_keys:
               raise SystemExit("unexpected durable evidence shape")
           if [item["phase"] for item in attempts] != ["intent_recorded", "succeeded"]:
               raise SystemExit("durable intent/result ordering invalid")
