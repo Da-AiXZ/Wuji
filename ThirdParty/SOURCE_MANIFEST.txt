@@ -1,0 +1,8 @@
+Snapshot manifest SHA-256: 7e9656a9b5175af303fe8c219d269aac4ba93002cd7c2a690448d05d47f16ac9
+Snapshot content: 1726 blobs, 20815132 bytes
+iSH Git tree: b94281841315d439cd9b1b222c192a2919b63694
+libarchive Git commit: fc6563f5130d8a7ee1fc27c0e55baef35119f26c
+rootfs SHA-256: f31202c4070c4ef7de9e157e1bd01cb4da3a2150035d74ea5372c5e86f1efac1
+GPL-3.0.txt SHA-256: 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
+GPL-2.0.txt SHA-256: edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6
+libarchive-COPYING SHA-256: e1e3d4ba9d0b0ccba333b5f5539f7c6c9a3ef3d57a96cd165d2c45eaa1cd026d

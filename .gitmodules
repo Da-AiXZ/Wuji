@@ -1,0 +1,3 @@
+[submodule "ThirdParty/ish"]
+	path = ThirdParty/ish
+	url = https://github.com/OpenMinis/ish-arm64.git

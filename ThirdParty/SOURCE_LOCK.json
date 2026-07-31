@@ -1,0 +1,34 @@
+{
+  "executorAuthority": {
+    "localSnapshot": "references/sources/ish-arm64-master",
+    "publicReproducibleIdentity": {
+      "repository": "https://github.com/OpenMinis/ish-arm64.git",
+      "commit": "de124dd66124a15239cea1465164f74980ada245",
+      "tree": "b94281841315d439cd9b1b222c192a2919b63694"
+    },
+    "snapshotManifest": {
+      "algorithm": "sha256",
+      "digest": "7e9656a9b5175af303fe8c219d269aac4ba93002cd7c2a690448d05d47f16ac9",
+      "blobCount": 1726,
+      "byteCount": 20815132,
+      "comparison": "0 missing, 0 extra, 0 content differences"
+    }
+  },
+  "includedDependency": {
+    "name": "libarchive",
+    "repository": "https://github.com/libarchive/libarchive.git",
+    "commit": "fc6563f5130d8a7ee1fc27c0e55baef35119f26c"
+  },
+  "excludedGitlinks": {
+    "deps/libapps": "b8cacae35e5b11d64bb736a053921c16ca7faf9e",
+    "deps/linux": "8ec9bf17f89c6dba818f3ed2427de4223e78644a"
+  },
+  "rootfs": {
+    "distribution": "Alpine Linux",
+    "version": "3.21.0",
+    "architecture": "aarch64",
+    "url": "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz",
+    "size": 3851686,
+    "sha256": "f31202c4070c4ef7de9e157e1bd01cb4da3a2150035d74ea5372c5e86f1efac1"
+  }
+}

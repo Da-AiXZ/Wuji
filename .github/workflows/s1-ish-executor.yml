@@ -1,0 +1,91 @@
+name: S1 iSH Executor
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Unsigned build and real guest tests
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out exact candidate without recursive submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Verify exact head and initialize approved source only
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git submodule update --init ThirdParty/ish
+          git -C ThirdParty/ish submodule update --init deps/libarchive
+          Scripts/verify-source-lock.sh
+
+      - name: Install fixed-source build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake meson ninja llvm lld
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
+
+      - name: Verify rootfs before any use
+        shell: bash
+        run: Scripts/fetch-rootfs.sh
+
+      - name: Build fixed iSH static closure
+        shell: bash
+        run: Scripts/build-ish.sh "$RUNNER_TEMP/wuji-ish"
+
+      - name: Verify Apple toolchain
+        shell: bash
+        run: xcodebuild -version
+
+      - name: Build unsigned Wuji app with fixed executor
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          WUJI_ISH_BUILD_DIR="$RUNNER_TEMP/wuji-ish" xcodebuild \
+            -project Wuji.xcodeproj \
+            -scheme Wuji \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "generic/platform=iOS Simulator" \
+            clean build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: Select an ARM64 iPad simulator
+        id: simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          simulator_id="$({ xcrun simctl list devices available -j; } | /usr/bin/python3 -c 'import json, sys; groups = json.load(sys.stdin)["devices"]; devices = [device for group in groups.values() for device in group if device.get("isAvailable") and "iPad" in device.get("name", "")]; print(devices[0]["udid"] if devices else "")')"
+          test -n "$simulator_id"
+          echo "id=$simulator_id" >> "$GITHUB_OUTPUT"
+
+      - name: Run contract and real ARM64 guest integration tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          WUJI_ISH_BUILD_DIR="$RUNNER_TEMP/wuji-ish" xcodebuild \
+            -project Wuji.xcodeproj \
+            -scheme Wuji \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.id }}" \
+            test \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: Confirm no rootfs artifact publication
+        shell: bash
+        run: test -f Wuji/Resources/rootfs.tar.gz

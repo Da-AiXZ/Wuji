@@ -22,10 +22,11 @@ struct ContentView: View {
             }
             .frame(maxWidth: .infinity, alignment: .center)
 
+            ExecutorSelfTestView()
+
             Spacer()
         }
         .padding(24)
         .background(Color(uiColor: .systemGroupedBackground))
     }
 }
-

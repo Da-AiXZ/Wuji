@@ -1,6 +1,6 @@
 .DS_Store
+Wuji/Resources/rootfs.tar.gz
 build/
 DerivedData/
 *.xcuserstate
 xcuserdata/
-
