@@ -464,7 +464,7 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
                 maxTokens: 256,
                 stream: false,
                 tools: tools,
-                toolChoice: request.requireTool ? "required" : "auto"
+                toolChoice: nil
             ))
             guard body.count <= ProviderLimits.maximumRequestBodyBytes else {
                 return await finishInferenceFailure(
