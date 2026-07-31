@@ -74,22 +74,165 @@ jobs:
           test -n "$simulator_id"
           echo "id=$simulator_id" >> "$GITHUB_OUTPUT"
 
-      - name: Run contract and real ARM64 guest integration tests
+      - name: Run isolated real guest diagnostics
+        id: guest_diagnostics
         shell: bash
         run: |
           set -euo pipefail
           set -o pipefail
-          WUJI_ISH_BUILD_DIR="$RUNNER_TEMP/wuji-ish" xcodebuild \
-            -project Wuji.xcodeproj \
-            -scheme Wuji \
-            -configuration Debug \
-            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.id }}" \
-            test \
-            ARCHS=arm64 \
-            ONLY_ACTIVE_ARCH=YES \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO
+
+          evidence_root="$RUNNER_TEMP/wuji-s1-runtime-diagnostics"
+          mkdir -p "$evidence_root"
+          echo "artifact_safe=false" >> "$GITHUB_OUTPUT"
+
+          guest_cases=(
+            "success:testRealGuestSuccessSeparatesOutputAndExit"
+            "nonzero:testRealGuestPreservesNonzeroExit"
+            "truncation:testRealGuestBoundsOutputAndStillDrains"
+            "cancellation:testRealGuestCancellationRecordsSignalAndFinalObservation"
+          )
+          overall_status=0
+          printf 'case\tmethod\texit_code\tduration_seconds\tstarted_utc\tended_utc\n' \
+            > "$evidence_root/results.tsv"
+
+          for entry in "${guest_cases[@]}"; do
+            case_name="${entry%%:*}"
+            method="${entry#*:}"
+            case_dir="$evidence_root/$case_name"
+            result_bundle="$case_dir/$case_name.xcresult"
+            mkdir -p "$case_dir/crashes"
+
+            marker="$(mktemp "$RUNNER_TEMP/wuji-$case_name-marker.XXXXXX")"
+            started_epoch="$(date +%s)"
+            started_utc="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+            set +e
+            WUJI_ISH_BUILD_DIR="$RUNNER_TEMP/wuji-ish" xcodebuild \
+              -project Wuji.xcodeproj \
+              -scheme Wuji \
+              -configuration Debug \
+              -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.id }}" \
+              -resultBundlePath "$result_bundle" \
+              -only-testing:"WujiTests/WujiISHGuestIntegrationTests/$method" \
+              test \
+              ARCHS=arm64 \
+              ONLY_ACTIVE_ARCH=YES \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              2>&1 | tee "$case_dir/xcodebuild.log"
+            test_status="${PIPESTATUS[0]}"
+            set -e
+
+            ended_epoch="$(date +%s)"
+            ended_utc="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            duration="$((ended_epoch - started_epoch))"
+            printf '%s\n' "$test_status" > "$case_dir/exit-code.txt"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$case_name" "$method" "$test_status" "$duration" "$started_utc" "$ended_utc" \
+              >> "$evidence_root/results.tsv"
+
+            if [[ -d "$result_bundle" ]]; then
+              set +e
+              xcrun xcresulttool get test-results summary \
+                --path "$result_bundle" --format json \
+                > "$case_dir/xcresult-summary.json" \
+                2> "$case_dir/xcresult-summary.stderr"
+              printf '%s\n' "$?" > "$case_dir/xcresult-summary-exit-code.txt"
+              xcrun xcresulttool get test-results tests \
+                --path "$result_bundle" --format json \
+                > "$case_dir/xcresult-tests.json" \
+                2> "$case_dir/xcresult-tests.stderr"
+              printf '%s\n' "$?" > "$case_dir/xcresult-tests-exit-code.txt"
+              set -e
+            fi
+
+            set +e
+            xcrun simctl spawn "${{ steps.simulator.outputs.id }}" log show \
+              --style compact \
+              --start "$started_utc" \
+              --end "$ended_utc" \
+              --predicate 'process == "Wuji" OR process == "xctest" OR eventMessage CONTAINS[c] "WujiTests"' \
+              > "$case_dir/simulator.log" 2> "$case_dir/simulator-log.stderr"
+            printf '%s\n' "$?" > "$case_dir/simulator-log-exit-code.txt"
+            set -e
+
+            sleep 2
+            crash_roots=(
+              "$HOME/Library/Logs/DiagnosticReports"
+              "$HOME/Library/Developer/CoreSimulator/Devices/${{ steps.simulator.outputs.id }}/data/Library/Logs/CrashReporter"
+              "$HOME/Library/Developer/CoreSimulator/Devices/${{ steps.simulator.outputs.id }}/data/Library/Logs/DiagnosticReports"
+            )
+            root_index=0
+            for crash_root in "${crash_roots[@]}"; do
+              root_index="$((root_index + 1))"
+              [[ -d "$crash_root" ]] || continue
+              while IFS= read -r -d '' crash_file; do
+                base_name="$(basename "$crash_file")"
+                case "$base_name" in
+                  Wuji*|WujiTests*|xctest*)
+                    cp "$crash_file" "$case_dir/crashes/$root_index-$base_name"
+                    ;;
+                esac
+              done < <(find "$crash_root" -type f -newer "$marker" -print0)
+            done
+            rm -f "$marker"
+
+            if [[ "$test_status" -ne 0 ]]; then
+              overall_status=1
+            fi
+          done
+
+          forbidden_file="$(find "$evidence_root" \
+            -path '*.xcresult' -prune -o -type f \
+            \( -iname 'rootfs.tar.gz' -o -iname '*.mobileprovision' -o -iname '*.p12' -o -iname '*.cer' -o -iname '*.key' \) \
+            -print -quit)"
+          if [[ -n "$forbidden_file" ]]; then
+            echo "::error::Forbidden diagnostic artifact file: $forbidden_file"
+            exit 1
+          fi
+
+          set +e
+          grep -RInaE --exclude-dir='*.xcresult' \
+            '(ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|BEGIN (RSA |OPENSSH |EC )?PRIVATE KEY)' \
+            "$evidence_root" > "$RUNNER_TEMP/wuji-s1-secret-findings.txt"
+          secret_status="$?"
+          absolute_path_count="$(grep -RInaE --exclude-dir='*.xcresult' \
+            '(/Users/runner/|/private/var/|/Applications/Xcode_)' \
+            "$evidence_root" | wc -l | tr -d ' ')"
+          set -e
+          if [[ "$secret_status" -eq 0 ]]; then
+            echo "::error::Potential secret found in diagnostic evidence"
+            exit 1
+          fi
+          if [[ "$secret_status" -gt 1 ]]; then
+            echo "::error::Diagnostic secret scan failed"
+            exit 1
+          fi
+
+          {
+            echo 'Scope: four isolated Wuji S1 guest tests only.'
+            echo 'Contains: per-test xcodebuild log, exit code, timing, xcresult, relevant simulator log, and new Wuji/xctest crash reports.'
+            echo "Text absolute-path findings: $absolute_path_count."
+            echo 'Expected absolute paths are ephemeral GitHub runner, Xcode, DerivedData, CoreSimulator, and result-bundle paths required by original Apple diagnostics.'
+            echo 'Text evidence passed the credential/private-key scan. Raw xcresult is structured Apple evidence and cannot be redacted without changing the original diagnostic bundle.'
+            echo 'No rootfs archive, signing material, environment dump, or unrelated runner diagnostic bundle is included.'
+          } > "$evidence_root/ARTIFACT_SCOPE.txt"
+
+          echo "artifact_safe=true" >> "$GITHUB_OUTPUT"
+          echo "overall_status=$overall_status" >> "$GITHUB_OUTPUT"
+          exit "$overall_status"
+
+      - name: Upload scoped S1 runtime diagnostics
+        if: ${{ always() && steps.guest_diagnostics.outputs.artifact_safe == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: s1-runtime-diagnostics-${{ github.sha }}
+          path: ${{ runner.temp }}/wuji-s1-runtime-diagnostics
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
 
       - name: Confirm no rootfs artifact publication
+        if: always()
         shell: bash
         run: test -f Wuji/Resources/rootfs.tar.gz
