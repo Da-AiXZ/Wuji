@@ -204,7 +204,7 @@ private final class BoundedResponseCollector: NSObject, URLSessionDataDelegate, 
     }
 }
 
-final class DeepSeekProvider: CloudProvider, @unchecked Sendable {
+final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked Sendable {
     let providerID = "deepseek"
 
     private let endpoint: DeepSeekEndpoint
@@ -279,7 +279,9 @@ final class DeepSeekProvider: CloudProvider, @unchecked Sendable {
                 model: model,
                 messages: [OpenAIChatMessage(role: "user", content: prompt)],
                 maxTokens: 64,
-                stream: false
+                stream: false,
+                tools: nil,
+                toolChoice: nil
             ))
         } catch {
             return await finishFailure(
@@ -421,6 +423,305 @@ final class DeepSeekProvider: CloudProvider, @unchecked Sendable {
         ))
     }
 
+    func infer(request: ProviderInferenceRequest, requestID: UUID) async -> ProviderInferenceOutcome {
+        guard validate(request) else {
+            return .failure(.invalidInput)
+        }
+
+        let attemptID = UUID()
+        do {
+            try await attemptStore.record(evidence(
+                requestID: requestID,
+                attemptID: attemptID,
+                phase: .intentRecorded,
+                resultCategory: .none
+            ))
+        } catch {
+            return .failure(.evidenceWriteFailed)
+        }
+
+        let credential: ProviderCredential
+        do {
+            credential = try credentialSource.credential()
+        } catch {
+            return await finishInferenceFailure(
+                .credentialUnavailable,
+                category: .credentialUnavailable,
+                requestID: requestID,
+                attemptID: attemptID
+            )
+        }
+
+        let body: Data
+        do {
+            let messages = request.messages.map(OpenAIChatMessage.init)
+            let tools = request.tools.map {
+                OpenAIToolDefinitionEnvelope(type: "function", function: $0)
+            }
+            body = try JSONEncoder().encode(OpenAIChatCompletionRequest(
+                model: model,
+                messages: messages,
+                maxTokens: 256,
+                stream: false,
+                tools: tools,
+                toolChoice: request.requireTool ? "required" : "auto"
+            ))
+            guard body.count <= ProviderLimits.maximumRequestBodyBytes else {
+                return await finishInferenceFailure(
+                    .invalidInput,
+                    category: .invalidInput,
+                    requestID: requestID,
+                    attemptID: attemptID
+                )
+            }
+        } catch {
+            return await finishInferenceFailure(
+                .invalidInput,
+                category: .invalidInput,
+                requestID: requestID,
+                attemptID: attemptID
+            )
+        }
+
+        let httpRequest = credential.withValue { secret in
+            ProviderHTTPRequest(
+                url: endpoint.chatCompletionsURL,
+                headers: [
+                    "Authorization": "Bearer \(secret)",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                ],
+                body: body,
+                timeout: ProviderLimits.requestTimeoutSeconds
+            )
+        }
+
+        let httpResponse: ProviderHTTPResponse
+        do {
+            httpResponse = try await transport.send(httpRequest)
+        } catch ProviderTransportError.responseTooLarge {
+            return await finishInferenceFailure(
+                .responseTooLarge,
+                category: .responseTooLarge,
+                requestID: requestID,
+                attemptID: attemptID
+            )
+        } catch {
+            try? await attemptStore.record(evidence(
+                requestID: requestID,
+                attemptID: attemptID,
+                phase: .reconciliationRequired,
+                resultCategory: .transportUnknown
+            ))
+            return .unknown(.reconciliationRequired)
+        }
+
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            return await finishInferenceFailure(
+                .httpStatus(httpResponse.statusCode),
+                category: .httpError,
+                requestID: requestID,
+                attemptID: attemptID
+            )
+        }
+        guard !httpResponse.body.isEmpty else {
+            return await finishInferenceFailure(
+                .emptyResponse,
+                category: .emptyResponse,
+                requestID: requestID,
+                attemptID: attemptID
+            )
+        }
+        guard httpResponse.body.count <= ProviderLimits.maximumResponseBodyBytes,
+              let decoded = try? JSONDecoder().decode(
+                OpenAIChatCompletionResponse.self,
+                from: httpResponse.body
+              ),
+              !decoded.id.isEmpty,
+              decoded.choices.count == 1 else {
+            return await finishInferenceFailure(
+                .malformedResponse,
+                category: .malformedResponse,
+                requestID: requestID,
+                attemptID: attemptID
+            )
+        }
+
+        let choice = decoded.choices[0]
+        if !choice.message.toolCalls.isEmpty {
+            guard choice.finishReason == "tool_calls",
+                  choice.message.toolCalls.count == ProviderLimits.maximumToolCalls,
+                  let envelope = choice.message.toolCalls.first,
+                  envelope.type == "function",
+                  validIdentifier(envelope.id, maximumBytes: ProviderLimits.maximumToolCallIDBytes),
+                  validToolName(envelope.function.name),
+                  !envelope.function.arguments.isEmpty,
+                  envelope.function.arguments.utf8.count <= ProviderLimits.maximumToolArgumentsBytes,
+                  choice.message.content.map({ $0.utf8.count <= ProviderLimits.maximumOutputBytes }) ?? true else {
+                return await finishInferenceFailure(
+                    .invalidToolExchange,
+                    category: .invalidToolExchange,
+                    requestID: requestID,
+                    attemptID: attemptID
+                )
+            }
+            let call = ProviderTurnToolCall(
+                id: envelope.id,
+                name: envelope.function.name,
+                arguments: envelope.function.arguments
+            )
+            let assistant = ProviderTurnMessage(
+                role: .assistant,
+                content: choice.message.content,
+                toolCalls: [call]
+            )
+            let argumentData = Data(call.arguments.utf8)
+            guard await recordInferenceSuccess(
+                requestID: requestID,
+                attemptID: attemptID,
+                category: .toolCall,
+                data: argumentData
+            ) else {
+                return .failure(.evidenceWriteFailed)
+            }
+            return .decision(.toolCall(assistant, call))
+        }
+
+        guard choice.finishReason == "stop",
+              let content = choice.message.content,
+              !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              content.utf8.count <= ProviderLimits.maximumOutputBytes else {
+            return await finishInferenceFailure(
+                .invalidToolExchange,
+                category: .invalidToolExchange,
+                requestID: requestID,
+                attemptID: attemptID
+            )
+        }
+        let assistant = ProviderTurnMessage(role: .assistant, content: content)
+        let contentData = Data(content.utf8)
+        guard await recordInferenceSuccess(
+            requestID: requestID,
+            attemptID: attemptID,
+            category: .finish,
+            data: contentData
+        ) else {
+            return .failure(.evidenceWriteFailed)
+        }
+        return .decision(.finish(assistant))
+    }
+
+    private func validate(_ request: ProviderInferenceRequest) -> Bool {
+        guard !request.messages.isEmpty,
+              request.messages.count <= ProviderLimits.maximumTurnMessages,
+              !request.tools.isEmpty,
+              request.tools.count <= ProviderLimits.maximumToolDefinitions,
+              Set(request.tools.map(\.name)).count == request.tools.count else {
+            return false
+        }
+        for tool in request.tools {
+            guard validToolName(tool.name),
+                  !tool.descriptionText.isEmpty,
+                  tool.descriptionText.utf8.count <= 512,
+                  tool.parameters.type == "object",
+                  tool.parameters.properties.count <= 4,
+                  tool.parameters.additionalProperties == false,
+                  Set(tool.parameters.required).isSubset(of: Set(tool.parameters.properties.keys)) else {
+                return false
+            }
+        }
+        for message in request.messages {
+            guard message.content.map({ $0.utf8.count <= ProviderLimits.maximumTurnMessageBytes }) ?? true,
+                  message.toolCalls.count <= ProviderLimits.maximumToolCalls else {
+                return false
+            }
+            switch message.role {
+            case .system, .user:
+                guard message.content?.isEmpty == false,
+                      message.toolCalls.isEmpty,
+                      message.toolCallID == nil else { return false }
+            case .assistant:
+                guard message.toolCallID == nil,
+                      message.content?.isEmpty == false || !message.toolCalls.isEmpty else {
+                    return false
+                }
+                for call in message.toolCalls {
+                    guard validIdentifier(call.id, maximumBytes: ProviderLimits.maximumToolCallIDBytes),
+                          validToolName(call.name),
+                          !call.arguments.isEmpty,
+                          call.arguments.utf8.count <= ProviderLimits.maximumToolArgumentsBytes else {
+                        return false
+                    }
+                }
+            case .tool:
+                guard message.content?.isEmpty == false,
+                      message.toolCalls.isEmpty,
+                      message.toolCallID.map({ validIdentifier($0, maximumBytes: ProviderLimits.maximumToolCallIDBytes) }) == true else {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
+    private func validToolName(_ value: String) -> Bool {
+        guard validIdentifier(value, maximumBytes: ProviderLimits.maximumToolNameBytes) else {
+            return false
+        }
+        return value.unicodeScalars.allSatisfy {
+            CharacterSet.lowercaseLetters.contains($0)
+                || CharacterSet.decimalDigits.contains($0)
+                || $0 == "_"
+        }
+    }
+
+    private func validIdentifier(_ value: String, maximumBytes: Int) -> Bool {
+        let count = value.utf8.count
+        return count > 0
+            && count <= maximumBytes
+            && value.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
+    }
+
+    private func finishInferenceFailure(
+        _ failure: ProviderFailure,
+        category: ProviderAttemptResultCategory,
+        requestID: UUID,
+        attemptID: UUID
+    ) async -> ProviderInferenceOutcome {
+        do {
+            try await attemptStore.record(evidence(
+                requestID: requestID,
+                attemptID: attemptID,
+                phase: .failed,
+                resultCategory: category
+            ))
+            return .failure(failure)
+        } catch {
+            return .failure(.evidenceWriteFailed)
+        }
+    }
+
+    private func recordInferenceSuccess(
+        requestID: UUID,
+        attemptID: UUID,
+        category: ProviderAttemptResultCategory,
+        data: Data
+    ) async -> Bool {
+        do {
+            try await attemptStore.record(evidence(
+                requestID: requestID,
+                attemptID: attemptID,
+                phase: .succeeded,
+                resultCategory: category,
+                responseByteCount: data.count,
+                responseSHA256: ProviderDigest.sha256Hex(data)
+            ))
+            return true
+        } catch {
+            return false
+        }
+    }
+
     private func finishFailure(
         _ failure: ProviderFailure,
         category: ProviderAttemptResultCategory,
@@ -467,18 +768,51 @@ private struct OpenAIChatCompletionRequest: Encodable {
     let messages: [OpenAIChatMessage]
     let maxTokens: Int
     let stream: Bool
+    let tools: [OpenAIToolDefinitionEnvelope]?
+    let toolChoice: String?
 
     enum CodingKeys: String, CodingKey {
         case model
         case messages
         case maxTokens = "max_tokens"
         case stream
+        case tools
+        case toolChoice = "tool_choice"
     }
 }
 
 private struct OpenAIChatMessage: Codable {
     let role: String
-    let content: String
+    let content: String?
+    let toolCalls: [OpenAIToolCallEnvelope]?
+    let toolCallID: String?
+
+    init(role: String, content: String) {
+        self.role = role
+        self.content = content
+        toolCalls = nil
+        toolCallID = nil
+    }
+
+    init(_ message: ProviderTurnMessage) {
+        role = message.role.rawValue
+        content = message.content
+        toolCalls = message.toolCalls.isEmpty ? nil : message.toolCalls.map {
+            OpenAIToolCallEnvelope(
+                id: $0.id,
+                type: "function",
+                function: OpenAIToolFunction(name: $0.name, arguments: $0.arguments)
+            )
+        }
+        toolCallID = message.toolCallID
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case role
+        case content
+        case toolCalls = "tool_calls"
+        case toolCallID = "tool_call_id"
+    }
 }
 
 private struct OpenAIChatCompletionResponse: Decodable {
@@ -517,7 +851,18 @@ private struct OpenAIChatResponseMessage: Decodable {
     }
 }
 
-private struct OpenAIToolCallEnvelope: Decodable {
-    let id: String?
-    let type: String?
+private struct OpenAIToolDefinitionEnvelope: Codable {
+    let type: String
+    let function: ProviderToolDefinition
+}
+
+private struct OpenAIToolCallEnvelope: Codable {
+    let id: String
+    let type: String
+    let function: OpenAIToolFunction
+}
+
+private struct OpenAIToolFunction: Codable {
+    let name: String
+    let arguments: String
 }

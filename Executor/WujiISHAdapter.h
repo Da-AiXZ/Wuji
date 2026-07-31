@@ -24,6 +24,12 @@ typedef enum {
     WUJI_ISH_CANCEL_NO_ACTIVE_TASK = 2,
 } WujiISHCancelDelivery;
 
+typedef enum {
+    WUJI_ISH_READ_ONLY_LIST = 0,
+    WUJI_ISH_READ_ONLY_SEARCH = 1,
+    WUJI_ISH_READ_ONLY_READ = 2,
+} WujiISHReadOnlyOperation;
+
 typedef struct WujiISHRunResult WujiISHRunResult;
 
 int wuji_ish_prepare(const char *archive_path,
@@ -31,7 +37,16 @@ int wuji_ish_prepare(const char *archive_path,
                      char *error_buffer,
                      size_t error_buffer_size);
 
+int wuji_ish_mount_read_only_workspace(const char *host_path,
+                                       char *error_buffer,
+                                       size_t error_buffer_size);
+
 WujiISHRunResult *wuji_ish_run_self_test(WujiISHSelfTestCase test_case,
+                                         size_t output_limit);
+
+WujiISHRunResult *wuji_ish_run_read_only(WujiISHReadOnlyOperation operation,
+                                         const char *relative_path,
+                                         const char *query,
                                          size_t output_limit);
 
 WujiISHCancelDelivery wuji_ish_request_cancel(void);

@@ -17,6 +17,9 @@ enum ProviderAttemptResultCategory: String, Codable, Sendable {
     case malformedResponse = "malformed_response"
     case emptyResponse = "empty_response"
     case toolCallsRejected = "tool_calls_rejected"
+    case toolCall = "tool_call"
+    case finish
+    case invalidToolExchange = "invalid_tool_exchange"
     case responseTooLarge = "response_too_large"
     case transportUnknown = "transport_unknown"
 }

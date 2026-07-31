@@ -1,0 +1,3 @@
+This file is part of the bounded S3 fixture.
+WUJI_S3_TARGET=read-only-loop-pass
+The Harness must verify this value from recorded observations.

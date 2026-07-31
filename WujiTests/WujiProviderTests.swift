@@ -195,6 +195,70 @@ final class WujiProviderTests: XCTestCase {
         XCTAssertEqual(outcome, .failure(.toolCallsRejected))
     }
 
+    func testStructuredToolExchangeUsesSameTransportAndKeepsSecretOutOfBodyAndEvidence() async throws {
+        let capture = URLRequestCapture()
+        S2MockURLProtocol.handler = { request in
+            capture.store(request)
+            let body = Data("""
+            {"id":"turn-id","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-list","type":"function","function":{"name":"list","arguments":"{\\\"path\\\":\\\"\\\"}"}}]},"finish_reason":"tool_calls"}]}
+            """.utf8)
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )!,
+                body
+            )
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [S2MockURLProtocol.self]
+        let directory = temporaryDirectory()
+        let provider = try DeepSeekProvider(
+            baseURL: "https://relay.example/v1",
+            model: model,
+            credentialSource: StaticProviderCredentialSource(
+                credential: try ProviderCredential(apiKey)
+            ),
+            transport: URLSessionProviderTransport(configuration: configuration),
+            attemptStore: try FileProviderAttemptStore(directoryURL: directory),
+            now: { Date(timeIntervalSince1970: 1_000) }
+        )
+        let request = ProviderInferenceRequest(
+            messages: [
+                ProviderTurnMessage(role: .system, content: "fixed system"),
+                ProviderTurnMessage(role: .user, content: "fixed goal")
+            ],
+            tools: S3ToolPolicy.toolDefinitions,
+            requireTool: true
+        )
+
+        let outcome = await provider.infer(request: request, requestID: UUID())
+
+        guard case let .decision(.toolCall(assistant, call)) = outcome else {
+            return XCTFail("expected typed tool call, got \(outcome)")
+        }
+        XCTAssertEqual(call.id, "call-list")
+        XCTAssertEqual(call.name, "list")
+        XCTAssertEqual(call.arguments, "{\"path\":\"\"}")
+        XCTAssertEqual(assistant.toolCalls, [call])
+        XCTAssertFalse(String(describing: outcome).contains(call.arguments))
+
+        let captured = try XCTUnwrap(capture.request)
+        XCTAssertEqual(captured.value(forHTTPHeaderField: "Authorization"), "Bearer \(apiKey)")
+        let requestBody = try XCTUnwrap(capture.body)
+        XCTAssertFalse(requestBody.contains(Data(apiKey.utf8)))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: requestBody) as? [String: Any])
+        XCTAssertEqual(object["tool_choice"] as? String, "required")
+        XCTAssertEqual((object["tools"] as? [[String: Any]])?.count, 3)
+        XCTAssertEqual((object["messages"] as? [[String: Any]])?.map { $0["role"] as? String }, ["system", "user"])
+
+        let durable = try Data(contentsOf: directory.appendingPathComponent("provider-attempts.jsonl"))
+        XCTAssertFalse(durable.contains(Data(apiKey.utf8)))
+        XCTAssertFalse(durable.contains(Data(call.arguments.utf8)))
+    }
+
     func testUncertainTransportResultRequiresReconciliationAndNeverRetries() async throws {
         let transport = MockProviderTransport(mode: .networkFailure)
         let store = RecordingAttemptStore()

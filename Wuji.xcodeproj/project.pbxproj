@@ -22,6 +22,14 @@
 		01000000000000000000000D /* ProviderAttemptStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000010 /* ProviderAttemptStore.swift */; };
 		01000000000000000000000E /* DeepSeekProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000011 /* DeepSeekProvider.swift */; };
 		01000000000000000000000F /* WujiProviderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000012 /* WujiProviderTests.swift */; };
+		010000000000000000000010 /* S3AttemptStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000013 /* S3AttemptStore.swift */; };
+		010000000000000000000011 /* S3ReadOnlyTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000014 /* S3ReadOnlyTools.swift */; };
+		010000000000000000000012 /* ISHReadOnlyExecutor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000015 /* ISHReadOnlyExecutor.swift */; };
+		010000000000000000000013 /* S3ReadOnlyAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000016 /* S3ReadOnlyAgent.swift */; };
+		010000000000000000000014 /* S3ProbeRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000017 /* S3ProbeRunner.swift */; };
+		010000000000000000000015 /* S3Fixture in Resources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000018 /* S3Fixture */; };
+		010000000000000000000016 /* WujiS3AgentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000019 /* WujiS3AgentTests.swift */; };
+		010000000000000000000017 /* WujiS3ISHIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000001A /* WujiS3ISHIntegrationTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -53,6 +61,14 @@
 		020000000000000000000010 /* ProviderAttemptStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderAttemptStore.swift; sourceTree = "<group>"; };
 		020000000000000000000011 /* DeepSeekProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepSeekProvider.swift; sourceTree = "<group>"; };
 		020000000000000000000012 /* WujiProviderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiProviderTests.swift; sourceTree = "<group>"; };
+		020000000000000000000013 /* S3AttemptStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = S3AttemptStore.swift; sourceTree = "<group>"; };
+		020000000000000000000014 /* S3ReadOnlyTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = S3ReadOnlyTools.swift; sourceTree = "<group>"; };
+		020000000000000000000015 /* ISHReadOnlyExecutor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ISHReadOnlyExecutor.swift; sourceTree = "<group>"; };
+		020000000000000000000016 /* S3ReadOnlyAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = S3ReadOnlyAgent.swift; sourceTree = "<group>"; };
+		020000000000000000000017 /* S3ProbeRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = S3ProbeRunner.swift; sourceTree = "<group>"; };
+		020000000000000000000018 /* S3Fixture */ = {isa = PBXFileReference; lastKnownFileType = folder; path = S3Fixture; sourceTree = "<group>"; };
+		020000000000000000000019 /* WujiS3AgentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiS3AgentTests.swift; sourceTree = "<group>"; };
+		02000000000000000000001A /* WujiS3ISHIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiS3ISHIntegrationTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -103,6 +119,12 @@
 				02000000000000000000000F /* ProviderContracts.swift */,
 				020000000000000000000010 /* ProviderAttemptStore.swift */,
 				020000000000000000000011 /* DeepSeekProvider.swift */,
+				020000000000000000000013 /* S3AttemptStore.swift */,
+				020000000000000000000014 /* S3ReadOnlyTools.swift */,
+				020000000000000000000015 /* ISHReadOnlyExecutor.swift */,
+				020000000000000000000016 /* S3ReadOnlyAgent.swift */,
+				020000000000000000000017 /* S3ProbeRunner.swift */,
+				020000000000000000000018 /* S3Fixture */,
 				02000000000000000000000C /* rootfs.tar.gz */,
 				020000000000000000000004 /* Assets.xcassets */,
 				020000000000000000000005 /* Info.plist */,
@@ -117,6 +139,8 @@
 				02000000000000000000000D /* WujiExecutorContractTests.swift */,
 				02000000000000000000000E /* WujiISHGuestIntegrationTests.swift */,
 				020000000000000000000012 /* WujiProviderTests.swift */,
+				020000000000000000000019 /* WujiS3AgentTests.swift */,
+				02000000000000000000001A /* WujiS3ISHIntegrationTests.swift */,
 			);
 			path = WujiTests;
 			sourceTree = "<group>";
@@ -204,6 +228,7 @@
 			files = (
 				010000000000000000000004 /* Assets.xcassets in Resources */,
 				010000000000000000000009 /* rootfs.tar.gz in Resources */,
+				010000000000000000000015 /* S3Fixture in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -230,6 +255,11 @@
 				01000000000000000000000C /* ProviderContracts.swift in Sources */,
 				01000000000000000000000D /* ProviderAttemptStore.swift in Sources */,
 				01000000000000000000000E /* DeepSeekProvider.swift in Sources */,
+				010000000000000000000010 /* S3AttemptStore.swift in Sources */,
+				010000000000000000000011 /* S3ReadOnlyTools.swift in Sources */,
+				010000000000000000000012 /* ISHReadOnlyExecutor.swift in Sources */,
+				010000000000000000000013 /* S3ReadOnlyAgent.swift in Sources */,
+				010000000000000000000014 /* S3ProbeRunner.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -241,6 +271,8 @@
 				01000000000000000000000A /* WujiExecutorContractTests.swift in Sources */,
 				01000000000000000000000B /* WujiISHGuestIntegrationTests.swift in Sources */,
 				01000000000000000000000F /* WujiProviderTests.swift in Sources */,
+				010000000000000000000016 /* WujiS3AgentTests.swift in Sources */,
+				010000000000000000000017 /* WujiS3ISHIntegrationTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

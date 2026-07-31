@@ -13,6 +13,7 @@
 #include "fs/fake.h"
 #include "fs/real.h"
 #include "kernel/calls.h"
+#include "kernel/fs.h"
 #include "kernel/init.h"
 #include "kernel/signal.h"
 #include "kernel/task.h"
@@ -47,6 +48,8 @@ static pthread_mutex_t g_run_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_state_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_exit_condition = PTHREAD_COND_INITIALIZER;
 static bool g_booted = false;
+static bool g_workspace_mounted = false;
+static char g_workspace_source[4096];
 static struct task *g_init_task = NULL;
 static struct WujiISHRunResult *g_active_result = NULL;
 static int g_active_pid = -1;
@@ -119,6 +122,51 @@ int wuji_ish_prepare(const char *archive_path,
     return 0;
 }
 
+int wuji_ish_mount_read_only_workspace(const char *host_path,
+                                       char *error_buffer,
+                                       size_t error_buffer_size) {
+    if (host_path == NULL || host_path[0] == '\0') {
+        set_error(error_buffer, error_buffer_size, "workspace path missing");
+        return -1;
+    }
+    char canonical_path[sizeof(g_workspace_source)];
+    if (realpath(host_path, canonical_path) == NULL) {
+        set_error(error_buffer, error_buffer_size, "workspace path unavailable");
+        return -1;
+    }
+    struct stat workspace_stat;
+    if (stat(canonical_path, &workspace_stat) != 0 || !S_ISDIR(workspace_stat.st_mode)) {
+        set_error(error_buffer, error_buffer_size, "workspace path is not a directory");
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_boot_lock);
+    if (!g_booted) {
+        set_error(error_buffer, error_buffer_size, "executor is not prepared");
+        pthread_mutex_unlock(&g_boot_lock);
+        return -1;
+    }
+    if (g_workspace_mounted) {
+        bool same_source = strcmp(g_workspace_source, canonical_path) == 0;
+        if (!same_source)
+            set_error(error_buffer, error_buffer_size, "different workspace already mounted");
+        pthread_mutex_unlock(&g_boot_lock);
+        return same_source ? 0 : -1;
+    }
+
+    int flags = MS_READONLY_ | MS_NOSUID_ | MS_NODEV_ | MS_NOEXEC_;
+    int error = do_mount(&realfs, canonical_path, "/wuji-s3", "", flags);
+    if (error < 0) {
+        set_error(error_buffer, error_buffer_size, "workspace mount failed");
+        pthread_mutex_unlock(&g_boot_lock);
+        return error;
+    }
+    snprintf(g_workspace_source, sizeof(g_workspace_source), "%s", canonical_path);
+    g_workspace_mounted = true;
+    pthread_mutex_unlock(&g_boot_lock);
+    return 0;
+}
+
 static bool attach_host_fd(struct task *task, int guest_fd, int host_fd) {
     struct fd *fd = adhoc_fd_create(&realfs_fdops);
     if (fd == NULL)
@@ -174,6 +222,73 @@ static const char *fixed_script(WujiISHSelfTestCase test_case) {
     return NULL;
 }
 
+static bool append_argument(char *buffer,
+                            size_t capacity,
+                            size_t *offset,
+                            const char *argument) {
+    size_t length = strlen(argument) + 1;
+    if (*offset >= capacity || length > capacity - *offset - 1)
+        return false;
+    memcpy(buffer + *offset, argument, length);
+    *offset += length;
+    buffer[*offset] = '\0';
+    return true;
+}
+
+static bool valid_relative_path(const char *path) {
+    if (path == NULL)
+        return false;
+    size_t length = strlen(path);
+    if (length > 512 || path[0] == '/' || path[0] == '\\')
+        return false;
+    if (strchr(path, '\\') != NULL || strchr(path, '%') != NULL)
+        return false;
+
+    const char *component = path;
+    while (*component != '\0') {
+        const char *slash = strchr(component, '/');
+        size_t component_length = slash == NULL
+            ? strlen(component)
+            : (size_t)(slash - component);
+        if (component_length == 0 ||
+            (component_length == 1 && component[0] == '.') ||
+            (component_length == 2 && component[0] == '.' && component[1] == '.'))
+            return false;
+        for (size_t index = 0; index < component_length; index++) {
+            unsigned char byte = (unsigned char)component[index];
+            if (byte < 0x20 || byte == 0x7f)
+                return false;
+        }
+        if (slash == NULL)
+            break;
+        component = slash + 1;
+    }
+    return true;
+}
+
+static bool build_guest_path(const char *relative_path, char *output, size_t output_size) {
+    if (!valid_relative_path(relative_path))
+        return false;
+    int count = relative_path[0] == '\0'
+        ? snprintf(output, output_size, "/wuji-s3")
+        : snprintf(output, output_size, "/wuji-s3/%s", relative_path);
+    return count > 0 && (size_t)count < output_size;
+}
+
+static bool valid_query(const char *query) {
+    if (query == NULL)
+        return false;
+    size_t length = strlen(query);
+    if (length == 0 || length > 256)
+        return false;
+    for (size_t index = 0; index < length; index++) {
+        unsigned char byte = (unsigned char)query[index];
+        if (byte < 0x20 || byte == 0x7f)
+            return false;
+    }
+    return true;
+}
+
 static struct WujiISHRunResult *make_result(size_t output_limit) {
     struct WujiISHRunResult *result = calloc(1, sizeof(*result));
     if (result == NULL)
@@ -192,13 +307,15 @@ static struct WujiISHRunResult *make_result(size_t output_limit) {
     return result;
 }
 
-WujiISHRunResult *wuji_ish_run_self_test(WujiISHSelfTestCase test_case,
-                                         size_t output_limit) {
+static WujiISHRunResult *run_arguments(const char *executable,
+                                       int argument_count,
+                                       char *arguments,
+                                       size_t output_limit) {
     struct WujiISHRunResult *result = make_result(output_limit);
     if (result == NULL)
         return NULL;
-    const char *script = fixed_script(test_case);
-    if (script == NULL || !g_booted || g_init_task == NULL) {
+    if (executable == NULL || arguments == NULL || argument_count <= 0 ||
+        !g_booted || g_init_task == NULL) {
         set_error(result->error, sizeof(result->error), "executor is not prepared");
         return result;
     }
@@ -246,25 +363,13 @@ WujiISHRunResult *wuji_ish_run_self_test(WujiISHSelfTestCase test_case,
     result->stderr_stream.fd = stderr_pipe[0];
     stderr_pipe[0] = -1;
 
-    char argv[12288];
-    size_t script_length = strlen(script);
-    const char shell[] = "/bin/sh";
-    const char option[] = "-c";
-    size_t offset = 0;
-    memcpy(argv + offset, shell, sizeof(shell));
-    offset += sizeof(shell);
-    memcpy(argv + offset, option, sizeof(option));
-    offset += sizeof(option);
-    memcpy(argv + offset, script, script_length + 1);
-    offset += script_length + 1;
-    argv[offset] = '\0';
     const char environment[] =
         "HOME=/root\0"
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0"
         "TERM=dumb\0"
         "PYTHONMALLOC=malloc\0";
 
-    error = do_execve(shell, 3, argv, environment);
+    error = do_execve(executable, argument_count, arguments, environment);
     if (error < 0) {
         current = saved_current;
         set_error(result->error, sizeof(result->error), "guest exec failed");
@@ -333,6 +438,74 @@ finish:
     if (stderr_pipe[1] >= 0) close(stderr_pipe[1]);
     pthread_mutex_unlock(&g_run_lock);
     return result;
+}
+
+WujiISHRunResult *wuji_ish_run_self_test(WujiISHSelfTestCase test_case,
+                                         size_t output_limit) {
+    const char *script = fixed_script(test_case);
+    if (script == NULL)
+        return NULL;
+    char arguments[12288] = {0};
+    size_t offset = 0;
+    if (!append_argument(arguments, sizeof(arguments), &offset, "/bin/sh") ||
+        !append_argument(arguments, sizeof(arguments), &offset, "-c") ||
+        !append_argument(arguments, sizeof(arguments), &offset, script))
+        return NULL;
+    return run_arguments("/bin/sh", 3, arguments, output_limit);
+}
+
+WujiISHRunResult *wuji_ish_run_read_only(WujiISHReadOnlyOperation operation,
+                                         const char *relative_path,
+                                         const char *query,
+                                         size_t output_limit) {
+    if (!g_workspace_mounted || output_limit == 0 || output_limit > 4096)
+        return NULL;
+
+    char guest_path[1024];
+    if (!build_guest_path(relative_path, guest_path, sizeof(guest_path)))
+        return NULL;
+
+    char arguments[4096] = {0};
+    size_t offset = 0;
+    const char *executable = NULL;
+    int argument_count = 0;
+    switch (operation) {
+        case WUJI_ISH_READ_ONLY_LIST:
+            executable = "/bin/ls";
+            argument_count = 4;
+            if (!append_argument(arguments, sizeof(arguments), &offset, executable) ||
+                !append_argument(arguments, sizeof(arguments), &offset, "-1A") ||
+                !append_argument(arguments, sizeof(arguments), &offset, "--") ||
+                !append_argument(arguments, sizeof(arguments), &offset, guest_path))
+                return NULL;
+            break;
+        case WUJI_ISH_READ_ONLY_SEARCH:
+            if (!valid_query(query))
+                return NULL;
+            executable = "/bin/grep";
+            argument_count = 8;
+            if (!append_argument(arguments, sizeof(arguments), &offset, executable) ||
+                !append_argument(arguments, sizeof(arguments), &offset, "-r") ||
+                !append_argument(arguments, sizeof(arguments), &offset, "-n") ||
+                !append_argument(arguments, sizeof(arguments), &offset, "-F") ||
+                !append_argument(arguments, sizeof(arguments), &offset, "-H") ||
+                !append_argument(arguments, sizeof(arguments), &offset, "--") ||
+                !append_argument(arguments, sizeof(arguments), &offset, query) ||
+                !append_argument(arguments, sizeof(arguments), &offset, guest_path))
+                return NULL;
+            break;
+        case WUJI_ISH_READ_ONLY_READ:
+            executable = "/bin/cat";
+            argument_count = 3;
+            if (!append_argument(arguments, sizeof(arguments), &offset, executable) ||
+                !append_argument(arguments, sizeof(arguments), &offset, "--") ||
+                !append_argument(arguments, sizeof(arguments), &offset, guest_path))
+                return NULL;
+            break;
+        default:
+            return NULL;
+    }
+    return run_arguments(executable, argument_count, arguments, output_limit);
 }
 
 WujiISHCancelDelivery wuji_ish_request_cancel(void) {

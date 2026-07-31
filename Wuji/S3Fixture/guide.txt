@@ -1,0 +1,2 @@
+Wuji S3 approved read-only fixture workspace.
+Only typed list, search, and read observations are authorized.
