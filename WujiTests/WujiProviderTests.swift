@@ -195,12 +195,12 @@ final class WujiProviderTests: XCTestCase {
         XCTAssertEqual(outcome, .failure(.toolCallsRejected))
     }
 
-    func testStructuredToolExchangeUsesSameTransportAndKeepsSecretOutOfBodyAndEvidence() async throws {
+    func testStructuredToolExchangeUsesTypedCallsRegardlessOfFinishReasonMetadata() async throws {
         let capture = URLRequestCapture()
         S2MockURLProtocol.handler = { request in
             capture.store(request)
             let body = Data("""
-            {"id":"turn-id","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-list","type":"function","function":{"name":"list","arguments":"{\\\"path\\\":\\\"\\\"}"}}]},"finish_reason":"tool_calls"}]}
+            {"id":"turn-id","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-list","type":"function","function":{"name":"list","arguments":"{\\\"path\\\":\\\"\\\"}"}}]},"finish_reason":"stop"}]}
             """.utf8)
             return (
                 HTTPURLResponse(

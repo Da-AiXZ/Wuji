@@ -549,8 +549,7 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
 
         let choice = decoded.choices[0]
         if !choice.message.toolCalls.isEmpty {
-            guard choice.finishReason == "tool_calls",
-                  choice.message.toolCalls.count == ProviderLimits.maximumToolCalls,
+            guard choice.message.toolCalls.count == ProviderLimits.maximumToolCalls,
                   let envelope = choice.message.toolCalls.first,
                   envelope.type == "function",
                   validIdentifier(envelope.id, maximumBytes: ProviderLimits.maximumToolCallIDBytes),
