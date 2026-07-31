@@ -241,7 +241,48 @@ jobs:
           }
           if set(summary) != expected_summary_keys:
               raise SystemExit("unexpected S3 summary shape")
+
+          evidence_dirs = list((data_container / "Library" / "Application Support").glob("WujiS3Evidence-*"))
+          if len(evidence_dirs) != 1:
+              raise SystemExit("S3 evidence directory identity is not unique")
+          evidence_dir = evidence_dirs[0]
+
+          def read_jsonl(name):
+              path = evidence_dir / name
+              if not path.is_file():
+                  return []
+              return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+          attempts = read_jsonl("s3-attempts.jsonl")
+          provider_attempts = read_jsonl("provider-attempts.jsonl")
+
           if summary["result_category"] != "completed":
+              bounded_failure = {
+                  "result_category": summary["result_category"],
+                  "provider_intent_count": sum(
+                      item.get("ioKind") == "provider" and item.get("phase") == "intent_recorded"
+                      for item in attempts
+                  ),
+                  "executor_intent_count": sum(
+                      item.get("ioKind") == "executor" and item.get("phase") == "intent_recorded"
+                      for item in attempts
+                  ),
+                  "s3_terminal_categories": [
+                      item.get("resultCategory")
+                      for item in attempts
+                      if item.get("phase") != "intent_recorded"
+                  ],
+                  "provider_terminal_categories": [
+                      item.get("resultCategory")
+                      for item in provider_attempts
+                      if item.get("phase") != "intent_recorded"
+                  ],
+              }
+              print("S3_REAL_LOOP_FAILURE_SUMMARY=" + json.dumps(
+                  bounded_failure,
+                  sort_keys=True,
+                  separators=(",", ":"),
+              ))
               raise SystemExit("real S3 loop did not complete")
           if summary["relative_path"] != "records/target.txt":
               raise SystemExit("unexpected normalized target path")
@@ -253,13 +294,6 @@ jobs:
               raise SystemExit("tool execution count outside cap")
           if not re.fullmatch(r"[0-9a-f]{64}", summary["observation_sha256"]):
               raise SystemExit("invalid observation hash")
-
-          evidence_dirs = list((data_container / "Library" / "Application Support").glob("WujiS3Evidence-*"))
-          if len(evidence_dirs) != 1:
-              raise SystemExit("S3 evidence directory identity is not unique")
-          evidence_dir = evidence_dirs[0]
-          attempts = [json.loads(line) for line in (evidence_dir / "s3-attempts.jsonl").read_text(encoding="utf-8").splitlines()]
-          provider_attempts = [json.loads(line) for line in (evidence_dir / "provider-attempts.jsonl").read_text(encoding="utf-8").splitlines()]
 
           if any("WUJI_S3_TARGET" in json.dumps(item) or "records/target.txt" in json.dumps(item) for item in attempts + provider_attempts):
               raise SystemExit("raw prompt, arguments, path, or observation persisted")
