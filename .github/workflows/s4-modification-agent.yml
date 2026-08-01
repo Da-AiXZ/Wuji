@@ -140,35 +140,62 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             2>&1 | tee "$RUNNER_TEMP/wuji-s4-ish-build.log"
 
-          derived="$RUNNER_TEMP/wuji-s4-derived"
-          mapfile -t apps < <(find "$derived/Build/Products" -type d -name 'Wuji.app' -print)
-          mapfile -t tests < <(find "$derived/Build/Products" -type d -name 'WujiTests.xctest' -print)
-          test "${#apps[@]}" = 1
-          test "${#tests[@]}" = 1
-          app="${apps[0]}"
-          test_bundle="${tests[0]}"
-          source="$app/rootfs.tar.gz"
-          target="$test_bundle/rootfs.tar.gz"
-          test -f "$source"
-          source_size="$(wc -c < "$source" | tr -d ' ')"
-          source_sha256="$(shasum -a 256 "$source" | awk '{print $1}')"
-          test "$source_size" = "3851686"
-          test "$source_sha256" = "f31202c4070c4ef7de9e157e1bd01cb4da3a2150035d74ea5372c5e86f1efac1"
-          python3 - "$derived" "$app" "$test_bundle" <<'PY'
-          import os
+          /usr/bin/python3 - "$RUNNER_TEMP/wuji-s4-derived/Build/Products" <<'PY'
+          import hashlib
+          import shutil
           import sys
+          from pathlib import Path
 
-          derived, app, test_bundle = (os.path.realpath(value) for value in sys.argv[1:])
-          if not app.startswith(derived + os.sep) or not test_bundle.startswith(derived + os.sep):
-              raise SystemExit("S4 bundle escaped RUNNER_TEMP derived data")
+          expected_size = 3_851_686
+          expected_sha256 = "f31202c4070c4ef7de9e157e1bd01cb4da3a2150035d74ea5372c5e86f1efac1"
+          products = Path(sys.argv[1]).resolve(strict=True)
+
+          def unique_bundle(name):
+              matches = [path.resolve(strict=True) for path in products.rglob(name) if path.is_dir()]
+              if len(matches) != 1:
+                  raise SystemExit(f"expected exactly one {name} bundle")
+              bundle = matches[0]
+              try:
+                  bundle.relative_to(products)
+              except ValueError as error:
+                  raise SystemExit(f"{name} escaped RUNNER_TEMP derived products") from error
+              return bundle
+
+          def digest(path):
+              hasher = hashlib.sha256()
+              size = 0
+              with path.open("rb") as handle:
+                  while chunk := handle.read(64 * 1024):
+                      size += len(chunk)
+                      hasher.update(chunk)
+              return size, hasher.hexdigest()
+
+          app = unique_bundle("Wuji.app")
+          test_bundle = unique_bundle("WujiTests.xctest")
           if app == test_bundle:
               raise SystemExit("S4 app and XCTest bundle are not distinct")
+          source = (app / "rootfs.tar.gz").resolve(strict=True)
+          try:
+              source.relative_to(app)
+          except ValueError as error:
+              raise SystemExit("S4 rootfs source escaped app bundle") from error
+          if not source.is_file() or digest(source) != (expected_size, expected_sha256):
+              raise SystemExit("S4 app rootfs lock mismatch")
+
+          target = test_bundle / "rootfs.tar.gz"
+          if target.exists() or target.is_symlink():
+              raise SystemExit("S4 XCTest rootfs target already exists")
+          with source.open("rb") as source_handle, target.open("xb") as target_handle:
+              shutil.copyfileobj(source_handle, target_handle, length=64 * 1024)
+          resolved_target = target.resolve(strict=True)
+          try:
+              resolved_target.relative_to(test_bundle)
+          except ValueError as error:
+              raise SystemExit("S4 rootfs target escaped XCTest bundle") from error
+          if not resolved_target.is_file() or digest(resolved_target) != (expected_size, expected_sha256):
+              raise SystemExit("S4 XCTest rootfs lock mismatch")
+          print("S4_TEST_ROOTFS_COPY=PASS")
           PY
-          cp "$source" "$target"
-          target_size="$(wc -c < "$target" | tr -d ' ')"
-          target_sha256="$(shasum -a 256 "$target" | awk '{print $1}')"
-          test "$target_size" = "$source_size"
-          test "$target_sha256" = "$source_sha256"
 
           WUJI_ISH_BUILD_DIR="$RUNNER_TEMP/wuji-ish" xcodebuild \
             -project Wuji.xcodeproj \
