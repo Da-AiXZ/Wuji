@@ -37,6 +37,13 @@ final class WujiS4AgentTests: XCTestCase {
 
         let requests = await provider.requests()
         XCTAssertEqual(requests.count, 4)
+        XCTAssertEqual(requests.map { $0.tools.map(\.name) }, [
+            ["list", "search", "read"],
+            ["edit"],
+            ["verify"],
+            []
+        ])
+        XCTAssertEqual(requests.map(\.requireTool), [true, true, true, false])
         let secondMessages = requests[1].messages
         let assistantBatch = secondMessages.first { $0.role == .assistant && $0.toolCalls.count == 3 }
         XCTAssertEqual(assistantBatch?.toolCalls.map(\.id), ["list-1", "search-1", "read-1"])
@@ -81,6 +88,29 @@ final class WujiS4AgentTests: XCTestCase {
         )
         let outcome = await agent.run(taskID: fixture.taskID)
         XCTAssertFalse(outcome.isCompleted)
+        let calls = await executor.calls()
+        XCTAssertTrue(calls.isEmpty)
+    }
+
+    func testPolicyRejectionReportsOnlyBoundedReasonAndIndexWithZeroExecutorIO() async throws {
+        let fixture = try makeWorkspace()
+        let provider = TestS4Provider(outcomes: [.decision(toolDecision([
+            call(id: "blocked-1", name: "shell", arguments: "{}")
+        ]))])
+        let executor = TestS4Executor(workspace: fixture.workspace)
+        let agent = try makeAgent(
+            fixture: fixture,
+            provider: provider,
+            executor: executor,
+            store: TestS4Store(),
+            approval: TestS4ApprovalAuthorizer(mode: .approve)
+        )
+
+        let outcome = await agent.run(taskID: fixture.taskID)
+        XCTAssertEqual(
+            outcome,
+            .policyRejected(S4BatchPolicyError(reason: .unknownTool, callIndex: 0))
+        )
         let calls = await executor.calls()
         XCTAssertTrue(calls.isEmpty)
     }

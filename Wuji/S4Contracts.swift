@@ -262,6 +262,7 @@ enum S4PolicyPhase: Equatable, Sendable {
     case inspecting
     case inspected
     case edited
+    case verified
 }
 
 enum S4PolicyError: String, Error, Equatable, Codable, Sendable {
@@ -356,6 +357,7 @@ struct S4ToolPolicy: Sendable {
             do {
                 switch S4ToolName(rawValue: call.name) {
                 case .list, .search, .read:
+                    guard phase == .inspecting else { throw S4PolicyError.stalePhase }
                     tool = .readOnly(try readPolicy.authorize(call))
                 case .edit:
                     guard phase == .inspected else { throw S4PolicyError.stalePhase }
@@ -427,6 +429,19 @@ struct S4ToolPolicy: Sendable {
                 )
             )
         ]
+    }
+
+    static func toolDefinitions(for phase: S4PolicyPhase) -> [ProviderToolDefinition] {
+        switch phase {
+        case .inspecting:
+            return S3ToolPolicy.toolDefinitions
+        case .inspected:
+            return toolDefinitions.filter { $0.name == S4ToolName.edit.rawValue }
+        case .edited:
+            return toolDefinitions.filter { $0.name == S4ToolName.verify.rawValue }
+        case .verified:
+            return []
+        }
     }
 
     private func parseObject(_ arguments: String, keys: Set<String>) throws -> [String: String] {

@@ -252,6 +252,7 @@ jobs:
               "write_stderr_eof_observed", "write_truncated", "verify_root_exit_observed",
               "verify_stdout_eof_observed", "verify_stderr_eof_observed",
               "verify_truncated", "completion_category",
+              "policy_rejection_reason", "policy_call_index",
           }
           if set(summary) != expected_summary_keys:
               raise SystemExit("unexpected S4 summary shape")
@@ -272,6 +273,20 @@ jobs:
           provider_attempts = read_jsonl("provider-attempts.jsonl")
 
           if summary["result_category"] != "completed":
+              allowed_policy_reasons = {
+                  "batch_count", "side_effect_isolation", "tool_call_id", "unknown_tool",
+                  "invalid_arguments", "path_rejected", "path_unavailable", "symlink_escape",
+                  "query_rejected", "stale_phase", "verification_profile",
+              }
+              reason = summary["policy_rejection_reason"]
+              index = summary["policy_call_index"]
+              if summary["result_category"] == "policy_rejected":
+                  if reason not in allowed_policy_reasons:
+                      raise SystemExit("unexpected policy rejection reason")
+                  if isinstance(index, bool) or not isinstance(index, int) or not (-1 <= index < 3):
+                      raise SystemExit("policy rejection index outside cap")
+              elif reason != "" or index != -1:
+                  raise SystemExit("policy diagnostic outside policy rejection")
               bounded_failure = {
                   "result_category": summary["result_category"],
                   "provider_intent_count": sum(
@@ -294,6 +309,14 @@ jobs:
                       if item.get("phase") != "intent_recorded"
                   ],
                   "approval_phases": [item.get("phase") for item in approvals],
+                  "policy_rejection_reason": reason,
+                  "policy_call_index": index,
+                  "tool_sequence": [
+                      item.get("toolName")
+                      for item in attempts
+                      if item.get("phase") == "succeeded"
+                      and item.get("ioKind") in {"read_executor", "write_executor", "verify_executor"}
+                  ],
               }
               print("S4_REAL_LOOP_FAILURE_SUMMARY=" + json.dumps(
                   bounded_failure,
@@ -307,6 +330,8 @@ jobs:
               raise SystemExit("explicit validation approval missing")
           if summary["completion_category"] != "code_owned_completed":
               raise SystemExit("code-owned completion missing")
+          if summary["policy_rejection_reason"] != "" or summary["policy_call_index"] != -1:
+              raise SystemExit("policy diagnostic present on completed summary")
           if not (1 <= summary["provider_request_count"] <= 10):
               raise SystemExit("provider request count outside cap")
           if not (5 <= summary["executor_call_count"] <= 10):

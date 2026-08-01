@@ -56,6 +56,25 @@ final class WujiS4ContractsTests: XCTestCase {
         }
     }
 
+    func testPhaseScopedCatalogCannotBeExpandedByPromptOrModel() throws {
+        XCTAssertEqual(
+            S4ToolPolicy.toolDefinitions(for: .inspecting).map(\.name),
+            ["list", "search", "read"]
+        )
+        XCTAssertEqual(S4ToolPolicy.toolDefinitions(for: .inspected).map(\.name), ["edit"])
+        XCTAssertEqual(S4ToolPolicy.toolDefinitions(for: .edited).map(\.name), ["verify"])
+        XCTAssertTrue(S4ToolPolicy.toolDefinitions(for: .verified).isEmpty)
+
+        let fixture = try makeWorkspace()
+        let policy = try S4ToolPolicy(workspace: fixture.workspace)
+        let lateRead = call(id: "late-read", name: "read", arguments: #"{"path":"records/draft.txt"}"#)
+        for phase in [S4PolicyPhase.inspected, .edited, .verified] {
+            XCTAssertThrowsError(try policy.authorizeBatch([lateRead], phase: phase)) {
+                XCTAssertEqual((error as? S4BatchPolicyError)?.reason, .stalePhase)
+            }
+        }
+    }
+
     func testInvalidNameArgumentsPathProfileAndPhaseFailClosed() throws {
         let fixture = try makeWorkspace()
         let policy = try S4ToolPolicy(workspace: fixture.workspace)

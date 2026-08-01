@@ -285,6 +285,66 @@ final class WujiProviderTests: XCTestCase {
         XCTAssertEqual(sendCount, 1)
     }
 
+    func testFinishOnlyRequestOmitsToolsAndRejectsRequiredEmptyCatalog() async throws {
+        let capture = URLRequestCapture()
+        let responseBody = diagnosticResponseBody(
+            toolCalls: [],
+            content: "bounded finish",
+            finishReason: "stop"
+        )
+        S2MockURLProtocol.handler = { request in
+            capture.store(request)
+            return (
+                HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )!,
+                responseBody
+            )
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [S2MockURLProtocol.self]
+        let provider = try DeepSeekProvider(
+            baseURL: "https://relay.example/v1",
+            model: model,
+            credentialSource: StaticProviderCredentialSource(
+                credential: try ProviderCredential(apiKey)
+            ),
+            transport: URLSessionProviderTransport(configuration: configuration),
+            attemptStore: RecordingAttemptStore()
+        )
+        let messages = [
+            ProviderTurnMessage(role: .system, content: "fixed system"),
+            ProviderTurnMessage(role: .user, content: "fixed goal")
+        ]
+        let finishRequest = ProviderInferenceRequest(
+            messages: messages,
+            tools: [],
+            requireTool: false
+        )
+        guard case .decision(.finish) = await provider.infer(
+            request: finishRequest,
+            requestID: UUID()
+        ) else {
+            return XCTFail("finish-only request did not use the no-tool branch")
+        }
+        let requestBody = try XCTUnwrap(capture.body)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: requestBody) as? [String: Any])
+        XCTAssertNil(object["tools"])
+        XCTAssertNil(object["tool_choice"])
+
+        let requiredEmpty = ProviderInferenceRequest(
+            messages: messages,
+            tools: [],
+            requireTool: true
+        )
+        let rejected = await provider.infer(request: requiredEmpty, requestID: UUID())
+        XCTAssertEqual(rejected, .failure(.invalidInput))
+        XCTAssertEqual(capture.count, 1)
+    }
+
     func testTwoAndThreeToolCallsPreserveArrayOrderDespiteFinishReasonStop() async throws {
         for count in [2, 3] {
             let responseCalls = (0..<count).map { index in
@@ -761,6 +821,7 @@ private final class URLRequestCapture: @unchecked Sendable {
     private let lock = NSLock()
     private var storedRequest: URLRequest?
     private var storedBody: Data?
+    private var storedCount = 0
 
     var request: URLRequest? {
         lock.lock()
@@ -774,10 +835,17 @@ private final class URLRequestCapture: @unchecked Sendable {
         return storedBody
     }
 
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedCount
+    }
+
     func store(_ request: URLRequest) {
         lock.lock()
         storedRequest = request
         storedBody = request.httpBody ?? Self.readBodyStream(request.httpBodyStream)
+        storedCount += 1
         lock.unlock()
     }
 

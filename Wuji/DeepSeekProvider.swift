@@ -463,7 +463,7 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
                 messages: messages,
                 maxTokens: 256,
                 stream: false,
-                tools: tools,
+                tools: tools.isEmpty ? nil : tools,
                 toolChoice: nil
             ))
             guard body.count <= ProviderLimits.maximumRequestBodyBytes else {
@@ -714,8 +714,8 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
     private func validate(_ request: ProviderInferenceRequest) -> Bool {
         guard !request.messages.isEmpty,
               request.messages.count <= ProviderLimits.maximumTurnMessages,
-              !request.tools.isEmpty,
               request.tools.count <= ProviderLimits.maximumToolDefinitions,
+              (!request.requireTool || !request.tools.isEmpty),
               Set(request.tools.map(\.name)).count == request.tools.count else {
             return false
         }

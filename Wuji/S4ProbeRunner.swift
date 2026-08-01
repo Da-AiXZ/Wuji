@@ -21,6 +21,8 @@ private struct S4ProbeSummary: Codable {
     let verifyStderrEOFObserved: Bool
     let verifyTruncated: Bool
     let completionCategory: String
+    let policyRejectionReason: String
+    let policyCallIndex: Int
 
     enum CodingKeys: String, CodingKey {
         case resultCategory = "result_category"
@@ -43,6 +45,8 @@ private struct S4ProbeSummary: Codable {
         case verifyStderrEOFObserved = "verify_stderr_eof_observed"
         case verifyTruncated = "verify_truncated"
         case completionCategory = "completion_category"
+        case policyRejectionReason = "policy_rejection_reason"
+        case policyCallIndex = "policy_call_index"
     }
 }
 
@@ -148,6 +152,12 @@ enum S4ProbeRunner {
                 write(summary)
             case .reconciliationRequired:
                 writeFailure(category: "reconciliation_required")
+            case let .policyRejected(diagnostic):
+                writeFailure(
+                    category: "policy_rejected",
+                    policyRejectionReason: diagnostic.reason.rawValue,
+                    policyCallIndex: diagnostic.callIndex ?? -1
+                )
             case let .failure(failure):
                 writeFailure(category: failure.rawValue)
             }
@@ -210,7 +220,9 @@ enum S4ProbeRunner {
             verifyStdoutEOFObserved: true,
             verifyStderrEOFObserved: true,
             verifyTruncated: false,
-            completionCategory: "code_owned_completed"
+            completionCategory: "code_owned_completed",
+            policyRejectionReason: "",
+            policyCallIndex: -1
         )
     }
 
@@ -247,7 +259,11 @@ enum S4ProbeRunner {
         )
     }
 
-    private static func writeFailure(category: String) {
+    private static func writeFailure(
+        category: String,
+        policyRejectionReason: String = "",
+        policyCallIndex: Int = -1
+    ) {
         write(S4ProbeSummary(
             resultCategory: category,
             providerRequestCount: 0,
@@ -268,7 +284,9 @@ enum S4ProbeRunner {
             verifyStdoutEOFObserved: false,
             verifyStderrEOFObserved: false,
             verifyTruncated: false,
-            completionCategory: "not_completed"
+            completionCategory: "not_completed",
+            policyRejectionReason: policyRejectionReason,
+            policyCallIndex: policyCallIndex
         ))
     }
 

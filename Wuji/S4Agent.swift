@@ -26,6 +26,7 @@ enum S4LoopFailure: String, Error, Equatable, Sendable {
 enum S4LoopOutcome: Equatable, Sendable {
     case completed(S4Completion)
     case failure(S4LoopFailure)
+    case policyRejected(S4BatchPolicyError)
     case reconciliationRequired
 }
 
@@ -116,7 +117,7 @@ final class S4Agent: @unchecked Sendable {
         switch outcome {
         case .completed: await executionProjection.report(.completed)
         case .reconciliationRequired: await executionProjection.report(.reconciliationRequired)
-        case .failure: await executionProjection.report(.failed)
+        case .failure, .policyRejected: await executionProjection.report(.failed)
         }
         return outcome
     }
@@ -142,8 +143,8 @@ final class S4Agent: @unchecked Sendable {
             }
             let request = ProviderInferenceRequest(
                 messages: messages,
-                tools: S4ToolPolicy.toolDefinitions,
-                requireTool: verifyObservation == nil
+                tools: S4ToolPolicy.toolDefinitions(for: phase),
+                requireTool: phase != .verified
             )
             let operationID = makeUUID()
             let attemptID = makeUUID()
@@ -216,6 +217,8 @@ final class S4Agent: @unchecked Sendable {
                             phase: phase,
                             previouslyUsedIDs: usedIDs
                         )
+                    } catch let error as S4BatchPolicyError {
+                        return .policyRejected(error)
                     } catch {
                         return .failure(.policyRejected)
                     }
@@ -284,7 +287,10 @@ final class S4Agent: @unchecked Sendable {
                             guard editObservation != nil,
                                   let approvalRequest,
                                   let approvalGrant else {
-                                return .failure(.policyRejected)
+                                return .policyRejected(S4BatchPolicyError(
+                                    reason: .stalePhase,
+                                    callIndex: nil
+                                ))
                             }
                             let step = await executeVerify(
                                 taskID: taskID,
@@ -297,6 +303,7 @@ final class S4Agent: @unchecked Sendable {
                             case let .success(observation):
                                 toolExecutionCount += 1
                                 verifyObservation = observation
+                                phase = .verified
                                 messages.append(ProviderTurnMessage(
                                     role: .tool,
                                     content: observation.modelContent(),
