@@ -255,6 +255,7 @@ final class WujiProviderTests: XCTestCase {
         let requestBody = try XCTUnwrap(capture.body)
         XCTAssertFalse(requestBody.contains(Data(apiKey.utf8)))
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: requestBody) as? [String: Any])
+        XCTAssertEqual(object["max_tokens"] as? Int, 10_000)
         XCTAssertNil(object["tool_choice"])
         XCTAssertEqual((object["tools"] as? [[String: Any]])?.count, 3)
         XCTAssertEqual((object["messages"] as? [[String: Any]])?.map { $0["role"] as? String }, ["system", "user"])

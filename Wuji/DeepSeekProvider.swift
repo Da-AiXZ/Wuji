@@ -461,7 +461,7 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
             body = try JSONEncoder().encode(OpenAIChatCompletionRequest(
                 model: model,
                 messages: messages,
-                maxTokens: 256,
+                maxTokens: 10_000,
                 stream: false,
                 tools: tools.isEmpty ? nil : tools,
                 toolChoice: nil
