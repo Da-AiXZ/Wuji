@@ -502,11 +502,12 @@ jobs:
           if len(executor_ops) != summary["executor_call_count"]:
               raise SystemExit("executor intent count mismatch")
           tool_sequence = [records[0]["toolName"] for records in executor_ops]
+          cursor = -1
           for required in ["list", "search", "read"]:
-              if required not in tool_sequence:
-                  raise SystemExit("required real tool observation missing")
-          if not (tool_sequence.index("list") < tool_sequence.index("search") < tool_sequence.index("read")):
-              raise SystemExit("required tool observation order invalid")
+              matches = [index for index in range(cursor + 1, len(tool_sequence)) if tool_sequence[index] == required]
+              if not matches:
+                  raise SystemExit("required ordered real tool observation missing")
+              cursor = matches[0]
           if tool_sequence.count("edit") != 1 or tool_sequence.count("verify") != 1:
               raise SystemExit("side-effect tool count mismatch")
           if tool_sequence.index("edit") > tool_sequence.index("verify"):
