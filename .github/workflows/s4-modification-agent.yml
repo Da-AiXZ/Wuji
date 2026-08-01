@@ -131,10 +131,55 @@ jobs:
             -configuration Debug \
             -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.id }}" \
             -derivedDataPath "$RUNNER_TEMP/wuji-s4-derived" \
+            -only-testing:"WujiTests/WujiS3ISHIntegrationTests" \
+            -only-testing:"WujiTests/WujiS4ISHIntegrationTests" \
+            build-for-testing \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee "$RUNNER_TEMP/wuji-s4-ish-build.log"
+
+          derived="$RUNNER_TEMP/wuji-s4-derived"
+          mapfile -t apps < <(find "$derived/Build/Products" -type d -name 'Wuji.app' -print)
+          mapfile -t tests < <(find "$derived/Build/Products" -type d -name 'WujiTests.xctest' -print)
+          test "${#apps[@]}" = 1
+          test "${#tests[@]}" = 1
+          app="${apps[0]}"
+          test_bundle="${tests[0]}"
+          source="$app/rootfs.tar.gz"
+          target="$test_bundle/rootfs.tar.gz"
+          test -f "$source"
+          source_size="$(wc -c < "$source" | tr -d ' ')"
+          source_sha256="$(shasum -a 256 "$source" | awk '{print $1}')"
+          test "$source_size" = "3851686"
+          test "$source_sha256" = "f31202c4070c4ef7de9e157e1bd01cb4da3a2150035d74ea5372c5e86f1efac1"
+          python3 - "$derived" "$app" "$test_bundle" <<'PY'
+          import os
+          import sys
+
+          derived, app, test_bundle = (os.path.realpath(value) for value in sys.argv[1:])
+          if not app.startswith(derived + os.sep) or not test_bundle.startswith(derived + os.sep):
+              raise SystemExit("S4 bundle escaped RUNNER_TEMP derived data")
+          if app == test_bundle:
+              raise SystemExit("S4 app and XCTest bundle are not distinct")
+          PY
+          cp "$source" "$target"
+          target_size="$(wc -c < "$target" | tr -d ' ')"
+          target_sha256="$(shasum -a 256 "$target" | awk '{print $1}')"
+          test "$target_size" = "$source_size"
+          test "$target_sha256" = "$source_sha256"
+
+          WUJI_ISH_BUILD_DIR="$RUNNER_TEMP/wuji-ish" xcodebuild \
+            -project Wuji.xcodeproj \
+            -scheme Wuji \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.id }}" \
+            -derivedDataPath "$RUNNER_TEMP/wuji-s4-derived" \
             -resultBundlePath "$RUNNER_TEMP/wuji-s4-ish-tests.xcresult" \
             -only-testing:"WujiTests/WujiS3ISHIntegrationTests" \
             -only-testing:"WujiTests/WujiS4ISHIntegrationTests" \
-            test \
+            test-without-building \
             ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=NO \
@@ -273,6 +318,63 @@ jobs:
           provider_attempts = read_jsonl("provider-attempts.jsonl")
 
           if summary["result_category"] != "completed":
+              diagnostic = None
+              provider_terminals = [
+                  item for item in provider_attempts
+                  if item.get("phase") != "intent_recorded"
+              ]
+              last_provider_terminal = provider_terminals[-1] if provider_terminals else None
+              if (
+                  last_provider_terminal is not None
+                  and last_provider_terminal.get("phase") == "failed"
+                  and last_provider_terminal.get("resultCategory") == "invalid_tool_exchange"
+              ):
+                  raw_diagnostic = last_provider_terminal.get("toolExchangeDiagnostic")
+                  expected_diagnostic_keys = {
+                      "reason", "toolCallCount", "finishReasonPresent",
+                      "finishReasonByteCount", "assistantContentPresent",
+                      "assistantContentByteCount", "envelopeTypeIsFunction",
+                      "toolCallIDPresent", "toolCallIDByteCount", "toolNamePresent",
+                      "toolNameByteCount", "argumentsPresent", "argumentsByteCount",
+                  }
+                  if not isinstance(raw_diagnostic, dict) or set(raw_diagnostic) != expected_diagnostic_keys:
+                      raise SystemExit("invalid bounded Provider tool-exchange diagnostic shape")
+                  allowed_diagnostic_reasons = {
+                      "no_tool_calls_with_invalid_finish_or_content", "tool_call_count",
+                      "envelope_type", "id_missing_or_invalid", "id_duplicate",
+                      "tool_name_missing_or_invalid", "tool_name_not_allowed",
+                      "arguments_missing", "arguments_too_large",
+                      "assistant_content_too_large",
+                  }
+                  if (
+                      not isinstance(raw_diagnostic["reason"], str)
+                      or raw_diagnostic["reason"] not in allowed_diagnostic_reasons
+                  ):
+                      raise SystemExit("invalid bounded Provider tool-exchange diagnostic reason")
+                  for key in [
+                      "finishReasonPresent", "assistantContentPresent",
+                      "envelopeTypeIsFunction", "toolCallIDPresent",
+                      "toolNamePresent", "argumentsPresent",
+                  ]:
+                      if not isinstance(raw_diagnostic[key], bool):
+                          raise SystemExit("invalid bounded Provider diagnostic boolean")
+                  numeric_bounds = {
+                      "toolCallCount": 4,
+                      "finishReasonByteCount": 65,
+                      "assistantContentByteCount": 8193,
+                      "toolCallIDByteCount": 129,
+                      "toolNameByteCount": 65,
+                      "argumentsByteCount": 1025,
+                  }
+                  for key, maximum in numeric_bounds.items():
+                      value = raw_diagnostic[key]
+                      if isinstance(value, bool) or not isinstance(value, int) or not (0 <= value <= maximum):
+                          raise SystemExit("invalid bounded Provider diagnostic count")
+                  diagnostic = {
+                      key: raw_diagnostic[key]
+                      for key in sorted(expected_diagnostic_keys)
+                  }
+
               allowed_policy_reasons = {
                   "batch_count", "side_effect_isolation", "tool_call_id", "unknown_tool",
                   "invalid_arguments", "path_rejected", "path_unavailable", "symlink_escape",
@@ -318,6 +420,8 @@ jobs:
                       and item.get("ioKind") in {"read_executor", "write_executor", "verify_executor"}
                   ],
               }
+              if diagnostic is not None:
+                  bounded_failure["tool_exchange_diagnostic"] = diagnostic
               print("S4_REAL_LOOP_FAILURE_SUMMARY=" + json.dumps(
                   bounded_failure,
                   sort_keys=True,
