@@ -2,27 +2,18 @@ import XCTest
 @testable import Wuji
 
 final class WujiS4ContractsTests: XCTestCase {
-    func testReadBatchesAcceptOneThroughThreeAndRejectZeroOrMoreThanThree() throws {
+    func testReadBatchesAcceptFourCallsAndRejectEmptyBatch() throws {
         let fixture = try makeWorkspace()
         let policy = try S4ToolPolicy(workspace: fixture.workspace)
 
         XCTAssertThrowsError(try policy.authorizeBatch([], phase: .inspecting))
-        for count in 1...3 {
+        for count in 1...4 {
             let calls = (0..<count).map {
                 call(id: "read-\($0)", name: "list", arguments: #"{"path":""}"#)
             }
             let admitted = try policy.authorizeBatch(calls, phase: .inspecting)
             XCTAssertEqual(admitted.count, count)
             XCTAssertTrue(admitted.allSatisfy { $0.tool.name == .list })
-        }
-        XCTAssertThrowsError(try policy.authorizeBatch(
-            (0..<4).map { call(id: "read-\($0)", name: "list", arguments: #"{"path":""}"#) },
-            phase: .inspecting
-        )) { error in
-            XCTAssertEqual(error as? S4BatchPolicyError, S4BatchPolicyError(
-                reason: .batchCount,
-                callIndex: nil
-            ))
         }
     }
 
@@ -100,6 +91,7 @@ final class WujiS4ContractsTests: XCTestCase {
         let list = #"{"path":""}"#
         let cases = [
             [call(id: "same", name: "list", arguments: list), call(id: "same", name: "list", arguments: list)],
+            [call(id: "same", name: "shell", arguments: "{}"), call(id: "same", name: "shell", arguments: "{}")],
             [call(id: "", name: "list", arguments: list)],
             [call(id: String(repeating: "i", count: ProviderLimits.maximumToolCallIDBytes + 1), name: "list", arguments: list)]
         ]

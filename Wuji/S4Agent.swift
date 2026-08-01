@@ -218,7 +218,16 @@ final class S4Agent: @unchecked Sendable {
                             previouslyUsedIDs: usedIDs
                         )
                     } catch let error as S4BatchPolicyError {
-                        return .policyRejected(error)
+                        guard correctablePolicyRejection(error) else {
+                            return .policyRejected(error)
+                        }
+                        appendPolicyRejectionFeedback(
+                            assistantMessage: assistantMessage,
+                            calls: calls,
+                            error: error,
+                            to: &messages
+                        )
+                        continue
                     } catch {
                         return .failure(.policyRejected)
                     }
@@ -356,6 +365,32 @@ final class S4Agent: @unchecked Sendable {
             }
         }
         return .failure(.completionNotEstablished)
+    }
+
+    private func appendPolicyRejectionFeedback(
+        assistantMessage: ProviderTurnMessage,
+        calls: [ProviderTurnToolCall],
+        error: S4BatchPolicyError,
+        to messages: inout [ProviderTurnMessage]
+    ) {
+        let content = "{\"status\":\"not_executed\",\"reason\":\"policy_rejected\",\"policy_code\":\"\(error.reason.rawValue)\"}"
+        messages.append(assistantMessage)
+        for call in calls {
+            messages.append(ProviderTurnMessage(
+                role: .tool,
+                content: content,
+                toolCallID: call.id
+            ))
+        }
+    }
+
+    private func correctablePolicyRejection(_ error: S4BatchPolicyError) -> Bool {
+        switch error.reason {
+        case .sideEffectIsolation, .unknownTool, .stalePhase, .verificationProfile:
+            return true
+        case .batchCount, .toolCallID, .invalidArguments, .pathRejected:
+            return false
+        }
     }
 
     private func obtainApproval(_ request: S4ApprovalRequest) async -> S4StepResult<S4ApprovalGrant> {

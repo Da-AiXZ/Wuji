@@ -618,9 +618,6 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
             return .finish(content)
         }
 
-        guard calls.count <= ProviderLimits.maximumToolCalls else {
-            return .rejected(diagnostic(.toolCallCount, choice: choice, envelope: calls.first))
-        }
         guard choice.message.content.map({ $0.utf8.count <= ProviderLimits.maximumOutputBytes }) ?? true else {
             return .rejected(diagnostic(.assistantContentTooLarge, choice: choice, envelope: calls.first))
         }
@@ -674,10 +671,7 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
         let function = envelope?.function
         return ProviderToolExchangeDiagnostic(
             reason: reason,
-            toolCallCount: capped(
-                choice.message.toolCalls.count,
-                maximum: ProviderLimits.maximumToolCalls
-            ),
+            toolCallCount: choice.message.toolCalls.count,
             finishReasonPresent: choice.finishReason != nil,
             finishReasonByteCount: capped(
                 choice.finishReason?.utf8.count ?? 0,
@@ -733,8 +727,7 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
         var pendingToolCallIDs = Set<String>()
         var seenToolCallIDs = Set<String>()
         for message in request.messages {
-            guard message.content.map({ $0.utf8.count <= ProviderLimits.maximumTurnMessageBytes }) ?? true,
-                  message.toolCalls.count <= ProviderLimits.maximumToolCalls else {
+            guard message.content.map({ $0.utf8.count <= ProviderLimits.maximumTurnMessageBytes }) ?? true else {
                 return false
             }
             switch message.role {

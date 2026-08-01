@@ -3,6 +3,7 @@ import Foundation
 enum S3Limits {
     static let maximumProviderTurns = 8
     static let maximumToolExecutions = 6
+    static let maximumToolCallsPerBatch = 3
     static let maximumPathBytes = 512
     static let maximumQueryBytes = 256
     static let maximumEntries = 32
@@ -157,7 +158,7 @@ struct S3ToolPolicy: Sendable {
         _ calls: [ProviderTurnToolCall],
         previouslyUsedIDs: Set<String> = []
     ) throws -> [S3AuthorizedToolCall] {
-        guard !calls.isEmpty, calls.count <= ProviderLimits.maximumToolCalls else {
+        guard !calls.isEmpty, calls.count <= S3Limits.maximumToolCallsPerBatch else {
             throw S3BatchPolicyError(reason: .batchCount, callIndex: nil)
         }
         var ids = Set<String>()

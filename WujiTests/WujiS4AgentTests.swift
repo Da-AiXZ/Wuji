@@ -24,10 +24,10 @@ final class WujiS4AgentTests: XCTestCase {
         XCTAssertEqual(completion.beforeSHA256, S4TaskContract.beforeHash)
         XCTAssertEqual(completion.afterSHA256, S4TaskContract.afterHash)
         XCTAssertEqual(completion.providerRequestCount, 4)
-        XCTAssertEqual(completion.toolExecutionCount, 5)
+        XCTAssertEqual(completion.toolExecutionCount, 6)
 
         let executorCalls = await executor.calls()
-        XCTAssertEqual(executorCalls, ["list", "search", "read", "edit", "verify"])
+        XCTAssertEqual(executorCalls, ["list", "search", "read", "list", "edit", "verify"])
         let eventValues = await events.values()
         assertPrecedes("attempt:provider:intent_recorded", "io:provider", in: eventValues)
         assertPrecedes("approval:pending", "approval:granted", in: eventValues)
@@ -45,10 +45,10 @@ final class WujiS4AgentTests: XCTestCase {
         ])
         XCTAssertEqual(requests.map(\.requireTool), [true, true, true, false])
         let secondMessages = requests[1].messages
-        let assistantBatch = secondMessages.first { $0.role == .assistant && $0.toolCalls.count == 3 }
-        XCTAssertEqual(assistantBatch?.toolCalls.map(\.id), ["list-1", "search-1", "read-1"])
+        let assistantBatch = secondMessages.first { $0.role == .assistant && $0.toolCalls.count == 4 }
+        XCTAssertEqual(assistantBatch?.toolCalls.map(\.id), ["list-1", "search-1", "read-1", "list-2"])
         XCTAssertEqual(secondMessages.filter { $0.role == .tool }.map(\.toolCallID), [
-            "list-1", "search-1", "read-1"
+            "list-1", "search-1", "read-1", "list-2"
         ])
         XCTAssertTrue(requests[2].messages.contains {
             $0.role == .tool && $0.toolCallID == "edit-1"
@@ -71,6 +71,16 @@ final class WujiS4AgentTests: XCTestCase {
         XCTAssertEqual(verifyTerminal.finalStateKind, "exited")
         XCTAssertEqual(verifyTerminal.finalStateValue, 0)
         XCTAssertEqual(verifyTerminal.truncated, false)
+        let readIntents = snapshot.attempts.filter {
+            $0.ioKind == .readExecutor && $0.phase == .intentRecorded
+        }
+        let readTerminals = snapshot.attempts.filter {
+            $0.ioKind == .readExecutor && $0.phase == .succeeded
+        }
+        let expectedReadIDHashes = ["list-1", "search-1", "read-1", "list-2"]
+            .map(ProviderDigest.sha256Hex)
+        XCTAssertEqual(readIntents.compactMap(\.toolCallIDHash), expectedReadIDHashes)
+        XCTAssertEqual(readTerminals.compactMap(\.toolCallIDHash), expectedReadIDHashes)
     }
 
     func testModelFinishCannotCompleteBeforeInspectionApprovalEditAndVerify() async throws {
@@ -92,27 +102,170 @@ final class WujiS4AgentTests: XCTestCase {
         XCTAssertTrue(calls.isEmpty)
     }
 
-    func testPolicyRejectionReportsOnlyBoundedReasonAndIndexWithZeroExecutorIO() async throws {
+    func testMixedSideEffectBatchReturnsPairedNotExecutedResultsThenCorrects() async throws {
         let fixture = try makeWorkspace()
-        let provider = TestS4Provider(outcomes: [.decision(toolDecision([
-            call(id: "blocked-1", name: "shell", arguments: "{}")
-        ]))])
+        let rejectedCalls = [
+            call(
+                id: "blocked-edit",
+                name: "edit",
+                arguments: #"{"path":"records/draft.txt","expected_old":"STATUS=pending","replacement":"STATUS=verified"}"#
+            ),
+            call(
+                id: "blocked-verify",
+                name: "verify",
+                arguments: #"{"profile":"s4_status_verified"}"#
+            )
+        ]
+        let provider = TestS4Provider(
+            outcomes: [.decision(toolDecision(rejectedCalls))] + happyProviderOutcomes()
+        )
         let executor = TestS4Executor(workspace: fixture.workspace)
+        let approval = TestS4ApprovalAuthorizer(mode: .approve)
         let agent = try makeAgent(
             fixture: fixture,
             provider: provider,
             executor: executor,
             store: TestS4Store(),
+            approval: approval
+        )
+
+        let outcome = await agent.run(taskID: fixture.taskID)
+        guard case .completed = outcome else {
+            return XCTFail("corrected side-effect selection did not complete")
+        }
+        let executorCalls = await executor.calls()
+        XCTAssertEqual(executorCalls, ["list", "search", "read", "list", "edit", "verify"])
+        let requests = await provider.requests()
+        XCTAssertEqual(requests.count, 5)
+        let feedbackRequest = requests[1]
+        let rejectedAssistant = feedbackRequest.messages.first {
+            $0.role == .assistant && $0.toolCalls.map(\.id) == rejectedCalls.map(\.id)
+        }
+        XCTAssertNotNil(rejectedAssistant)
+        let feedback = feedbackRequest.messages.filter {
+            $0.role == .tool && rejectedCalls.map(\.id).contains($0.toolCallID ?? "")
+        }
+        XCTAssertEqual(feedback.map(\.toolCallID), rejectedCalls.map(\.id))
+        XCTAssertTrue(feedback.allSatisfy {
+            $0.content?.contains(#""status":"not_executed""#) == true
+                && $0.content?.contains(#""policy_code":"side_effect_isolation""#) == true
+        })
+        let approvalRequests = await approval.requests()
+        XCTAssertEqual(approvalRequests.count, 1)
+    }
+
+    func testRepeatedPolicyRejectionStopsAtExistingProviderTurnLimitWithoutExecutorIO() async throws {
+        let fixture = try makeWorkspace()
+        let outcomes = (0..<S4Limits.maximumProviderTurns).map { index in
+            ProviderInferenceOutcome.decision(toolDecision([
+                call(id: "blocked-\(index)", name: "shell", arguments: "{}")
+            ]))
+        }
+        let provider = TestS4Provider(outcomes: outcomes)
+        let executor = TestS4Executor(workspace: fixture.workspace)
+        let store = TestS4Store()
+        let agent = try makeAgent(
+            fixture: fixture,
+            provider: provider,
+            executor: executor,
+            store: store,
             approval: TestS4ApprovalAuthorizer(mode: .approve)
         )
 
         let outcome = await agent.run(taskID: fixture.taskID)
-        XCTAssertEqual(
-            outcome,
-            .policyRejected(S4BatchPolicyError(reason: .unknownTool, callIndex: 0))
+
+        XCTAssertEqual(outcome, .failure(.completionNotEstablished))
+        let providerRequestCount = await provider.requestCount()
+        let executorCalls = await executor.calls()
+        XCTAssertEqual(providerRequestCount, S4Limits.maximumProviderTurns)
+        XCTAssertTrue(executorCalls.isEmpty)
+        let requests = await provider.requests()
+        for index in 1..<requests.count {
+            XCTAssertTrue(requests[index].messages.contains {
+                $0.role == .tool
+                    && $0.toolCallID == "blocked-\(index - 1)"
+                    && $0.content?.contains(#""status":"not_executed""#) == true
+            })
+        }
+        let snapshot = await store.currentSnapshot()
+        let providerIntents = snapshot.attempts.filter {
+            $0.ioKind == .provider && $0.phase == .intentRecorded
+        }
+        XCTAssertEqual(providerIntents.count, S4Limits.maximumProviderTurns)
+        XCTAssertEqual(Set(providerIntents.map(\.attemptID)).count, S4Limits.maximumProviderTurns)
+    }
+
+    func testMalformedAndWorkspaceArgumentsDoNotEnterPolicyCorrectionPath() async throws {
+        let invalidArguments = [
+            "{",
+            #"{"path":"../draft.txt","expected_old":"STATUS=pending","replacement":"STATUS=verified"}"#
+        ]
+        for (index, arguments) in invalidArguments.enumerated() {
+            let fixture = try makeWorkspace()
+            let provider = TestS4Provider(outcomes: [
+                happyProviderOutcomes()[0],
+                .decision(toolDecision([
+                    call(id: "invalid-edit-\(index)", name: "edit", arguments: arguments)
+                ]))
+            ])
+            let executor = TestS4Executor(workspace: fixture.workspace)
+            let approval = TestS4ApprovalAuthorizer(mode: .approve)
+            let agent = try makeAgent(
+                fixture: fixture,
+                provider: provider,
+                executor: executor,
+                store: TestS4Store(),
+                approval: approval
+            )
+
+            let outcome = await agent.run(taskID: fixture.taskID)
+
+            XCTAssertEqual(outcome, .policyRejected(S4BatchPolicyError(
+                reason: .invalidArguments,
+                callIndex: 0
+            )))
+            let providerRequestCount = await provider.requestCount()
+            let executorCalls = await executor.calls()
+            let approvalRequests = await approval.requests()
+            XCTAssertEqual(providerRequestCount, 2)
+            XCTAssertEqual(executorCalls, ["list", "search", "read", "list"])
+            XCTAssertTrue(approvalRequests.isEmpty)
+        }
+    }
+
+    func testCumulativeToolBudgetRejectsEntireOverflowBatchWithoutExecutingIt() async throws {
+        let fixture = try makeWorkspace()
+        let firstBatch = (0..<6).map {
+            call(id: "within-budget-\($0)", name: "list", arguments: #"{"path":""}"#)
+        }
+        let overflowBatch = (0..<5).map {
+            call(id: "overflow-\($0)", name: "list", arguments: #"{"path":""}"#)
+        }
+        let provider = TestS4Provider(outcomes: [
+            .decision(toolDecision(firstBatch)),
+            .decision(toolDecision(overflowBatch))
+        ])
+        let executor = TestS4Executor(workspace: fixture.workspace)
+        let store = TestS4Store()
+        let agent = try makeAgent(
+            fixture: fixture,
+            provider: provider,
+            executor: executor,
+            store: store,
+            approval: TestS4ApprovalAuthorizer(mode: .approve)
         )
-        let calls = await executor.calls()
-        XCTAssertTrue(calls.isEmpty)
+
+        let outcome = await agent.run(taskID: fixture.taskID)
+
+        XCTAssertEqual(outcome, .failure(.limitsExceeded))
+        let providerRequestCount = await provider.requestCount()
+        let executorCalls = await executor.calls()
+        XCTAssertEqual(providerRequestCount, 2)
+        XCTAssertEqual(executorCalls, Array(repeating: "list", count: 6))
+        let snapshot = await store.currentSnapshot()
+        XCTAssertEqual(snapshot.attempts.filter {
+            $0.ioKind == .readExecutor && $0.phase == .intentRecorded
+        }.count, 6)
     }
 
     func testRejectExpiredAndTamperedApprovalProduceZeroWriteIO() async throws {
@@ -669,7 +822,8 @@ final class WujiS4AgentTests: XCTestCase {
             .decision(toolDecision([
                 call(id: "list-1", name: "list", arguments: #"{"path":""}"#),
                 call(id: "search-1", name: "search", arguments: #"{"path":"","query":"STATUS=pending"}"#),
-                call(id: "read-1", name: "read", arguments: #"{"path":"records/draft.txt"}"#)
+                call(id: "read-1", name: "read", arguments: #"{"path":"records/draft.txt"}"#),
+                call(id: "list-2", name: "list", arguments: #"{"path":"records"}"#)
             ])),
             .decision(toolDecision([
                 call(id: "edit-1", name: "edit", arguments: #"{"path":"records/draft.txt","expected_old":"STATUS=pending","replacement":"STATUS=verified"}"#)

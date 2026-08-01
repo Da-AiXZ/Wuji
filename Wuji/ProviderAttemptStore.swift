@@ -93,7 +93,7 @@ actor FileProviderAttemptStore: ProviderAttemptRecording {
 
     private static func valid(_ diagnostic: ProviderToolExchangeDiagnostic?) -> Bool {
         guard let diagnostic else { return true }
-        return (0...(ProviderLimits.maximumToolCalls + 1)).contains(diagnostic.toolCallCount)
+        return (0...ProviderLimits.maximumResponseBodyBytes).contains(diagnostic.toolCallCount)
             && (0...(ProviderLimits.maximumToolNameBytes + 1)).contains(diagnostic.finishReasonByteCount)
             && (0...(ProviderLimits.maximumOutputBytes + 1)).contains(diagnostic.assistantContentByteCount)
             && (0...(ProviderLimits.maximumToolCallIDBytes + 1)).contains(diagnostic.toolCallIDByteCount)

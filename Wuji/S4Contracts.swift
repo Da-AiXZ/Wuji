@@ -334,16 +334,10 @@ struct S4ToolPolicy: Sendable {
         phase: S4PolicyPhase,
         previouslyUsedIDs: Set<String> = []
     ) throws -> [S4AuthorizedToolCall] {
-        guard !calls.isEmpty, calls.count <= ProviderLimits.maximumToolCalls else {
+        guard !calls.isEmpty else {
             throw S4BatchPolicyError(reason: .batchCount, callIndex: nil)
         }
-        if calls.contains(where: { $0.name == S4ToolName.edit.rawValue || $0.name == S4ToolName.verify.rawValue }),
-           calls.count != 1 {
-            throw S4BatchPolicyError(reason: .sideEffectIsolation, callIndex: nil)
-        }
-
         var batchIDs = Set<String>()
-        var authorized: [S4AuthorizedToolCall] = []
         for (index, call) in calls.enumerated() {
             let idBytes = call.id.utf8.count
             guard idBytes > 0,
@@ -353,6 +347,18 @@ struct S4ToolPolicy: Sendable {
                   batchIDs.insert(call.id).inserted else {
                 throw S4BatchPolicyError(reason: .toolCallID, callIndex: index)
             }
+            guard structurallyValidName(call.name),
+                  structurallyValidArguments(call.arguments) else {
+                throw S4BatchPolicyError(reason: .invalidArguments, callIndex: index)
+            }
+        }
+        if calls.contains(where: { $0.name == S4ToolName.edit.rawValue || $0.name == S4ToolName.verify.rawValue }),
+           calls.count != 1 {
+            throw S4BatchPolicyError(reason: .sideEffectIsolation, callIndex: nil)
+        }
+
+        var authorized: [S4AuthorizedToolCall] = []
+        for (index, call) in calls.enumerated() {
             let tool: S4AuthorizedTool
             do {
                 switch S4ToolName(rawValue: call.name) {
@@ -453,5 +459,26 @@ struct S4ToolPolicy: Sendable {
             throw S4PolicyError.invalidArguments
         }
         return raw.reduce(into: [:]) { result, item in result[item.key] = item.value as? String }
+    }
+
+    private func structurallyValidName(_ value: String) -> Bool {
+        let byteCount = value.utf8.count
+        return byteCount > 0
+            && byteCount <= ProviderLimits.maximumToolNameBytes
+            && value.unicodeScalars.allSatisfy {
+                CharacterSet.lowercaseLetters.contains($0)
+                    || CharacterSet.decimalDigits.contains($0)
+                    || $0 == "_"
+            }
+    }
+
+    private func structurallyValidArguments(_ value: String) -> Bool {
+        guard !value.isEmpty,
+              value.utf8.count <= ProviderLimits.maximumToolArgumentsBytes,
+              let data = value.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) else {
+            return false
+        }
+        return object is [String: Any]
     }
 }

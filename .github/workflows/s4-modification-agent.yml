@@ -386,7 +386,7 @@ jobs:
                       if not isinstance(raw_diagnostic[key], bool):
                           raise SystemExit("invalid bounded Provider diagnostic boolean")
                   numeric_bounds = {
-                      "toolCallCount": 4,
+                      "toolCallCount": 256 * 1024,
                       "finishReasonByteCount": 65,
                       "assistantContentByteCount": 8193,
                       "toolCallIDByteCount": 129,
