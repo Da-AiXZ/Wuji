@@ -30,6 +30,19 @@
 		010000000000000000000015 /* S3Fixture in Resources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000018 /* S3Fixture */; };
 		010000000000000000000016 /* WujiS3AgentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000019 /* WujiS3AgentTests.swift */; };
 		010000000000000000000017 /* WujiS3ISHIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000001A /* WujiS3ISHIntegrationTests.swift */; };
+		010000000000000000000018 /* S4Contracts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000001B /* S4Contracts.swift */; };
+		010000000000000000000019 /* S4Approval.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000001C /* S4Approval.swift */; };
+		01000000000000000000001A /* S4DurableStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000001D /* S4DurableStore.swift */; };
+		01000000000000000000001B /* ISHS4Executor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000001E /* ISHS4Executor.swift */; };
+		01000000000000000000001C /* S4Agent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000001F /* S4Agent.swift */; };
+		01000000000000000000001D /* S4ApprovalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000020 /* S4ApprovalView.swift */; };
+		01000000000000000000001E /* S4ProbeRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000021 /* S4ProbeRunner.swift */; };
+		01000000000000000000001F /* S4Fixture in Resources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000022 /* S4Fixture */; };
+		010000000000000000000020 /* WujiS4ContractsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000023 /* WujiS4ContractsTests.swift */; };
+		010000000000000000000021 /* WujiS4ExecutorContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000024 /* WujiS4ExecutorContractTests.swift */; };
+		010000000000000000000022 /* WujiS4ISHIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000025 /* WujiS4ISHIntegrationTests.swift */; };
+		010000000000000000000023 /* WujiS4AgentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000026 /* WujiS4AgentTests.swift */; };
+		010000000000000000000024 /* WujiS4ApprovalViewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000027 /* WujiS4ApprovalViewTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -69,6 +82,19 @@
 		020000000000000000000018 /* S3Fixture */ = {isa = PBXFileReference; lastKnownFileType = folder; path = S3Fixture; sourceTree = "<group>"; };
 		020000000000000000000019 /* WujiS3AgentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiS3AgentTests.swift; sourceTree = "<group>"; };
 		02000000000000000000001A /* WujiS3ISHIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiS3ISHIntegrationTests.swift; sourceTree = "<group>"; };
+		02000000000000000000001B /* S4Contracts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = S4Contracts.swift; sourceTree = "<group>"; };
+		02000000000000000000001C /* S4Approval.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = S4Approval.swift; sourceTree = "<group>"; };
+		02000000000000000000001D /* S4DurableStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = S4DurableStore.swift; sourceTree = "<group>"; };
+		02000000000000000000001E /* ISHS4Executor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ISHS4Executor.swift; sourceTree = "<group>"; };
+		02000000000000000000001F /* S4Agent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = S4Agent.swift; sourceTree = "<group>"; };
+		020000000000000000000020 /* S4ApprovalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = S4ApprovalView.swift; sourceTree = "<group>"; };
+		020000000000000000000021 /* S4ProbeRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = S4ProbeRunner.swift; sourceTree = "<group>"; };
+		020000000000000000000022 /* S4Fixture */ = {isa = PBXFileReference; lastKnownFileType = folder; path = S4Fixture; sourceTree = "<group>"; };
+		020000000000000000000023 /* WujiS4ContractsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiS4ContractsTests.swift; sourceTree = "<group>"; };
+		020000000000000000000024 /* WujiS4ExecutorContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiS4ExecutorContractTests.swift; sourceTree = "<group>"; };
+		020000000000000000000025 /* WujiS4ISHIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiS4ISHIntegrationTests.swift; sourceTree = "<group>"; };
+		020000000000000000000026 /* WujiS4AgentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiS4AgentTests.swift; sourceTree = "<group>"; };
+		020000000000000000000027 /* WujiS4ApprovalViewTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiS4ApprovalViewTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -125,6 +151,14 @@
 				020000000000000000000016 /* S3ReadOnlyAgent.swift */,
 				020000000000000000000017 /* S3ProbeRunner.swift */,
 				020000000000000000000018 /* S3Fixture */,
+				02000000000000000000001B /* S4Contracts.swift */,
+				02000000000000000000001C /* S4Approval.swift */,
+				02000000000000000000001D /* S4DurableStore.swift */,
+				02000000000000000000001E /* ISHS4Executor.swift */,
+				02000000000000000000001F /* S4Agent.swift */,
+				020000000000000000000020 /* S4ApprovalView.swift */,
+				020000000000000000000021 /* S4ProbeRunner.swift */,
+				020000000000000000000022 /* S4Fixture */,
 				02000000000000000000000C /* rootfs.tar.gz */,
 				020000000000000000000004 /* Assets.xcassets */,
 				020000000000000000000005 /* Info.plist */,
@@ -141,6 +175,11 @@
 				020000000000000000000012 /* WujiProviderTests.swift */,
 				020000000000000000000019 /* WujiS3AgentTests.swift */,
 				02000000000000000000001A /* WujiS3ISHIntegrationTests.swift */,
+				020000000000000000000023 /* WujiS4ContractsTests.swift */,
+				020000000000000000000024 /* WujiS4ExecutorContractTests.swift */,
+				020000000000000000000025 /* WujiS4ISHIntegrationTests.swift */,
+				020000000000000000000026 /* WujiS4AgentTests.swift */,
+				020000000000000000000027 /* WujiS4ApprovalViewTests.swift */,
 			);
 			path = WujiTests;
 			sourceTree = "<group>";
@@ -229,6 +268,7 @@
 				010000000000000000000004 /* Assets.xcassets in Resources */,
 				010000000000000000000009 /* rootfs.tar.gz in Resources */,
 				010000000000000000000015 /* S3Fixture in Resources */,
+				01000000000000000000001F /* S4Fixture in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -260,6 +300,13 @@
 				010000000000000000000012 /* ISHReadOnlyExecutor.swift in Sources */,
 				010000000000000000000013 /* S3ReadOnlyAgent.swift in Sources */,
 				010000000000000000000014 /* S3ProbeRunner.swift in Sources */,
+				010000000000000000000018 /* S4Contracts.swift in Sources */,
+				010000000000000000000019 /* S4Approval.swift in Sources */,
+				01000000000000000000001A /* S4DurableStore.swift in Sources */,
+				01000000000000000000001B /* ISHS4Executor.swift in Sources */,
+				01000000000000000000001C /* S4Agent.swift in Sources */,
+				01000000000000000000001D /* S4ApprovalView.swift in Sources */,
+				01000000000000000000001E /* S4ProbeRunner.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -273,6 +320,11 @@
 				01000000000000000000000F /* WujiProviderTests.swift in Sources */,
 				010000000000000000000016 /* WujiS3AgentTests.swift in Sources */,
 				010000000000000000000017 /* WujiS3ISHIntegrationTests.swift in Sources */,
+				010000000000000000000020 /* WujiS4ContractsTests.swift in Sources */,
+				010000000000000000000021 /* WujiS4ExecutorContractTests.swift in Sources */,
+				010000000000000000000022 /* WujiS4ISHIntegrationTests.swift in Sources */,
+				010000000000000000000023 /* WujiS4AgentTests.swift in Sources */,
+				010000000000000000000024 /* WujiS4ApprovalViewTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

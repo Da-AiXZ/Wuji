@@ -50,6 +50,8 @@ static pthread_cond_t g_exit_condition = PTHREAD_COND_INITIALIZER;
 static bool g_booted = false;
 static bool g_workspace_mounted = false;
 static char g_workspace_source[4096];
+static bool g_s4_workspace_mounted = false;
+static char g_s4_workspace_source[4096];
 static struct task *g_init_task = NULL;
 static struct WujiISHRunResult *g_active_result = NULL;
 static int g_active_pid = -1;
@@ -167,6 +169,51 @@ int wuji_ish_mount_read_only_workspace(const char *host_path,
     return 0;
 }
 
+int wuji_ish_mount_s4_workspace(const char *host_path,
+                                char *error_buffer,
+                                size_t error_buffer_size) {
+    if (host_path == NULL || host_path[0] == '\0') {
+        set_error(error_buffer, error_buffer_size, "S4 workspace path missing");
+        return -1;
+    }
+    char canonical_path[sizeof(g_s4_workspace_source)];
+    if (realpath(host_path, canonical_path) == NULL) {
+        set_error(error_buffer, error_buffer_size, "S4 workspace path unavailable");
+        return -1;
+    }
+    struct stat workspace_stat;
+    if (stat(canonical_path, &workspace_stat) != 0 || !S_ISDIR(workspace_stat.st_mode)) {
+        set_error(error_buffer, error_buffer_size, "S4 workspace path is not a directory");
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_boot_lock);
+    if (!g_booted) {
+        set_error(error_buffer, error_buffer_size, "executor is not prepared");
+        pthread_mutex_unlock(&g_boot_lock);
+        return -1;
+    }
+    if (g_s4_workspace_mounted) {
+        bool same_source = strcmp(g_s4_workspace_source, canonical_path) == 0;
+        if (!same_source)
+            set_error(error_buffer, error_buffer_size, "different S4 workspace already mounted");
+        pthread_mutex_unlock(&g_boot_lock);
+        return same_source ? 0 : -1;
+    }
+
+    int flags = MS_NOSUID_ | MS_NODEV_ | MS_NOEXEC_;
+    int error = do_mount(&realfs, canonical_path, "/wuji-s4", "", flags);
+    if (error < 0) {
+        set_error(error_buffer, error_buffer_size, "S4 workspace mount failed");
+        pthread_mutex_unlock(&g_boot_lock);
+        return error;
+    }
+    snprintf(g_s4_workspace_source, sizeof(g_s4_workspace_source), "%s", canonical_path);
+    g_s4_workspace_mounted = true;
+    pthread_mutex_unlock(&g_boot_lock);
+    return 0;
+}
+
 static bool attach_host_fd(struct task *task, int guest_fd, int host_fd) {
     struct fd *fd = adhoc_fd_create(&realfs_fdops);
     if (fd == NULL)
@@ -272,6 +319,15 @@ static bool build_guest_path(const char *relative_path, char *output, size_t out
     int count = relative_path[0] == '\0'
         ? snprintf(output, output_size, "/wuji-s3")
         : snprintf(output, output_size, "/wuji-s3/%s", relative_path);
+    return count > 0 && (size_t)count < output_size;
+}
+
+static bool build_s4_guest_path(const char *relative_path, char *output, size_t output_size) {
+    if (!valid_relative_path(relative_path))
+        return false;
+    int count = relative_path[0] == '\0'
+        ? snprintf(output, output_size, "/wuji-s4")
+        : snprintf(output, output_size, "/wuji-s4/%s", relative_path);
     return count > 0 && (size_t)count < output_size;
 }
 
@@ -454,15 +510,20 @@ WujiISHRunResult *wuji_ish_run_self_test(WujiISHSelfTestCase test_case,
     return run_arguments("/bin/sh", 3, arguments, output_limit);
 }
 
-WujiISHRunResult *wuji_ish_run_read_only(WujiISHReadOnlyOperation operation,
-                                         const char *relative_path,
-                                         const char *query,
-                                         size_t output_limit) {
-    if (!g_workspace_mounted || output_limit == 0 || output_limit > 4096)
+static WujiISHRunResult *run_read_only_operation(WujiISHReadOnlyOperation operation,
+                                                 const char *relative_path,
+                                                 const char *query,
+                                                 size_t output_limit,
+                                                 bool mounted,
+                                                 bool s4_workspace) {
+    if (!mounted || output_limit == 0 || output_limit > 4096)
         return NULL;
 
     char guest_path[1024];
-    if (!build_guest_path(relative_path, guest_path, sizeof(guest_path)))
+    bool valid_path = s4_workspace
+        ? build_s4_guest_path(relative_path, guest_path, sizeof(guest_path))
+        : build_guest_path(relative_path, guest_path, sizeof(guest_path));
+    if (!valid_path)
         return NULL;
 
     char arguments[4096] = {0};
@@ -506,6 +567,145 @@ WujiISHRunResult *wuji_ish_run_read_only(WujiISHReadOnlyOperation operation,
             return NULL;
     }
     return run_arguments(executable, argument_count, arguments, output_limit);
+}
+
+WujiISHRunResult *wuji_ish_run_read_only(WujiISHReadOnlyOperation operation,
+                                         const char *relative_path,
+                                         const char *query,
+                                         size_t output_limit) {
+    return run_read_only_operation(
+        operation,
+        relative_path,
+        query,
+        output_limit,
+        g_workspace_mounted,
+        false
+    );
+}
+
+WujiISHRunResult *wuji_ish_run_s4_read_only(WujiISHReadOnlyOperation operation,
+                                            const char *relative_path,
+                                            const char *query,
+                                            size_t output_limit) {
+    return run_read_only_operation(
+        operation,
+        relative_path,
+        query,
+        output_limit,
+        g_s4_workspace_mounted,
+        true
+    );
+}
+
+static bool valid_sha256(const char *value) {
+    if (value == NULL || strlen(value) != 64)
+        return false;
+    for (size_t index = 0; index < 64; index++) {
+        char byte = value[index];
+        if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f')))
+            return false;
+    }
+    return true;
+}
+
+static const char s4_edit_script[] =
+    "set -eu\n"
+    "p=$1\n"
+    "old=$2\n"
+    "new=$3\n"
+    "before=$4\n"
+    "after=$5\n"
+    "tmp=${p}.wuji-s4-tmp\n"
+    "[ -f \"$p\" ] && [ ! -L \"$p\" ] || exit 40\n"
+    "actual=$(sha256sum \"$p\"); actual=${actual%% *}\n"
+    "[ \"$actual\" = \"$before\" ] || exit 42\n"
+    "[ ! -e \"$tmp\" ] || exit 43\n"
+    "trap 'rm -f -- \"$tmp\"' 0 1 2 15\n"
+    "awk -v old=\"$old\" -v new=\"$new\" 'BEGIN { count=0 } { if ($0 == old) { count++; print new } else { print } } END { if (count != 1) exit 44 }' \"$p\" > \"$tmp\"\n"
+    "actual=$(sha256sum \"$tmp\"); actual=${actual%% *}\n"
+    "[ \"$actual\" = \"$after\" ] || exit 45\n"
+    "mv -f -- \"$tmp\" \"$p\"\n"
+    "trap - 0 1 2 15\n"
+    "actual=$(sha256sum \"$p\"); actual=${actual%% *}\n"
+    "[ \"$actual\" = \"$after\" ] || exit 46\n"
+    "printf 'WUJI_S4_EDIT_OK\\n'\n";
+
+WujiISHRunResult *wuji_ish_run_s4_edit(const char *relative_path,
+                                       const char *expected_old,
+                                       const char *replacement,
+                                       const char *before_sha256,
+                                       const char *after_sha256,
+                                       size_t output_limit) {
+    if (!g_s4_workspace_mounted || output_limit == 0 || output_limit > 4096 ||
+        relative_path == NULL || strcmp(relative_path, "records/draft.txt") != 0 ||
+        expected_old == NULL || strcmp(expected_old, "STATUS=pending") != 0 ||
+        replacement == NULL || strcmp(replacement, "STATUS=verified") != 0 ||
+        !valid_sha256(before_sha256) || !valid_sha256(after_sha256))
+        return NULL;
+
+    char guest_path[1024];
+    if (!build_s4_guest_path(relative_path, guest_path, sizeof(guest_path)))
+        return NULL;
+    char arguments[8192] = {0};
+    size_t offset = 0;
+    if (!append_argument(arguments, sizeof(arguments), &offset, "/bin/sh") ||
+        !append_argument(arguments, sizeof(arguments), &offset, "-c") ||
+        !append_argument(arguments, sizeof(arguments), &offset, s4_edit_script) ||
+        !append_argument(arguments, sizeof(arguments), &offset, "wuji-s4-edit") ||
+        !append_argument(arguments, sizeof(arguments), &offset, guest_path) ||
+        !append_argument(arguments, sizeof(arguments), &offset, expected_old) ||
+        !append_argument(arguments, sizeof(arguments), &offset, replacement) ||
+        !append_argument(arguments, sizeof(arguments), &offset, before_sha256) ||
+        !append_argument(arguments, sizeof(arguments), &offset, after_sha256))
+        return NULL;
+    return run_arguments("/bin/sh", 9, arguments, output_limit);
+}
+
+static const char s4_verify_script[] =
+    "set -eu\n"
+    "draft=$1\n"
+    "context=$2\n"
+    "after=$3\n"
+    "context_hash=$4\n"
+    "tmp=${draft}.wuji-s4-tmp\n"
+    "[ -f \"$draft\" ] && [ ! -L \"$draft\" ] || exit 50\n"
+    "actual=$(sha256sum \"$draft\"); actual=${actual%% *}\n"
+    "[ \"$actual\" = \"$after\" ] || exit 51\n"
+    "count=$(grep -Fxc 'STATUS=verified' \"$draft\" || true)\n"
+    "[ \"$count\" -eq 1 ] || exit 52\n"
+    "if grep -Fxq 'STATUS=pending' \"$draft\"; then exit 53; fi\n"
+    "[ -f \"$context\" ] && [ ! -L \"$context\" ] || exit 54\n"
+    "actual=$(sha256sum \"$context\"); actual=${actual%% *}\n"
+    "[ \"$actual\" = \"$context_hash\" ] || exit 55\n"
+    "[ ! -e \"$tmp\" ] || exit 56\n"
+    "printf 'WUJI_S4_VERIFY_OK\\n'\n";
+
+WujiISHRunResult *wuji_ish_run_s4_verify(const char *profile,
+                                         const char *after_sha256,
+                                         const char *context_sha256,
+                                         size_t output_limit) {
+    if (!g_s4_workspace_mounted || output_limit == 0 || output_limit > 4096 ||
+        profile == NULL || strcmp(profile, "s4_status_verified") != 0 ||
+        !valid_sha256(after_sha256) || !valid_sha256(context_sha256))
+        return NULL;
+
+    char draft_path[1024];
+    char context_path[1024];
+    if (!build_s4_guest_path("records/draft.txt", draft_path, sizeof(draft_path)) ||
+        !build_s4_guest_path("records/context.txt", context_path, sizeof(context_path)))
+        return NULL;
+    char arguments[8192] = {0};
+    size_t offset = 0;
+    if (!append_argument(arguments, sizeof(arguments), &offset, "/bin/sh") ||
+        !append_argument(arguments, sizeof(arguments), &offset, "-c") ||
+        !append_argument(arguments, sizeof(arguments), &offset, s4_verify_script) ||
+        !append_argument(arguments, sizeof(arguments), &offset, "wuji-s4-verify") ||
+        !append_argument(arguments, sizeof(arguments), &offset, draft_path) ||
+        !append_argument(arguments, sizeof(arguments), &offset, context_path) ||
+        !append_argument(arguments, sizeof(arguments), &offset, after_sha256) ||
+        !append_argument(arguments, sizeof(arguments), &offset, context_sha256))
+        return NULL;
+    return run_arguments("/bin/sh", 8, arguments, output_limit);
 }
 
 WujiISHCancelDelivery wuji_ish_request_cancel(void) {

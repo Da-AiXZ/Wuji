@@ -11,7 +11,7 @@ enum ProviderLimits {
     static let maximumChoices = 8
     static let maximumTurnMessages = 24
     static let maximumTurnMessageBytes = 8_192
-    static let maximumToolDefinitions = 3
+    static let maximumToolDefinitions = 5
     static let maximumToolCalls = 3
     static let maximumToolNameBytes = 64
     static let maximumToolArgumentsBytes = 1_024

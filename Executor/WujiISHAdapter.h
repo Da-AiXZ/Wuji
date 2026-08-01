@@ -41,12 +41,33 @@ int wuji_ish_mount_read_only_workspace(const char *host_path,
                                        char *error_buffer,
                                        size_t error_buffer_size);
 
+int wuji_ish_mount_s4_workspace(const char *host_path,
+                                char *error_buffer,
+                                size_t error_buffer_size);
+
 WujiISHRunResult *wuji_ish_run_self_test(WujiISHSelfTestCase test_case,
                                          size_t output_limit);
 
 WujiISHRunResult *wuji_ish_run_read_only(WujiISHReadOnlyOperation operation,
                                          const char *relative_path,
                                          const char *query,
+                                         size_t output_limit);
+
+WujiISHRunResult *wuji_ish_run_s4_read_only(WujiISHReadOnlyOperation operation,
+                                            const char *relative_path,
+                                            const char *query,
+                                            size_t output_limit);
+
+WujiISHRunResult *wuji_ish_run_s4_edit(const char *relative_path,
+                                       const char *expected_old,
+                                       const char *replacement,
+                                       const char *before_sha256,
+                                       const char *after_sha256,
+                                       size_t output_limit);
+
+WujiISHRunResult *wuji_ish_run_s4_verify(const char *profile,
+                                         const char *after_sha256,
+                                         const char *context_sha256,
                                          size_t output_limit);
 
 WujiISHCancelDelivery wuji_ish_request_cancel(void);

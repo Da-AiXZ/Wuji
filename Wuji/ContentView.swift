@@ -24,6 +24,10 @@ struct ContentView: View {
 
             ExecutorSelfTestView()
 
+            Divider()
+
+            S4ApprovalView()
+
             Spacer()
         }
         .padding(24)
