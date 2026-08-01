@@ -79,7 +79,12 @@ final class WujiS4ExecutorContractTests: XCTestCase {
 
     func testInterruptedEditRemainsUnknownAndCannotBeCompleted() {
         let outcome = S4ExecutorClassifier.edit(
-            facts: facts(rootExit: false, stdoutEOF: false, stderrEOF: false, finalState: .unknown),
+            facts: facts(
+                rootExit: false,
+                stdoutEOF: false,
+                stderrEOF: false,
+                finalState: .unknown("interrupted")
+            ),
             stdout: "",
             stderr: "",
             edit: authorizedEdit()
