@@ -64,7 +64,7 @@ actor FileProviderAttemptStore: ProviderAttemptRecording {
     func record(_ evidence: ProviderAttemptEvidence) async throws {
         guard evidence.providerID.utf8.count <= 32,
               evidence.modelSHA256.count == 64,
-              evidence.responseByteCount.map({ $0 >= 0 && $0 <= ProviderLimits.maximumOutputBytes }) ?? true,
+              Self.validResponseByteCount(evidence),
               evidence.responseSHA256.map({ $0.count == 64 }) ?? true,
               Self.valid(evidence.toolExchangeDiagnostic),
               Self.validDiagnosticContext(evidence) else {
@@ -99,6 +99,16 @@ actor FileProviderAttemptStore: ProviderAttemptRecording {
             && (0...(ProviderLimits.maximumToolCallIDBytes + 1)).contains(diagnostic.toolCallIDByteCount)
             && (0...(ProviderLimits.maximumToolNameBytes + 1)).contains(diagnostic.toolNameByteCount)
             && (0...(ProviderLimits.maximumToolArgumentsBytes + 1)).contains(diagnostic.argumentsByteCount)
+    }
+
+    private static func validResponseByteCount(_ evidence: ProviderAttemptEvidence) -> Bool {
+        guard let byteCount = evidence.responseByteCount, byteCount >= 0 else {
+            return evidence.responseByteCount == nil
+        }
+        let maximum = evidence.resultCategory == .toolCall
+            ? ProviderLimits.maximumResponseBodyBytes
+            : ProviderLimits.maximumOutputBytes
+        return byteCount <= maximum
     }
 
     private static func validDiagnosticContext(_ evidence: ProviderAttemptEvidence) -> Bool {

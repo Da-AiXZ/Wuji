@@ -2,12 +2,12 @@ import XCTest
 @testable import Wuji
 
 final class WujiS4ContractsTests: XCTestCase {
-    func testReadBatchesAcceptFourCallsAndRejectEmptyBatch() throws {
+    func testReadBatchesAcceptThroughCumulativeBudgetAndRejectEmptyBatch() throws {
         let fixture = try makeWorkspace()
         let policy = try S4ToolPolicy(workspace: fixture.workspace)
 
         XCTAssertThrowsError(try policy.authorizeBatch([], phase: .inspecting))
-        for count in 1...4 {
+        for count in [1, 4, S4Limits.maximumToolExecutions] {
             let calls = (0..<count).map {
                 call(id: "read-\($0)", name: "list", arguments: #"{"path":""}"#)
             }

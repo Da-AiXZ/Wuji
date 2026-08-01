@@ -309,7 +309,7 @@ final class WujiS4AgentTests: XCTestCase {
         let outcome = await agent.run(taskID: fixture.taskID)
         XCTAssertEqual(outcome, .failure(.approvalTampered))
         let calls = await executor.calls()
-        XCTAssertEqual(calls, ["list", "search", "read"])
+        XCTAssertEqual(calls, ["list", "search", "read", "list"])
     }
 
     func testWriteIntentFailureAndWriterBusyCauseZeroWriteIO() async throws {
@@ -391,7 +391,7 @@ final class WujiS4AgentTests: XCTestCase {
             let outcome = await agent.run(taskID: fixture.taskID)
             XCTAssertEqual(outcome, .failure(.durableEvidenceUnavailable))
             let calls = await executor.calls()
-            XCTAssertEqual(calls, ["list", "search", "read", "edit"])
+            XCTAssertEqual(calls, ["list", "search", "read", "list", "edit"])
         }
     }
 
@@ -419,7 +419,7 @@ final class WujiS4AgentTests: XCTestCase {
             case .readExecutor:
                 XCTAssertEqual(calls, ["list"])
             case .verifyExecutor:
-                XCTAssertEqual(calls, ["list", "search", "read", "edit", "verify"])
+                XCTAssertEqual(calls, ["list", "search", "read", "list", "edit", "verify"])
             default:
                 XCTFail("unexpected test kind")
             }

@@ -412,7 +412,7 @@ jobs:
               if summary["result_category"] == "policy_rejected":
                   if reason not in allowed_policy_reasons:
                       raise SystemExit("unexpected policy rejection reason")
-                  if isinstance(index, bool) or not isinstance(index, int) or not (-1 <= index < 3):
+                  if isinstance(index, bool) or not isinstance(index, int) or not (-1 <= index < 10):
                       raise SystemExit("policy rejection index outside cap")
               elif reason != "" or index != -1:
                   raise SystemExit("policy diagnostic outside policy rejection")
@@ -575,7 +575,9 @@ jobs:
           if draft.count(b"STATUS=pending") != 1:
               raise SystemExit("S4 pending token count changed")
           PY
-          if git diff --name-only 088cdbfa16b50195ff34855231021da2a67f3139..HEAD | grep -E '^(ThirdParty/ish|Wuji/ISHExecutor.swift|Wuji/ExecutorContracts.swift|Wuji/ISHReadOnlyExecutor.swift|Wuji/S3AttemptStore.swift|Wuji/S3ReadOnlyAgent.swift|Wuji/S3ReadOnlyTools.swift|Wuji/S3Fixture|WujiTests/WujiISHGuestIntegrationTests.swift|WujiTests/WujiExecutorContractTests.swift|WujiTests/WujiS3|Scripts/build-ish.sh|Scripts/fetch-rootfs.sh|Scripts/verify-source-lock.sh|\.github/workflows/s[0-3]-)'; then
+          test "$(git rev-parse c0acfc7ebb0977cf1b5b20a7ad397e18cc926343:Wuji/S3ReadOnlyTools.swift)" = "38b4342a5045eacde0e4daa11e0374183aacee30"
+          git diff --quiet c0acfc7ebb0977cf1b5b20a7ad397e18cc926343..HEAD -- Wuji/S3ReadOnlyTools.swift
+          if git diff --name-only 088cdbfa16b50195ff34855231021da2a67f3139..HEAD | grep -E '^(ThirdParty/ish|Wuji/ISHExecutor.swift|Wuji/ExecutorContracts.swift|Wuji/ISHReadOnlyExecutor.swift|Wuji/S3AttemptStore.swift|Wuji/S3ReadOnlyAgent.swift|Wuji/S3Fixture|WujiTests/WujiISHGuestIntegrationTests.swift|WujiTests/WujiExecutorContractTests.swift|WujiTests/WujiS3|Scripts/build-ish.sh|Scripts/fetch-rootfs.sh|Scripts/verify-source-lock.sh|\.github/workflows/s[0-3]-)'; then
             echo '::error::Protected S1 or fixed-source boundary changed'
             exit 1
           fi

@@ -394,6 +394,53 @@ final class WujiProviderTests: XCTestCase {
         }
     }
 
+    func testLargeBoundedToolCallBatchPersistsWithoutUsingFinishOutputLimit() async throws {
+        let padding = String(repeating: "x", count: 900)
+        let arguments = "{\"path\":\"\(padding)\"}"
+        XCTAssertLessThanOrEqual(arguments.utf8.count, ProviderLimits.maximumToolArgumentsBytes)
+        let responseCalls = (0..<10).map { index in
+            diagnosticToolCall(
+                id: "large-batch-\(index)",
+                name: "list",
+                arguments: arguments
+            )
+        }
+        let body = diagnosticResponseBody(
+            toolCalls: responseCalls,
+            content: NSNull(),
+            finishReason: "tool_calls"
+        )
+        XCTAssertLessThanOrEqual(body.count, ProviderLimits.maximumResponseBodyBytes)
+        let directory = temporaryDirectory()
+        let provider = try makeProvider(
+            transport: MockProviderTransport(mode: .response(ProviderHTTPResponse(
+                statusCode: 200,
+                body: body
+            ))),
+            store: try FileProviderAttemptStore(directoryURL: directory)
+        )
+
+        let outcome = await provider.infer(request: structuredRequest(), requestID: UUID())
+
+        guard case let .decision(.toolCalls(_, calls)) = outcome else {
+            return XCTFail("expected complete large typed batch, got \(outcome)")
+        }
+        XCTAssertEqual(calls.map(\.id), (0..<10).map { "large-batch-\($0)" })
+        let durable = try Data(contentsOf: directory.appendingPathComponent("provider-attempts.jsonl"))
+        let lines = durable.split(separator: 0x0A)
+        XCTAssertEqual(lines.count, 2)
+        let terminal = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(lines[1])) as? [String: Any]
+        )
+        let responseByteCount = try XCTUnwrap(terminal["responseByteCount"] as? Int)
+        XCTAssertGreaterThan(responseByteCount, ProviderLimits.maximumOutputBytes)
+        XCTAssertLessThanOrEqual(responseByteCount, ProviderLimits.maximumResponseBodyBytes)
+        XCTAssertFalse(durable.contains(Data(arguments.utf8)))
+        for call in calls {
+            XCTAssertFalse(durable.contains(Data(call.id.utf8)))
+        }
+    }
+
     func testToolResultHistoryRequiresUniqueExactIDPairingBeforeNetwork() async throws {
         let first = ProviderTurnToolCall(id: "pair-1", name: "list", arguments: "{\"path\":\"\"}")
         let second = ProviderTurnToolCall(id: "pair-2", name: "read", arguments: "{\"path\":\"records/target.txt\"}")
