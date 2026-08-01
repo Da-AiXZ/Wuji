@@ -8,6 +8,9 @@ private struct S3ProbeSummary: Codable {
     let providerRequestCount: Int
     let toolExecutionCount: Int
     let observationSHA256: String
+    let loopFailureCode: String
+    let policyRejectionReason: String
+    let policyCallIndex: Int
 
     enum CodingKeys: String, CodingKey {
         case taskID = "task_id"
@@ -17,6 +20,9 @@ private struct S3ProbeSummary: Codable {
         case providerRequestCount = "provider_request_count"
         case toolExecutionCount = "tool_execution_count"
         case observationSHA256 = "observation_sha256"
+        case loopFailureCode = "loop_failure_code"
+        case policyRejectionReason = "policy_rejection_reason"
+        case policyCallIndex = "policy_call_index"
     }
 }
 
@@ -94,19 +100,42 @@ enum S3ProbeRunner {
                     value: completion.value,
                     providerRequestCount: completion.providerRequestCount,
                     toolExecutionCount: completion.toolExecutionCount,
-                    observationSHA256: completion.observationSHA256
+                    observationSHA256: completion.observationSHA256,
+                    loopFailureCode: "",
+                    policyRejectionReason: "",
+                    policyCallIndex: -1
                 ))
             case .reconciliationRequired:
                 writeFailure(taskID: taskID, category: "reconciliation_required")
-            case .failure:
-                writeFailure(taskID: taskID, category: "loop_failure")
+            case let .failure(failure):
+                if case let .policyRejected(reason, callIndex) = failure {
+                    writeFailure(
+                        taskID: taskID,
+                        category: "loop_failure",
+                        loopFailureCode: failure.summaryCode,
+                        policyRejectionReason: reason.rawValue,
+                        policyCallIndex: callIndex ?? -1
+                    )
+                } else {
+                    writeFailure(
+                        taskID: taskID,
+                        category: "loop_failure",
+                        loopFailureCode: failure.summaryCode
+                    )
+                }
             }
         } catch {
             writeFailure(taskID: taskID, category: "configuration_rejected")
         }
     }
 
-    private static func writeFailure(taskID: UUID, category: String) {
+    private static func writeFailure(
+        taskID: UUID,
+        category: String,
+        loopFailureCode: String = "",
+        policyRejectionReason: String = "",
+        policyCallIndex: Int = -1
+    ) {
         write(S3ProbeSummary(
             taskID: taskID.uuidString,
             resultCategory: category,
@@ -114,7 +143,10 @@ enum S3ProbeRunner {
             value: "",
             providerRequestCount: 0,
             toolExecutionCount: 0,
-            observationSHA256: String(repeating: "0", count: 64)
+            observationSHA256: String(repeating: "0", count: 64),
+            loopFailureCode: loopFailureCode,
+            policyRejectionReason: policyRejectionReason,
+            policyCallIndex: policyCallIndex
         ))
     }
 

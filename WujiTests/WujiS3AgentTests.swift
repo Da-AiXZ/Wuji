@@ -149,22 +149,22 @@ final class WujiS3AgentTests: XCTestCase {
             at: link,
             withDestinationURL: outsideRoot.appendingPathComponent("secret.txt")
         )
-        let invalidBatches: [[ProviderTurnToolCall]] = [
-            [valid, call(id: "bad-name", name: "network", arguments: ["path": ""])],
-            [valid, ProviderTurnToolCall(id: "bad-json", name: "read", arguments: "not-json")],
-            [valid, call(id: "bad-path", name: "read", arguments: ["path": "../outside/secret.txt"])],
-            [valid, call(id: "bad-symlink", name: "read", arguments: ["path": "batch-escape"])],
-            [valid, call(id: "", name: "read", arguments: ["path": "records/target.txt"])],
-            [valid, call(id: valid.id, name: "read", arguments: ["path": "records/target.txt"])],
-            [
+        let invalidBatches: [([ProviderTurnToolCall], S3PolicyError, Int?)] = [
+            ([valid, call(id: "bad-name", name: "network", arguments: ["path": ""])], .unknownTool, 1),
+            ([valid, ProviderTurnToolCall(id: "bad-json", name: "read", arguments: "not-json")], .invalidArguments, 1),
+            ([valid, call(id: "bad-path", name: "read", arguments: ["path": "../outside/secret.txt"])], .pathRejected, 1),
+            ([valid, call(id: "bad-symlink", name: "read", arguments: ["path": "batch-escape"])], .symlinkEscape, 1),
+            ([valid, call(id: "", name: "read", arguments: ["path": "records/target.txt"])], .toolCallID, 1),
+            ([valid, call(id: valid.id, name: "read", arguments: ["path": "records/target.txt"])], .toolCallID, 1),
+            ([
                 valid,
                 call(id: "extra-1", name: "list", arguments: ["path": ""]),
                 call(id: "extra-2", name: "list", arguments: ["path": ""]),
                 call(id: "extra-3", name: "list", arguments: ["path": ""])
-            ]
+            ], .batchCount, nil)
         ]
 
-        for batch in invalidBatches {
+        for (batch, expectedReason, expectedIndex) in invalidBatches {
             let provider = S3ScriptedProvider(outcomes: [batchDecision(batch)])
             let executor = S3MockExecutor()
             let agent = try makeAgent(
@@ -175,7 +175,10 @@ final class WujiS3AgentTests: XCTestCase {
 
             let outcome = await agent.run(taskID: UUID())
 
-            XCTAssertEqual(outcome, .failure(.policyRejected))
+            XCTAssertEqual(outcome, .failure(.policyRejected(
+                reason: expectedReason,
+                callIndex: expectedIndex
+            )))
             let executorCalls = await executor.callCount
             XCTAssertEqual(executorCalls, 0)
         }
@@ -236,7 +239,10 @@ final class WujiS3AgentTests: XCTestCase {
 
         let outcome = await agent.run(taskID: UUID())
 
-        XCTAssertEqual(outcome, .failure(.policyRejected))
+        XCTAssertEqual(outcome, .failure(.policyRejected(
+            reason: .toolCallID,
+            callIndex: 0
+        )))
         let providerCalls = await provider.callCount
         let executorCalls = await executor.callCount
         XCTAssertEqual(providerCalls, 2)
@@ -257,7 +263,10 @@ final class WujiS3AgentTests: XCTestCase {
 
             let outcome = await agent.run(taskID: UUID())
             let executorCalls = await executor.callCount
-            XCTAssertEqual(outcome, .failure(.policyRejected), name)
+            XCTAssertEqual(outcome, .failure(.policyRejected(
+                reason: .unknownTool,
+                callIndex: 0
+            )), name)
             XCTAssertEqual(executorCalls, 0, name)
         }
     }

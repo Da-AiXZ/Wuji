@@ -19,16 +19,20 @@ enum S3ToolName: String, CaseIterable, Codable, Sendable {
     case read
 }
 
-enum S3PolicyError: Error, Equatable, CustomStringConvertible {
-    case unknownTool
-    case invalidArguments
-    case pathRejected
-    case pathUnavailable
-    case symlinkEscape
-    case queryRejected
+enum S3PolicyError: String, Error, Equatable, Codable, Sendable, CustomStringConvertible {
+    case batchCount = "batch_count"
+    case toolCallID = "tool_call_id"
+    case unknownTool = "unknown_tool"
+    case invalidArguments = "invalid_arguments"
+    case pathRejected = "path_rejected"
+    case pathUnavailable = "path_unavailable"
+    case symlinkEscape = "symlink_escape"
+    case queryRejected = "query_rejected"
 
     var description: String {
         switch self {
+        case .batchCount: return "tool batch count rejected"
+        case .toolCallID: return "tool call ID rejected"
         case .unknownTool: return "tool is not in the S3 read-only allowlist"
         case .invalidArguments: return "tool arguments rejected"
         case .pathRejected: return "workspace path rejected"
@@ -37,6 +41,11 @@ enum S3PolicyError: Error, Equatable, CustomStringConvertible {
         case .queryRejected: return "search query rejected"
         }
     }
+}
+
+struct S3BatchPolicyError: Error, Equatable, Sendable {
+    let reason: S3PolicyError
+    let callIndex: Int?
 }
 
 struct S3ApprovedWorkspace: Sendable {
@@ -149,12 +158,12 @@ struct S3ToolPolicy: Sendable {
         previouslyUsedIDs: Set<String> = []
     ) throws -> [S3AuthorizedToolCall] {
         guard !calls.isEmpty, calls.count <= ProviderLimits.maximumToolCalls else {
-            throw S3PolicyError.invalidArguments
+            throw S3BatchPolicyError(reason: .batchCount, callIndex: nil)
         }
         var ids = Set<String>()
         var authorized: [S3AuthorizedToolCall] = []
         authorized.reserveCapacity(calls.count)
-        for call in calls {
+        for (index, call) in calls.enumerated() {
             let idBytes = call.id.utf8.count
             guard idBytes > 0,
                   idBytes <= ProviderLimits.maximumToolCallIDBytes,
@@ -163,12 +172,18 @@ struct S3ToolPolicy: Sendable {
                   }),
                   !previouslyUsedIDs.contains(call.id),
                   ids.insert(call.id).inserted else {
-                throw S3PolicyError.invalidArguments
+                throw S3BatchPolicyError(reason: .toolCallID, callIndex: index)
             }
-            authorized.append(S3AuthorizedToolCall(
-                toolCallID: call.id,
-                tool: try authorize(call)
-            ))
+            do {
+                authorized.append(S3AuthorizedToolCall(
+                    toolCallID: call.id,
+                    tool: try authorize(call)
+                ))
+            } catch let reason as S3PolicyError {
+                throw S3BatchPolicyError(reason: reason, callIndex: index)
+            } catch {
+                throw S3BatchPolicyError(reason: .invalidArguments, callIndex: index)
+            }
         }
         return authorized
     }

@@ -25,7 +25,7 @@ struct S3Completion: Equatable, Sendable, CustomStringConvertible {
 enum S3LoopFailure: Error, Equatable, CustomStringConvertible {
     case evidenceUnavailable
     case providerFailure
-    case policyRejected
+    case policyRejected(reason: S3PolicyError, callIndex: Int?)
     case executorFailure
     case limitsExceeded
     case completionNotEstablished
@@ -34,10 +34,22 @@ enum S3LoopFailure: Error, Equatable, CustomStringConvertible {
         switch self {
         case .evidenceUnavailable: return "S3 durable evidence unavailable"
         case .providerFailure: return "S3 provider inference failed"
-        case .policyRejected: return "S3 tool policy rejected model output"
+        case let .policyRejected(reason, callIndex):
+            return "S3 tool policy rejected model output (reason: \(reason.rawValue), callIndex: \(callIndex ?? -1))"
         case .executorFailure: return "S3 read-only executor failed"
         case .limitsExceeded: return "S3 loop limit exceeded"
         case .completionNotEstablished: return "S3 code-owned completion was not established"
+        }
+    }
+
+    var summaryCode: String {
+        switch self {
+        case .evidenceUnavailable: return "evidence_unavailable"
+        case .providerFailure: return "provider_failure"
+        case .policyRejected: return "policy_rejected"
+        case .executorFailure: return "executor_failure"
+        case .limitsExceeded: return "limits_exceeded"
+        case .completionNotEstablished: return "completion_not_established"
         }
     }
 }
@@ -164,8 +176,16 @@ final class S3ReadOnlyAgent: @unchecked Sendable {
                             calls,
                             previouslyUsedIDs: previouslyUsedIDs
                         )
+                    } catch let rejection as S3BatchPolicyError {
+                        return .failure(.policyRejected(
+                            reason: rejection.reason,
+                            callIndex: rejection.callIndex
+                        ))
                     } catch {
-                        return .failure(.policyRejected)
+                        return .failure(.policyRejected(
+                            reason: .invalidArguments,
+                            callIndex: nil
+                        ))
                     }
                     messages.append(assistantMessage)
 
