@@ -958,7 +958,9 @@ private actor TestS4Executor: S4Executing {
         ))
     }
 
-    nonisolated func requestCancellation() -> ExecutorCancelDelivery { .noActiveTask }
+    nonisolated func requestCancellation() -> CancellationReceipt {
+        CancellationReceipt(requested: true, delivery: .noActiveTask)
+    }
     func calls() -> [String] { callNames }
 
     private func successFacts() -> S3ExecutorFacts {

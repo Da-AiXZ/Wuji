@@ -66,7 +66,13 @@ final class S4ApprovalViewModel: ObservableObject {
 struct S4ApprovalView: View {
     @StateObject private var model: S4ApprovalViewModel
 
-    init(model: S4ApprovalViewModel = S4ApprovalViewModel()) {
+    @MainActor
+    init() {
+        _model = StateObject(wrappedValue: S4ApprovalViewModel())
+    }
+
+    @MainActor
+    init(model: S4ApprovalViewModel) {
         _model = StateObject(wrappedValue: model)
     }
 

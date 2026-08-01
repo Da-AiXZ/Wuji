@@ -107,7 +107,7 @@ enum S4ExecutorClassifier {
 protocol S4Executing: S3ReadOnlyExecuting {
     func edit(_ edit: S4AuthorizedEdit) async -> S4EditOutcome
     func verify(_ profile: S4VerificationProfile) async -> S4VerifyOutcome
-    func requestCancellation() -> ExecutorCancelDelivery
+    func requestCancellation() -> CancellationReceipt
 }
 
 final class ISHS4Executor: S4Executing, @unchecked Sendable {
@@ -226,12 +226,11 @@ final class ISHS4Executor: S4Executing, @unchecked Sendable {
         }.value
     }
 
-    func requestCancellation() -> ExecutorCancelDelivery {
-        switch wuji_ish_request_cancel() {
-        case WUJI_ISH_CANCEL_SIGNAL_SENT: return .signalSent
-        case WUJI_ISH_CANCEL_NO_ACTIVE_TASK: return .noActiveTask
-        default: return .unknown("S4 cancellation delivery unavailable")
-        }
+    func requestCancellation() -> CancellationReceipt {
+        let delivery = wuji_ish_request_cancel() == WUJI_ISH_CANCEL_SIGNAL_SENT
+            ? CancellationDelivery.signalSent
+            : CancellationDelivery.noActiveTask
+        return CancellationReceipt(requested: true, delivery: delivery)
     }
 
     private func prepare() -> Bool {
