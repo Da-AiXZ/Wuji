@@ -69,7 +69,7 @@ final class WujiS4ContractsTests: XCTestCase {
         let policy = try S4ToolPolicy(workspace: fixture.workspace)
         let lateRead = call(id: "late-read", name: "read", arguments: #"{"path":"records/draft.txt"}"#)
         for phase in [S4PolicyPhase.inspected, .edited, .verified] {
-            XCTAssertThrowsError(try policy.authorizeBatch([lateRead], phase: phase)) {
+            XCTAssertThrowsError(try policy.authorizeBatch([lateRead], phase: phase)) { error in
                 XCTAssertEqual((error as? S4BatchPolicyError)?.reason, .stalePhase)
             }
         }
