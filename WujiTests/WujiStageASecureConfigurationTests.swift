@@ -64,6 +64,28 @@ final class WujiStageASecureConfigurationTests: XCTestCase {
         XCTAssertThrowsError(try store.load()) {
             XCTAssertEqual($0 as? ProviderSecretStoreError, .unavailable)
         }
+
+        let categories: [(KeychainOperationFailure, KeychainStatusCategory)] = [
+            (KeychainOperationFailure(operation: .update, status: -34018), .missingEntitlement),
+            (KeychainOperationFailure(operation: .add, status: -25291), .notAvailable),
+            (KeychainOperationFailure(operation: .copyMatching, status: -25308), .interactionNotAllowed),
+            (KeychainOperationFailure(operation: .delete, status: -50), .invalidParameter),
+            (KeychainOperationFailure(operation: .update, status: -25293), .authenticationFailed),
+            (KeychainOperationFailure(operation: .add, status: -25243), .noAccess)
+        ]
+        for (failure, expectedCategory) in categories {
+            XCTAssertEqual(failure.category, expectedCategory)
+        }
+        for operation in KeychainOperation.allCases {
+            let failure = KeychainOperationFailure(operation: operation, status: -50)
+            XCTAssertEqual(failure.operation, operation)
+            XCTAssertEqual(failure.status, -50)
+            XCTAssertEqual(failure.category, .invalidParameter)
+        }
+        let unknown = KeychainOperationFailure(operation: .copyMatching, status: -12345)
+        XCTAssertEqual(unknown.status, -12345)
+        XCTAssertEqual(unknown.category, .unknown)
+        XCTAssertEqual(unknown.description, "operation=copy_matching status=-12345 category=unknown")
     }
 
     func testInvalidBaseURLAndModelRejectBeforeSecretPersistence() throws {
@@ -95,6 +117,23 @@ final class WujiStageASecureConfigurationTests: XCTestCase {
         let secrets = KeychainProviderSecretStore()
         let store = DeepSeekSecureConfigurationStore(defaults: defaults, secrets: secrets)
         let apiKey = ProviderDigest.sha256Hex("stage-a-keychain-negative-scan-sentinel")
+        let diagnostic = KeychainOperationFailure(operation: .delete, status: -34018)
+        XCTAssertEqual(
+            diagnostic.description,
+            "operation=delete status=-34018 category=missing_entitlement"
+        )
+        for forbidden in [
+            apiKey,
+            DeepSeekSecureConfigurationStore.keychainService,
+            DeepSeekSecureConfigurationStore.keychainAccount,
+            "service",
+            "account",
+            "access_group",
+            "query",
+            "data"
+        ] {
+            XCTAssertFalse(diagnostic.description.contains(forbidden))
+        }
         defer {
             try? secrets.remove(
                 service: DeepSeekSecureConfigurationStore.keychainService,

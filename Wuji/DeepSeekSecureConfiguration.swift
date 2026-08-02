@@ -33,6 +33,51 @@ enum ProviderSecretStoreError: Error, Equatable, CustomStringConvertible {
     }
 }
 
+enum KeychainOperation: String, CaseIterable, Equatable, Sendable {
+    case update
+    case add
+    case copyMatching = "copy_matching"
+    case delete
+}
+
+enum KeychainStatusCategory: String, Equatable, Sendable {
+    case missingEntitlement = "missing_entitlement"
+    case notAvailable = "not_available"
+    case interactionNotAllowed = "interaction_not_allowed"
+    case invalidParameter = "invalid_parameter"
+    case authenticationFailed = "authentication_failed"
+    case noAccess = "no_access"
+    case unknown
+
+    init(status: OSStatus) {
+        switch status {
+        case -34018: self = .missingEntitlement
+        case -25291: self = .notAvailable
+        case -25308: self = .interactionNotAllowed
+        case -50: self = .invalidParameter
+        case -25293: self = .authenticationFailed
+        case -25243: self = .noAccess
+        default: self = .unknown
+        }
+    }
+}
+
+struct KeychainOperationFailure: Error, Equatable, CustomStringConvertible, Sendable {
+    let operation: KeychainOperation
+    let status: OSStatus
+    let category: KeychainStatusCategory
+
+    init(operation: KeychainOperation, status: OSStatus) {
+        self.operation = operation
+        self.status = status
+        category = KeychainStatusCategory(status: status)
+    }
+
+    var description: String {
+        "operation=\(operation.rawValue) status=\(status) category=\(category.rawValue)"
+    }
+}
+
 struct KeychainProviderSecretStore: ProviderSecretStoring, Sendable {
     func save(_ data: Data, service: String, account: String) throws {
         let match: [String: Any] = [
@@ -47,13 +92,14 @@ struct KeychainProviderSecretStore: ProviderSecretStoring, Sendable {
         let updateStatus = SecItemUpdate(match as CFDictionary, update as CFDictionary)
         if updateStatus == errSecSuccess { return }
         guard updateStatus == errSecItemNotFound else {
-            throw ProviderSecretStoreError.writeFailed
+            throw KeychainOperationFailure(operation: .update, status: updateStatus)
         }
         var add = match
         add[kSecValueData as String] = data
         add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-        guard SecItemAdd(add as CFDictionary, nil) == errSecSuccess else {
-            throw ProviderSecretStoreError.writeFailed
+        let addStatus = SecItemAdd(add as CFDictionary, nil)
+        guard addStatus == errSecSuccess else {
+            throw KeychainOperationFailure(operation: .add, status: addStatus)
         }
     }
 
@@ -68,9 +114,10 @@ struct KeychainProviderSecretStore: ProviderSecretStoring, Sendable {
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         if status == errSecItemNotFound { throw ProviderSecretStoreError.unavailable }
-        guard status == errSecSuccess, let data = item as? Data else {
-            throw ProviderSecretStoreError.readFailed
+        guard status == errSecSuccess else {
+            throw KeychainOperationFailure(operation: .copyMatching, status: status)
         }
+        guard let data = item as? Data else { throw ProviderSecretStoreError.readFailed }
         return data
     }
 
@@ -82,7 +129,7 @@ struct KeychainProviderSecretStore: ProviderSecretStoring, Sendable {
         ]
         let status = SecItemDelete(query as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw ProviderSecretStoreError.deleteFailed
+            throw KeychainOperationFailure(operation: .delete, status: status)
         }
     }
 }
