@@ -636,8 +636,9 @@ final class S4Agent: @unchecked Sendable {
         }
         let operationID = makeUUID()
         let attemptID = makeUUID()
-        let inputHash = ProviderDigest.sha256Hex(
-            "verify\u{0}\(profile.rawValue)\u{0}\(approvalRequest.bindingSHA256)"
+        let inputHash = verifyInputHash(
+            profile: profile,
+            approvalRequest: approvalRequest
         )
         guard await recordAttempt(intent(
             taskID: taskID,
@@ -724,16 +725,6 @@ final class S4Agent: @unchecked Sendable {
            }) {
             return await reconcileWrite(taskID: taskID, attempt: writeIntent)
         }
-        if let unknownVerify = snapshot.attempts.last(where: {
-            $0.phase == .reconciliationRequired && $0.ioKind == .verifyExecutor
-        }), !snapshot.attempts.contains(where: {
-            $0.ioKind == .verifyExecutor
-                && $0.phase == .succeeded
-                && $0.resultCategory == .verifyPassed
-                && $0.recordedAt >= unknownVerify.recordedAt
-        }) {
-            return await reconcileThenVerify(taskID: taskID)
-        }
         let unresolved = unresolvedAttempts(snapshot.attempts)
         if unresolved.count > 1 { return .reconciliationRequired }
         if let attempt = unresolved.first {
@@ -753,12 +744,12 @@ final class S4Agent: @unchecked Sendable {
                 ) else { return .reconciliationRequired }
                 return await reconcileWrite(taskID: taskID, attempt: attempt)
             case .verifyExecutor:
-                _ = await recordRecoveredTerminal(
+                guard await recordRecoveredTerminal(
                     attempt,
                     phase: .reconciliationRequired,
                     category: .executorUnknown
-                )
-                return await reconcileThenVerify(taskID: taskID)
+                ) else { return .reconciliationRequired }
+                return .reconciliationRequired
             case .workspacePrepare, .reconciliation, .completionCheck:
                 return .reconciliationRequired
             }
@@ -803,15 +794,10 @@ final class S4Agent: @unchecked Sendable {
             }
         case .granted:
             guard let grant = approval.grant else { return .failure(.approvalTampered) }
-            if let verifyTerminal = snapshot.attempts.last(where: {
-                $0.ioKind == .verifyExecutor
-                    && $0.phase == .succeeded
-                    && $0.resultCategory == .verifyPassed
-            }),
-               let verifyFacts = facts(from: verifyTerminal),
-               verifyFacts.completionBarrierSatisfied,
-               !verifyFacts.truncated,
-               verifyFacts.finalState == .exited(0),
+            if let verifyObservation = recoveryVerifyObservation(
+                snapshot: snapshot,
+                approvalRequest: approval.request
+            ),
                let writeEvidence = recoveryWriteEvidence(
                    snapshot: snapshot,
                    approvalRequest: approval.request
@@ -823,13 +809,11 @@ final class S4Agent: @unchecked Sendable {
                     approvalRequest: approval.request,
                     approvalGrant: grant,
                     writeEvidence: writeEvidence,
-                    verifyObservation: S4VerifyObservation(
-                        profile: approval.request.verificationProfile,
-                        afterSHA256: approval.request.afterSHA256,
-                        contextSHA256: S4TaskContract.contextHash,
-                        facts: verifyFacts
-                    )
+                    verifyObservation: verifyObservation
                 )
+            }
+            guard !snapshot.attempts.contains(where: { $0.ioKind == .verifyExecutor }) else {
+                return .reconciliationRequired
             }
             let writeTerminals = snapshot.attempts.filter {
                 $0.ioKind == .writeExecutor && $0.phase != .intentRecorded
@@ -840,7 +824,7 @@ final class S4Agent: @unchecked Sendable {
             if writeTerminals.contains(where: {
                 $0.phase == .succeeded || $0.phase == .reconciledApplied
             }) {
-                return await reconcileThenVerify(taskID: taskID)
+                return await verifyAfterReconciledWrite(taskID: taskID)
             }
             return .reconciliationRequired
         case .rejected: return .failure(.approvalRejected)
@@ -920,7 +904,7 @@ final class S4Agent: @unchecked Sendable {
                     phase: .reconciledApplied,
                     category: .workspaceAfter
                 ) else { return .reconciliationRequired }
-                return await reconcileThenVerify(taskID: taskID)
+                return await verifyAfterReconciledWrite(taskID: taskID)
             }
             _ = await recordRecoveredTerminal(
                 attempt,
@@ -933,9 +917,23 @@ final class S4Agent: @unchecked Sendable {
         }
     }
 
-    private func reconcileThenVerify(
+    private func verifyAfterReconciledWrite(
         taskID: UUID
     ) async -> S4LoopOutcome {
+        let initialSnapshot: S4DurableSnapshot
+        do { initialSnapshot = try await durableStore.snapshot(taskID: taskID) }
+        catch { return .failure(.durableEvidenceUnavailable) }
+        guard !initialSnapshot.attempts.contains(where: { $0.ioKind == .verifyExecutor }),
+              let initialApproval = latestApproval(initialSnapshot.approvals),
+              initialApproval.phase == .granted,
+              let initialGrant = initialApproval.grant,
+              valid(
+                  grant: initialGrant,
+                  for: initialApproval.request,
+                  at: initialGrant.approvedAt
+              ) else {
+            return .reconciliationRequired
+        }
         let inspection = await reconcileWorkspace(taskID: taskID)
         let snapshot: S4DurableSnapshot
         do { snapshot = try await durableStore.snapshot(taskID: taskID) }
@@ -948,7 +946,10 @@ final class S4Agent: @unchecked Sendable {
               let approval = latestApproval(snapshot.approvals),
               approval.phase == .granted,
               let grant = approval.grant,
+              approval.request.requestID == initialApproval.request.requestID,
+              approval.request.bindingSHA256 == initialApproval.request.bindingSHA256,
               valid(grant: grant, for: approval.request, at: grant.approvedAt),
+              !snapshot.attempts.contains(where: { $0.ioKind == .verifyExecutor }),
               let writeEvidence = recoveryWriteEvidence(
                   snapshot: snapshot,
                   approvalRequest: approval.request
@@ -1370,6 +1371,36 @@ final class S4Agent: @unchecked Sendable {
         return .reconciledApplied(reconciled)
     }
 
+    private func recoveryVerifyObservation(
+        snapshot: S4DurableSnapshot,
+        approvalRequest: S4ApprovalRequest
+    ) -> S4VerifyObservation? {
+        let verifyRecords = snapshot.attempts.filter { $0.ioKind == .verifyExecutor }
+        let intents = verifyRecords.filter { $0.phase == .intentRecorded }
+        guard intents.count == 1,
+              let intent = intents.first,
+              matchesApprovedVerify(intent, approvalRequest: approvalRequest),
+              verifyRecords.allSatisfy({
+                  $0.attemptID == intent.attemptID
+                      && $0.operationID == intent.operationID
+                      && matchesApprovedVerify($0, approvalRequest: approvalRequest)
+                      && $0.toolCallIDHash == intent.toolCallIDHash
+              }),
+              let terminal = verifyRecords.last(where: { $0.phase != .intentRecorded }),
+              terminal.phase == .succeeded,
+              terminal.resultCategory == .verifyPassed,
+              let verifyFacts = facts(from: terminal),
+              verifyFacts.completionBarrierSatisfied,
+              !verifyFacts.truncated,
+              verifyFacts.finalState == .exited(0) else { return nil }
+        return S4VerifyObservation(
+            profile: approvalRequest.verificationProfile,
+            afterSHA256: approvalRequest.afterSHA256,
+            contextSHA256: S4TaskContract.contextHash,
+            facts: verifyFacts
+        )
+    }
+
     private func valid(
         writeEvidence: S4WriteCompletionEvidence,
         approvalRequest: S4ApprovalRequest
@@ -1413,6 +1444,31 @@ final class S4Agent: @unchecked Sendable {
                 approvalRequest.nonce.uuidString.lowercased()
             )
             && evidence.inputSHA256 == edit.inputSHA256
+    }
+
+    private func matchesApprovedVerify(
+        _ evidence: S4AttemptEvidence,
+        approvalRequest: S4ApprovalRequest
+    ) -> Bool {
+        evidence.ioKind == .verifyExecutor
+            && evidence.toolName == S4ToolName.verify.rawValue
+            && evidence.toolCallIDHash != nil
+            && evidence.approvalNonceHash == ProviderDigest.sha256Hex(
+                approvalRequest.nonce.uuidString.lowercased()
+            )
+            && evidence.inputSHA256 == verifyInputHash(
+                profile: approvalRequest.verificationProfile,
+                approvalRequest: approvalRequest
+            )
+    }
+
+    private func verifyInputHash(
+        profile: S4VerificationProfile,
+        approvalRequest: S4ApprovalRequest
+    ) -> String {
+        ProviderDigest.sha256Hex(
+            "verify\u{0}\(profile.rawValue)\u{0}\(approvalRequest.bindingSHA256)"
+        )
     }
 
     private func finalStateFields(_ state: ExecutorFinalState) -> (kind: String, value: Int32) {

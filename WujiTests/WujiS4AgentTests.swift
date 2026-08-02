@@ -689,6 +689,12 @@ final class WujiS4AgentTests: XCTestCase {
                 && $0.phase == .succeeded
                 && $0.resultCategory == .completionEstablished
         })
+        let secondOutcome = await agent.run(taskID: fixture.taskID)
+        let secondCalls = await executor.calls()
+        let secondSnapshot = await store.currentSnapshot()
+        XCTAssertEqual(secondOutcome, .reconciliationRequired)
+        XCTAssertEqual(secondCalls, ["verify"])
+        XCTAssertEqual(secondSnapshot, snapshot)
     }
 
     func testUnresolvedWriteWithTempOrOtherStateRequiresManualReconciliation() async throws {
@@ -727,7 +733,7 @@ final class WujiS4AgentTests: XCTestCase {
         }
     }
 
-    func testUnresolvedVerifyMarksOldAttemptUnknownThenCreatesOneNewAttempt() async throws {
+    func testUnresolvedVerifyColdRecoveryMarksUnknownWithoutRetryAndIsIdempotent() async throws {
         let fixture = try makeWorkspace(initialState: .after)
         let seeded = seededGrant(workspace: fixture.workspace)
         let write = attemptPair(
@@ -742,7 +748,9 @@ final class WujiS4AgentTests: XCTestCase {
             taskID: fixture.taskID,
             kind: .verifyExecutor,
             phase: .intentRecorded,
-            approvalNonce: seeded.request.nonce
+            approvalNonce: seeded.request.nonce,
+            toolCallID: "verify-unresolved",
+            inputSHA256: verifyInputHash(seeded.request)
         )
         let store = TestS4Store(attempts: write + [verifyIntent], approvals: seeded.evidence)
         let executor = TestS4Executor(workspace: fixture.workspace)
@@ -753,18 +761,24 @@ final class WujiS4AgentTests: XCTestCase {
             store: store,
             approval: TestS4ApprovalAuthorizer(mode: .approve)
         )
-        guard case .completed = await agent.run(taskID: fixture.taskID) else {
-            return XCTFail("verify recovery did not complete")
-        }
+        let firstOutcome = await agent.run(taskID: fixture.taskID)
         let calls = await executor.calls()
-        XCTAssertEqual(calls, ["verify"])
+        XCTAssertEqual(firstOutcome, .reconciliationRequired)
+        XCTAssertTrue(calls.isEmpty)
         let snapshot = await store.currentSnapshot()
         XCTAssertTrue(snapshot.attempts.contains {
             $0.attemptID == verifyIntent.attemptID && $0.phase == .reconciliationRequired
         })
         XCTAssertEqual(Set(snapshot.attempts.filter {
             $0.ioKind == .verifyExecutor && $0.phase == .intentRecorded
-        }.map(\.attemptID)).count, 2)
+        }.map(\.attemptID)).count, 1)
+
+        let secondOutcome = await agent.run(taskID: fixture.taskID)
+        let secondCalls = await executor.calls()
+        let secondSnapshot = await store.currentSnapshot()
+        XCTAssertEqual(secondOutcome, .reconciliationRequired)
+        XCTAssertEqual(secondCalls, [])
+        XCTAssertEqual(secondSnapshot, snapshot)
     }
 
     func testExistingVerifySuccessColdRecoveryDoesNotRepeatVerify() async throws {
@@ -782,6 +796,8 @@ final class WujiS4AgentTests: XCTestCase {
             kind: .verifyExecutor,
             terminalCategory: .verifyPassed,
             approvalNonce: seeded.request.nonce,
+            toolCallID: "verify-existing",
+            inputSHA256: verifyInputHash(seeded.request),
             facts: successFacts()
         )
         let executor = TestS4Executor(workspace: fixture.workspace)
@@ -797,6 +813,146 @@ final class WujiS4AgentTests: XCTestCase {
         }
         let calls = await executor.calls()
         XCTAssertTrue(calls.isEmpty)
+    }
+
+    func testSameAttemptLateVerifyTerminalResolvesUnknownWithoutExecutorIO() async throws {
+        let fixture = try makeWorkspace(initialState: .after)
+        let seeded = seededGrant(workspace: fixture.workspace)
+        let write = attemptPair(
+            taskID: fixture.taskID,
+            kind: .writeExecutor,
+            terminalCategory: .writeApplied,
+            approvalNonce: seeded.request.nonce,
+            toolCallID: seeded.request.toolCallID,
+            facts: successFacts()
+        )
+        let verifyOperationID = UUID()
+        let verifyAttemptID = UUID()
+        let verifyRecords = [
+            attempt(
+                taskID: fixture.taskID,
+                kind: .verifyExecutor,
+                phase: .intentRecorded,
+                operationID: verifyOperationID,
+                attemptID: verifyAttemptID,
+                approvalNonce: seeded.request.nonce,
+                toolCallID: "verify-late-terminal",
+                inputSHA256: verifyInputHash(seeded.request)
+            ),
+            attempt(
+                taskID: fixture.taskID,
+                kind: .verifyExecutor,
+                phase: .reconciliationRequired,
+                operationID: verifyOperationID,
+                attemptID: verifyAttemptID,
+                category: .executorUnknown,
+                approvalNonce: seeded.request.nonce,
+                toolCallID: "verify-late-terminal",
+                inputSHA256: verifyInputHash(seeded.request)
+            ),
+            attempt(
+                taskID: fixture.taskID,
+                kind: .verifyExecutor,
+                phase: .succeeded,
+                operationID: verifyOperationID,
+                attemptID: verifyAttemptID,
+                category: .verifyPassed,
+                approvalNonce: seeded.request.nonce,
+                toolCallID: "verify-late-terminal",
+                inputSHA256: verifyInputHash(seeded.request),
+                facts: successFacts()
+            )
+        ]
+        let store = TestS4Store(
+            attempts: write + verifyRecords,
+            approvals: seeded.evidence
+        )
+        let executor = TestS4Executor(workspace: fixture.workspace)
+        let agent = try makeAgent(
+            fixture: fixture,
+            provider: TestS4Provider(outcomes: []),
+            executor: executor,
+            store: store,
+            approval: TestS4ApprovalAuthorizer(mode: .approve)
+        )
+
+        guard case .completed = await agent.run(taskID: fixture.taskID) else {
+            return XCTFail("same-attempt late verify terminal did not complete")
+        }
+        let calls = await executor.calls()
+        XCTAssertTrue(calls.isEmpty)
+        let snapshot = await store.currentSnapshot()
+        XCTAssertEqual(Set(snapshot.attempts.filter {
+            $0.ioKind == .verifyExecutor
+        }.map(\.attemptID)), Set([verifyAttemptID]))
+    }
+
+    func testOlderVerifySuccessCannotSatisfyNewerUnknownAttempt() async throws {
+        let fixture = try makeWorkspace(initialState: .after)
+        let seeded = seededGrant(workspace: fixture.workspace)
+        let write = attemptPair(
+            taskID: fixture.taskID,
+            kind: .writeExecutor,
+            terminalCategory: .writeApplied,
+            approvalNonce: seeded.request.nonce,
+            toolCallID: seeded.request.toolCallID,
+            facts: successFacts()
+        )
+        let oldSuccess = attemptPair(
+            taskID: fixture.taskID,
+            kind: .verifyExecutor,
+            terminalCategory: .verifyPassed,
+            approvalNonce: seeded.request.nonce,
+            toolCallID: "verify-old",
+            inputSHA256: verifyInputHash(seeded.request),
+            facts: successFacts()
+        )
+        let newOperationID = UUID()
+        let newAttemptID = UUID()
+        let newerUnknown = [
+            attempt(
+                taskID: fixture.taskID,
+                kind: .verifyExecutor,
+                phase: .intentRecorded,
+                operationID: newOperationID,
+                attemptID: newAttemptID,
+                approvalNonce: seeded.request.nonce,
+                toolCallID: "verify-new",
+                inputSHA256: verifyInputHash(seeded.request)
+            ),
+            attempt(
+                taskID: fixture.taskID,
+                kind: .verifyExecutor,
+                phase: .reconciliationRequired,
+                operationID: newOperationID,
+                attemptID: newAttemptID,
+                category: .executorUnknown,
+                approvalNonce: seeded.request.nonce,
+                toolCallID: "verify-new",
+                inputSHA256: verifyInputHash(seeded.request)
+            )
+        ]
+        let store = TestS4Store(
+            attempts: write + oldSuccess + newerUnknown,
+            approvals: seeded.evidence
+        )
+        let executor = TestS4Executor(workspace: fixture.workspace)
+        let agent = try makeAgent(
+            fixture: fixture,
+            provider: TestS4Provider(outcomes: []),
+            executor: executor,
+            store: store,
+            approval: TestS4ApprovalAuthorizer(mode: .approve)
+        )
+
+        let outcome = await agent.run(taskID: fixture.taskID)
+        let calls = await executor.calls()
+        XCTAssertEqual(outcome, .reconciliationRequired)
+        XCTAssertTrue(calls.isEmpty)
+        let snapshot = await store.currentSnapshot()
+        XCTAssertFalse(snapshot.attempts.contains {
+            $0.ioKind == .completionCheck && $0.resultCategory == .completionEstablished
+        })
     }
 
     func testColdRecoveryCompletesFromAppliedReconciliationAndRealVerifyWithoutSyntheticFacts() async throws {
@@ -840,6 +996,8 @@ final class WujiS4AgentTests: XCTestCase {
             kind: .verifyExecutor,
             terminalCategory: .verifyPassed,
             approvalNonce: seeded.request.nonce,
+            toolCallID: "verify-reconciled-write",
+            inputSHA256: verifyInputHash(seeded.request),
             facts: successFacts()
         )
         let store = TestS4Store(
@@ -1080,6 +1238,7 @@ final class WujiS4AgentTests: XCTestCase {
         category: S4AttemptResultCategory = .none,
         approvalNonce: UUID? = nil,
         toolCallID: String? = nil,
+        inputSHA256: String? = nil,
         facts: S3ExecutorFacts? = nil
     ) -> S4AttemptEvidence {
         let state: (String, Int32)? = facts.map {
@@ -1098,13 +1257,13 @@ final class WujiS4AgentTests: XCTestCase {
             toolName: kind == .writeExecutor ? "edit" : (kind == .verifyExecutor ? "verify" : nil),
             toolCallIDHash: toolCallID.map(ProviderDigest.sha256Hex),
             approvalNonceHash: approvalNonce.map { ProviderDigest.sha256Hex($0.uuidString.lowercased()) },
-            inputSHA256: kind == .writeExecutor
+            inputSHA256: inputSHA256 ?? (kind == .writeExecutor
                 ? S4AuthorizedEdit(
                     relativePath: S4TaskContract.authorizedPath,
                     beforeHash: S4TaskContract.beforeHash,
                     afterHash: S4TaskContract.afterHash
                 ).inputSHA256
-                : String(repeating: "a", count: 64),
+                : String(repeating: "a", count: 64)),
             recordedAt: testDate,
             phase: phase,
             resultCategory: category,
@@ -1125,6 +1284,7 @@ final class WujiS4AgentTests: XCTestCase {
         terminalCategory: S4AttemptResultCategory,
         approvalNonce: UUID?,
         toolCallID: String? = nil,
+        inputSHA256: String? = nil,
         facts: S3ExecutorFacts
     ) -> [S4AttemptEvidence] {
         let operationID = UUID()
@@ -1137,7 +1297,8 @@ final class WujiS4AgentTests: XCTestCase {
                 operationID: operationID,
                 attemptID: attemptID,
                 approvalNonce: approvalNonce,
-                toolCallID: toolCallID
+                toolCallID: toolCallID,
+                inputSHA256: inputSHA256
             ),
             attempt(
                 taskID: taskID,
@@ -1148,6 +1309,7 @@ final class WujiS4AgentTests: XCTestCase {
                 category: terminalCategory,
                 approvalNonce: approvalNonce,
                 toolCallID: toolCallID,
+                inputSHA256: inputSHA256,
                 facts: facts
             )
         ]
@@ -1164,6 +1326,12 @@ final class WujiS4AgentTests: XCTestCase {
             stdoutSHA256: String(repeating: "c", count: 64),
             stderrSHA256: String(repeating: "d", count: 64),
             truncated: false
+        )
+    }
+
+    private func verifyInputHash(_ request: S4ApprovalRequest) -> String {
+        ProviderDigest.sha256Hex(
+            "verify\u{0}\(request.verificationProfile.rawValue)\u{0}\(request.bindingSHA256)"
         )
     }
 
