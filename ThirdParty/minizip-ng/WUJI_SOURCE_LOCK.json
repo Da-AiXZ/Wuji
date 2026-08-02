@@ -31,6 +31,7 @@
     {"path":"mz_strm_os_posix.c","sha256":"b222b78e7d887b3b26ad889cef3ed738e88963751f796301a16382d66d089395","bytes":6063},
     {"path":"mz_strm_split.c","sha256":"5fb45efb4b3847a9b340643f64858d70a2777ec2e4cfd1dc9871d90b36b21fe4","bytes":12877},
     {"path":"mz_strm_split.h","sha256":"180ca6074b172f652b96d30bfdeb96c10e69975b8e1b5d9e58aca41f10c2002a","bytes":1374},
+    {"path":"mz_strm_wzaes.h","sha256":"755ab26a33884fd5ec70bfdce5d7a5fe37120d057120e289f380aee0abc15f6f","bytes":1533},
     {"path":"mz_strm_zlib.c","sha256":"09aba27912927281e36c38ee4afc7b77c1d7048b78570a805d894f8d71a12889","bytes":10274},
     {"path":"mz_strm_zlib.h","sha256":"ffd2c061512a2a54e07a6b9372fbac7d347499936fa67e42aa9068a88912d209","bytes":1367},
     {"path":"mz_zip.c","sha256":"41182ceeeb87e39665b596e26d81aa66506af2c1b1047bd9a9eb60fcb7c3d0ef","bytes":106066},
