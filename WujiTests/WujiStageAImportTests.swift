@@ -243,7 +243,8 @@ final class WujiStageAImportTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: store.workspaceURL(for: result.workspaceID).path
         ))
-        XCTAssertTrue(try await importerReadyRecords(importer).isEmpty)
+        let readyRecords = try await importerReadyRecords(importer)
+        XCTAssertTrue(readyRecords.isEmpty)
     }
 
     func testCancellationLeavesNoReadyWorkspace() async throws {
@@ -297,7 +298,8 @@ final class WujiStageAImportTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: store.workspaceURL(for: linked.workspaceID).path
         ))
-        XCTAssertTrue(try await importerReadyRecords(importer).isEmpty)
+        let readyRecords = try await importerReadyRecords(importer)
+        XCTAssertTrue(readyRecords.isEmpty)
     }
 
     func testContainedURLRejectsBoundaryEscape() throws {
