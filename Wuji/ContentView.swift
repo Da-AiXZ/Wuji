@@ -6,7 +6,12 @@ struct ContentView: View {
     private let taskState = WujiTaskState.empty
 
     @MainActor
-    init(viewModel: StageAViewModel = StageAViewModel()) {
+    init() {
+        _viewModel = StateObject(wrappedValue: StageAViewModel())
+    }
+
+    @MainActor
+    init(viewModel: StageAViewModel) {
         _viewModel = StateObject(wrappedValue: viewModel)
     }
 
