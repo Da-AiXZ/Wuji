@@ -58,7 +58,7 @@ jobs:
         run: |
           set -euo pipefail
           xcodebuild -version
-          plutil -lint Wuji.xcodeproj/project.pbxproj
+          xcodebuild -list -project Wuji.xcodeproj
 
       - name: Build exact-head unsigned ARM64 Wuji app
         shell: bash
