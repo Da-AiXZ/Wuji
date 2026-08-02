@@ -275,6 +275,81 @@ final class WujiS4ContractsTests: XCTestCase {
         XCTAssertLessThanOrEqual(raw.utf8.count, S4Limits.maximumDurableFileBytes)
     }
 
+    func testDurableAppliedReconciliationKeepsUnknownAndRejectsExecutorFacts() async throws {
+        let fixture = try makeWorkspace()
+        let directory = fixture.temp.appendingPathComponent("reconciliation-evidence", isDirectory: true)
+        let store = try FileS4DurableStore(directoryURL: directory)
+        let operationID = UUID()
+        let attemptID = UUID()
+        let approvalNonceHash = ProviderDigest.sha256Hex(UUID().uuidString.lowercased())
+        let inputHash = S4AuthorizedEdit(
+            relativePath: S4TaskContract.authorizedPath,
+            beforeHash: S4TaskContract.beforeHash,
+            afterHash: S4TaskContract.afterHash
+        ).inputSHA256
+
+        func evidence(
+            phase: S4AttemptPhase,
+            category: S4AttemptResultCategory,
+            withExecutorFacts: Bool = false
+        ) -> S4AttemptEvidence {
+            S4AttemptEvidence(
+                taskID: fixture.taskID,
+                operationID: operationID,
+                attemptID: attemptID,
+                ioKind: .writeExecutor,
+                providerID: nil,
+                toolName: S4ToolName.edit.rawValue,
+                toolCallIDHash: ProviderDigest.sha256Hex("edit-recovery"),
+                approvalNonceHash: approvalNonceHash,
+                inputSHA256: inputHash,
+                recordedAt: Date(timeIntervalSince1970: 5_000),
+                phase: phase,
+                resultCategory: category,
+                resultByteCount: nil,
+                resultSHA256: nil,
+                rootExitObserved: withExecutorFacts ? true : nil,
+                stdoutEOFObserved: withExecutorFacts ? true : nil,
+                stderrEOFObserved: withExecutorFacts ? true : nil,
+                finalStateKind: withExecutorFacts ? "exited" : nil,
+                finalStateValue: withExecutorFacts ? 0 : nil,
+                truncated: withExecutorFacts ? false : nil
+            )
+        }
+
+        try await store.recordAttempt(evidence(phase: .intentRecorded, category: .none))
+        try await store.recordAttempt(evidence(
+            phase: .reconciliationRequired,
+            category: .executorUnknown
+        ))
+        try await store.recordAttempt(evidence(
+            phase: .reconciledApplied,
+            category: .workspaceAfter
+        ))
+        let snapshot = try await store.snapshot(taskID: fixture.taskID)
+        XCTAssertEqual(snapshot.attempts.map(\.phase), [
+            .intentRecorded, .reconciliationRequired, .reconciledApplied
+        ])
+        let applied = try XCTUnwrap(snapshot.attempts.last)
+        XCTAssertNil(applied.rootExitObserved)
+        XCTAssertNil(applied.stdoutEOFObserved)
+        XCTAssertNil(applied.stderrEOFObserved)
+        XCTAssertNil(applied.finalStateKind)
+        XCTAssertNil(applied.finalStateValue)
+        XCTAssertNil(applied.truncated)
+
+        do {
+            try await store.recordAttempt(evidence(
+                phase: .reconciledApplied,
+                category: .workspaceAfter,
+                withExecutorFacts: true
+            ))
+            XCTFail("reconciled applied evidence accepted synthetic executor facts")
+        } catch {
+            XCTAssertEqual(error as? S4DurableStoreError, .invalidEvidence)
+        }
+    }
+
     private struct Fixture {
         let temp: URL
         let root: URL

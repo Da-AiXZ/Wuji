@@ -470,6 +470,29 @@ final class WujiS4AgentTests: XCTestCase {
         XCTAssertEqual(calls.filter { $0 == "verify" }.count, 1)
         let providerCount = await provider.requestCount()
         XCTAssertEqual(providerCount, 2)
+        let snapshot = await store.currentSnapshot()
+        let unknown = try XCTUnwrap(snapshot.attempts.last {
+            $0.ioKind == .writeExecutor
+                && $0.phase == .reconciliationRequired
+                && $0.resultCategory == .executorUnknown
+        })
+        let applied = try XCTUnwrap(snapshot.attempts.last {
+            $0.attemptID == unknown.attemptID
+                && $0.phase == .reconciledApplied
+                && $0.resultCategory == .workspaceAfter
+        })
+        assertNoExecutorFacts(applied)
+        let verify = try XCTUnwrap(snapshot.attempts.last {
+            $0.ioKind == .verifyExecutor
+                && $0.phase == .succeeded
+                && $0.resultCategory == .verifyPassed
+        })
+        XCTAssertNotEqual(verify.attemptID, unknown.attemptID)
+        XCTAssertEqual(verify.rootExitObserved, true)
+        XCTAssertEqual(verify.stdoutEOFObserved, true)
+        XCTAssertEqual(verify.stderrEOFObserved, true)
+        XCTAssertEqual(verify.finalStateKind, "exited")
+        XCTAssertEqual(verify.finalStateValue, 0)
     }
 
     func testUnknownSecondReadStopsThirdCallAndDoesNotRetry() async throws {
@@ -553,7 +576,8 @@ final class WujiS4AgentTests: XCTestCase {
             taskID: fixture.taskID,
             kind: .writeExecutor,
             phase: .intentRecorded,
-            approvalNonce: seeded.request.nonce
+            approvalNonce: seeded.request.nonce,
+            toolCallID: seeded.request.toolCallID
         )
         let store = TestS4Store(attempts: [writeIntent], approvals: seeded.evidence)
         let executor = TestS4Executor(workspace: fixture.workspace)
@@ -572,6 +596,11 @@ final class WujiS4AgentTests: XCTestCase {
         XCTAssertTrue(snapshot.attempts.contains {
             $0.attemptID == writeIntent.attemptID && $0.phase == .reconciledNotApplied
         })
+        XCTAssertTrue(snapshot.attempts.contains {
+            $0.attemptID == writeIntent.attemptID
+                && $0.phase == .reconciliationRequired
+                && $0.resultCategory == .executorUnknown
+        })
     }
 
     func testUnresolvedWriteAfterStateIsReconciledThenVerifiedWithoutRewrite() async throws {
@@ -581,7 +610,8 @@ final class WujiS4AgentTests: XCTestCase {
             taskID: fixture.taskID,
             kind: .writeExecutor,
             phase: .intentRecorded,
-            approvalNonce: seeded.request.nonce
+            approvalNonce: seeded.request.nonce,
+            toolCallID: seeded.request.toolCallID
         )
         let store = TestS4Store(attempts: [writeIntent], approvals: seeded.evidence)
         let executor = TestS4Executor(workspace: fixture.workspace)
@@ -598,8 +628,66 @@ final class WujiS4AgentTests: XCTestCase {
         let calls = await executor.calls()
         XCTAssertEqual(calls, ["verify"])
         let snapshot = await store.currentSnapshot()
-        XCTAssertTrue(snapshot.attempts.contains {
+        let unknown = try XCTUnwrap(snapshot.attempts.last {
+            $0.attemptID == writeIntent.attemptID
+                && $0.phase == .reconciliationRequired
+                && $0.resultCategory == .executorUnknown
+        })
+        let applied = try XCTUnwrap(snapshot.attempts.last {
             $0.attemptID == writeIntent.attemptID && $0.phase == .reconciledApplied
+        })
+        XCTAssertEqual(unknown.attemptID, applied.attemptID)
+        assertNoExecutorFacts(applied)
+        let verifyIntent = try XCTUnwrap(snapshot.attempts.last {
+            $0.ioKind == .verifyExecutor && $0.phase == .intentRecorded
+        })
+        let verifyTerminal = try XCTUnwrap(snapshot.attempts.last {
+            $0.attemptID == verifyIntent.attemptID && $0.phase == .succeeded
+        })
+        XCTAssertNotEqual(verifyIntent.attemptID, writeIntent.attemptID)
+        XCTAssertEqual(verifyTerminal.rootExitObserved, true)
+        XCTAssertEqual(verifyTerminal.stdoutEOFObserved, true)
+        XCTAssertEqual(verifyTerminal.stderrEOFObserved, true)
+    }
+
+    func testAppliedReconciliationWithoutRealVerifyTerminalCannotComplete() async throws {
+        let fixture = try makeWorkspace(initialState: .after)
+        let seeded = seededGrant(workspace: fixture.workspace)
+        let writeIntent = attempt(
+            taskID: fixture.taskID,
+            kind: .writeExecutor,
+            phase: .intentRecorded,
+            approvalNonce: seeded.request.nonce,
+            toolCallID: seeded.request.toolCallID
+        )
+        let store = TestS4Store(attempts: [writeIntent], approvals: seeded.evidence)
+        let executor = TestS4Executor(workspace: fixture.workspace, verifyMode: .unknown)
+        let agent = try makeAgent(
+            fixture: fixture,
+            provider: TestS4Provider(outcomes: []),
+            executor: executor,
+            store: store,
+            approval: TestS4ApprovalAuthorizer(mode: .approve)
+        )
+
+        let outcome = await agent.run(taskID: fixture.taskID)
+        let calls = await executor.calls()
+        XCTAssertEqual(outcome, .reconciliationRequired)
+        XCTAssertEqual(calls, ["verify"])
+        let snapshot = await store.currentSnapshot()
+        let applied = try XCTUnwrap(snapshot.attempts.last {
+            $0.attemptID == writeIntent.attemptID && $0.phase == .reconciledApplied
+        })
+        assertNoExecutorFacts(applied)
+        XCTAssertTrue(snapshot.attempts.contains {
+            $0.ioKind == .verifyExecutor
+                && $0.phase == .reconciliationRequired
+                && $0.resultCategory == .executorUnknown
+        })
+        XCTAssertFalse(snapshot.attempts.contains {
+            $0.ioKind == .completionCheck
+                && $0.phase == .succeeded
+                && $0.resultCategory == .completionEstablished
         })
     }
 
@@ -621,7 +709,8 @@ final class WujiS4AgentTests: XCTestCase {
                 taskID: fixture.taskID,
                 kind: .writeExecutor,
                 phase: .intentRecorded,
-                approvalNonce: seeded.request.nonce
+                approvalNonce: seeded.request.nonce,
+                toolCallID: seeded.request.toolCallID
             )
             let executor = TestS4Executor(workspace: fixture.workspace)
             let agent = try makeAgent(
@@ -646,6 +735,7 @@ final class WujiS4AgentTests: XCTestCase {
             kind: .writeExecutor,
             terminalCategory: .writeApplied,
             approvalNonce: seeded.request.nonce,
+            toolCallID: seeded.request.toolCallID,
             facts: successFacts()
         )
         let verifyIntent = attempt(
@@ -685,6 +775,7 @@ final class WujiS4AgentTests: XCTestCase {
             kind: .writeExecutor,
             terminalCategory: .writeApplied,
             approvalNonce: seeded.request.nonce,
+            toolCallID: seeded.request.toolCallID,
             facts: successFacts()
         ) + attemptPair(
             taskID: fixture.taskID,
@@ -708,6 +799,80 @@ final class WujiS4AgentTests: XCTestCase {
         XCTAssertTrue(calls.isEmpty)
     }
 
+    func testColdRecoveryCompletesFromAppliedReconciliationAndRealVerifyWithoutSyntheticFacts() async throws {
+        let fixture = try makeWorkspace(initialState: .after)
+        let seeded = seededGrant(workspace: fixture.workspace)
+        let writeOperationID = UUID()
+        let writeAttemptID = UUID()
+        let writeRecords = [
+            attempt(
+                taskID: fixture.taskID,
+                kind: .writeExecutor,
+                phase: .intentRecorded,
+                operationID: writeOperationID,
+                attemptID: writeAttemptID,
+                approvalNonce: seeded.request.nonce,
+                toolCallID: seeded.request.toolCallID
+            ),
+            attempt(
+                taskID: fixture.taskID,
+                kind: .writeExecutor,
+                phase: .reconciliationRequired,
+                operationID: writeOperationID,
+                attemptID: writeAttemptID,
+                category: .executorUnknown,
+                approvalNonce: seeded.request.nonce,
+                toolCallID: seeded.request.toolCallID
+            ),
+            attempt(
+                taskID: fixture.taskID,
+                kind: .writeExecutor,
+                phase: .reconciledApplied,
+                operationID: writeOperationID,
+                attemptID: writeAttemptID,
+                category: .workspaceAfter,
+                approvalNonce: seeded.request.nonce,
+                toolCallID: seeded.request.toolCallID
+            )
+        ]
+        let verifyRecords = attemptPair(
+            taskID: fixture.taskID,
+            kind: .verifyExecutor,
+            terminalCategory: .verifyPassed,
+            approvalNonce: seeded.request.nonce,
+            facts: successFacts()
+        )
+        let store = TestS4Store(
+            attempts: writeRecords + verifyRecords,
+            approvals: seeded.evidence
+        )
+        let executor = TestS4Executor(workspace: fixture.workspace)
+        let agent = try makeAgent(
+            fixture: fixture,
+            provider: TestS4Provider(outcomes: []),
+            executor: executor,
+            store: store,
+            approval: TestS4ApprovalAuthorizer(mode: .approve)
+        )
+
+        guard case .completed = await agent.run(taskID: fixture.taskID) else {
+            return XCTFail("layered cold-recovery evidence did not complete")
+        }
+        let calls = await executor.calls()
+        XCTAssertTrue(calls.isEmpty)
+        let snapshot = await store.currentSnapshot()
+        let unknown = try XCTUnwrap(snapshot.attempts.first {
+            $0.attemptID == writeAttemptID && $0.phase == .reconciliationRequired
+        })
+        let applied = try XCTUnwrap(snapshot.attempts.first {
+            $0.attemptID == writeAttemptID && $0.phase == .reconciledApplied
+        })
+        XCTAssertEqual(unknown.resultCategory, .executorUnknown)
+        XCTAssertEqual(applied.resultCategory, .workspaceAfter)
+        assertNoExecutorFacts(unknown)
+        assertNoExecutorFacts(applied)
+    }
+
     func testConsumedGrantIsNotReplayedAfterReconciledNotAppliedWrite() async throws {
         let fixture = try makeWorkspace()
         let seeded = seededGrant(workspace: fixture.workspace)
@@ -720,7 +885,8 @@ final class WujiS4AgentTests: XCTestCase {
                 phase: .intentRecorded,
                 operationID: operationID,
                 attemptID: attemptID,
-                approvalNonce: seeded.request.nonce
+                approvalNonce: seeded.request.nonce,
+                toolCallID: seeded.request.toolCallID
             ),
             attempt(
                 taskID: fixture.taskID,
@@ -729,7 +895,8 @@ final class WujiS4AgentTests: XCTestCase {
                 operationID: operationID,
                 attemptID: attemptID,
                 category: .workspaceBefore,
-                approvalNonce: seeded.request.nonce
+                approvalNonce: seeded.request.nonce,
+                toolCallID: seeded.request.toolCallID
             )
         ]
         let executor = TestS4Executor(workspace: fixture.workspace)
@@ -912,6 +1079,7 @@ final class WujiS4AgentTests: XCTestCase {
         attemptID: UUID = UUID(),
         category: S4AttemptResultCategory = .none,
         approvalNonce: UUID? = nil,
+        toolCallID: String? = nil,
         facts: S3ExecutorFacts? = nil
     ) -> S4AttemptEvidence {
         let state: (String, Int32)? = facts.map {
@@ -928,9 +1096,15 @@ final class WujiS4AgentTests: XCTestCase {
             ioKind: kind,
             providerID: kind == .provider ? "mock" : nil,
             toolName: kind == .writeExecutor ? "edit" : (kind == .verifyExecutor ? "verify" : nil),
-            toolCallIDHash: nil,
+            toolCallIDHash: toolCallID.map(ProviderDigest.sha256Hex),
             approvalNonceHash: approvalNonce.map { ProviderDigest.sha256Hex($0.uuidString.lowercased()) },
-            inputSHA256: String(repeating: "a", count: 64),
+            inputSHA256: kind == .writeExecutor
+                ? S4AuthorizedEdit(
+                    relativePath: S4TaskContract.authorizedPath,
+                    beforeHash: S4TaskContract.beforeHash,
+                    afterHash: S4TaskContract.afterHash
+                ).inputSHA256
+                : String(repeating: "a", count: 64),
             recordedAt: testDate,
             phase: phase,
             resultCategory: category,
@@ -950,6 +1124,7 @@ final class WujiS4AgentTests: XCTestCase {
         kind: S4ExternalIOKind,
         terminalCategory: S4AttemptResultCategory,
         approvalNonce: UUID?,
+        toolCallID: String? = nil,
         facts: S3ExecutorFacts
     ) -> [S4AttemptEvidence] {
         let operationID = UUID()
@@ -961,7 +1136,8 @@ final class WujiS4AgentTests: XCTestCase {
                 phase: .intentRecorded,
                 operationID: operationID,
                 attemptID: attemptID,
-                approvalNonce: approvalNonce
+                approvalNonce: approvalNonce,
+                toolCallID: toolCallID
             ),
             attempt(
                 taskID: taskID,
@@ -971,6 +1147,7 @@ final class WujiS4AgentTests: XCTestCase {
                 attemptID: attemptID,
                 category: terminalCategory,
                 approvalNonce: approvalNonce,
+                toolCallID: toolCallID,
                 facts: facts
             )
         ]
@@ -996,6 +1173,19 @@ final class WujiS4AgentTests: XCTestCase {
             return XCTFail("missing event ordering evidence: \(first) -> \(second)")
         }
         XCTAssertLessThan(firstIndex, secondIndex)
+    }
+
+    private func assertNoExecutorFacts(
+        _ evidence: S4AttemptEvidence,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertNil(evidence.rootExitObserved, file: file, line: line)
+        XCTAssertNil(evidence.stdoutEOFObserved, file: file, line: line)
+        XCTAssertNil(evidence.stderrEOFObserved, file: file, line: line)
+        XCTAssertNil(evidence.finalStateKind, file: file, line: line)
+        XCTAssertNil(evidence.finalStateValue, file: file, line: line)
+        XCTAssertNil(evidence.truncated, file: file, line: line)
     }
 }
 
@@ -1037,12 +1227,14 @@ private actor TestS4Provider: AgentInferenceProvider {
 
 private actor TestS4Executor: S4Executing {
     enum EditMode: Equatable { case success, unknownBefore, unknownAfter }
+    enum VerifyMode: Equatable { case success, unknown }
 
     nonisolated let workspace: S4ApprovedWorkspace
     private let events: TestS4EventLog?
     private let editMode: EditMode
     private let unknownReadIndex: Int?
     private let addUnexpectedFileAfterVerify: Bool
+    private let verifyMode: VerifyMode
     private var callNames: [String] = []
     private var readCount = 0
 
@@ -1051,13 +1243,15 @@ private actor TestS4Executor: S4Executing {
         events: TestS4EventLog? = nil,
         editMode: EditMode = .success,
         unknownReadIndex: Int? = nil,
-        addUnexpectedFileAfterVerify: Bool = false
+        addUnexpectedFileAfterVerify: Bool = false,
+        verifyMode: VerifyMode = .success
     ) {
         self.workspace = workspace
         self.events = events
         self.editMode = editMode
         self.unknownReadIndex = unknownReadIndex
         self.addUnexpectedFileAfterVerify = addUnexpectedFileAfterVerify
+        self.verifyMode = verifyMode
     }
 
     func execute(_ tool: S3AuthorizedTool) async -> S3ExecutorOutcome {
@@ -1129,6 +1323,7 @@ private actor TestS4Executor: S4Executing {
     func verify(_ profile: S4VerificationProfile) async -> S4VerifyOutcome {
         callNames.append("verify")
         await events?.append("io:verify")
+        if verifyMode == .unknown { return .unknown }
         if addUnexpectedFileAfterVerify {
             try? Data("unexpected\n".utf8).write(
                 to: workspace.canonicalRootURL.appendingPathComponent("records/unexpected.txt")

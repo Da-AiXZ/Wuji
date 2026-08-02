@@ -175,7 +175,7 @@ enum S4ProbeRunner {
                 && [.readExecutor, .writeExecutor, .verifyExecutor].contains($0.ioKind)
         }
         let sequence = terminals.compactMap { evidence -> String? in
-            guard evidence.phase == .succeeded || evidence.phase == .reconciledApplied else { return nil }
+            guard evidence.phase == .succeeded else { return nil }
             return evidence.toolName
         }
         guard sequence.contains("list"),
@@ -183,7 +183,9 @@ enum S4ProbeRunner {
               sequence.contains("read"),
               sequence.filter({ $0 == "edit" }).count == 1,
               sequence.filter({ $0 == "verify" }).count == 1,
-              let write = terminals.last(where: { $0.ioKind == .writeExecutor }),
+              let write = terminals.last(where: {
+                  $0.ioKind == .writeExecutor && $0.phase == .succeeded
+              }),
               let verify = terminals.last(where: { $0.ioKind == .verifyExecutor }),
               write.resultCategory == .writeApplied,
               verify.resultCategory == .verifyPassed,

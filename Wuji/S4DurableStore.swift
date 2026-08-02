@@ -167,7 +167,55 @@ actor FileS4DurableStore: S4DurableRecording {
     }
 
     private static func valid(_ evidence: S4AttemptEvidence) -> Bool {
-        validHash(evidence.inputSHA256)
+        let executorFactValues: [Any?] = [
+            evidence.rootExitObserved,
+            evidence.stdoutEOFObserved,
+            evidence.stderrEOFObserved,
+            evidence.finalStateKind,
+            evidence.finalStateValue,
+            evidence.truncated
+        ]
+        let hasAnyExecutorFact = executorFactValues.contains { $0 != nil }
+        let hasCompleteExecutorFacts = executorFactValues.allSatisfy { $0 != nil }
+        let factShapeIsValid = !hasAnyExecutorFact || hasCompleteExecutorFacts
+        let reconciliationShapeIsValid: Bool
+        switch evidence.phase {
+        case .reconciledApplied:
+            reconciliationShapeIsValid = evidence.ioKind == .writeExecutor
+                && evidence.resultCategory == .workspaceAfter
+                && evidence.resultByteCount == nil
+                && evidence.resultSHA256 == nil
+                && !hasAnyExecutorFact
+        case .reconciledNotApplied:
+            reconciliationShapeIsValid = evidence.ioKind == .writeExecutor
+                && evidence.resultCategory == .workspaceBefore
+                && evidence.resultByteCount == nil
+                && evidence.resultSHA256 == nil
+                && !hasAnyExecutorFact
+        case .manualReconciliation:
+            reconciliationShapeIsValid = evidence.resultByteCount == nil
+                && evidence.resultSHA256 == nil
+                && !hasAnyExecutorFact
+        case .intentRecorded, .reconciliationRequired:
+            reconciliationShapeIsValid = evidence.resultByteCount == nil
+                && evidence.resultSHA256 == nil
+                && !hasAnyExecutorFact
+        case .succeeded, .failed:
+            reconciliationShapeIsValid = true
+        }
+        let successfulSideEffectShapeIsValid: Bool
+        if evidence.ioKind == .writeExecutor,
+           evidence.phase == .succeeded,
+           evidence.resultCategory == .writeApplied {
+            successfulSideEffectShapeIsValid = hasCompleteExecutorFacts
+        } else if evidence.ioKind == .verifyExecutor,
+                  evidence.phase == .succeeded,
+                  evidence.resultCategory == .verifyPassed {
+            successfulSideEffectShapeIsValid = hasCompleteExecutorFacts
+        } else {
+            successfulSideEffectShapeIsValid = true
+        }
+        return validHash(evidence.inputSHA256)
             && (evidence.providerID.map { !$0.isEmpty && $0.utf8.count <= 32 } ?? true)
             && (evidence.toolName.map { !$0.isEmpty && $0.utf8.count <= 64 } ?? true)
             && (evidence.toolCallIDHash.map(validHash) ?? true)
@@ -176,6 +224,9 @@ actor FileS4DurableStore: S4DurableRecording {
             && (evidence.resultSHA256.map(validHash) ?? true)
             && (evidence.finalStateKind.map { $0 == "exited" || $0 == "signaled" } ?? true)
             && ((evidence.finalStateKind == nil) == (evidence.finalStateValue == nil))
+            && factShapeIsValid
+            && reconciliationShapeIsValid
+            && successfulSideEffectShapeIsValid
     }
 
     private static func valid(_ evidence: S4ApprovalEvidence) -> Bool {
