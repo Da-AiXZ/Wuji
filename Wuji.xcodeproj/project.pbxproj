@@ -43,6 +43,27 @@
 		010000000000000000000022 /* WujiS4ISHIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000025 /* WujiS4ISHIntegrationTests.swift */; };
 		010000000000000000000023 /* WujiS4AgentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000026 /* WujiS4AgentTests.swift */; };
 		010000000000000000000024 /* WujiS4ApprovalViewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000027 /* WujiS4ApprovalViewTests.swift */; };
+		010000000000000000000025 /* StageAImportContracts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000028 /* StageAImportContracts.swift */; };
+		010000000000000000000026 /* StageAZipArchive.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000029 /* StageAZipArchive.swift */; };
+		010000000000000000000027 /* StageAWorkspaceStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000002A /* StageAWorkspaceStore.swift */; };
+		010000000000000000000028 /* StageAWorkspaceImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000002B /* StageAWorkspaceImporter.swift */; };
+		010000000000000000000029 /* DeepSeekSecureConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000002C /* DeepSeekSecureConfiguration.swift */; };
+		01000000000000000000002A /* StageAViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000002D /* StageAViewModel.swift */; };
+		01000000000000000000002B /* DeepSeekSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000002E /* DeepSeekSettingsView.swift */; };
+		01000000000000000000002C /* WujiStageAImportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000002F /* WujiStageAImportTests.swift */; };
+		01000000000000000000002D /* WujiStageASecureConfigurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000030 /* WujiStageASecureConfigurationTests.swift */; };
+		01000000000000000000002E /* WujiStageAZipBridge.c in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000031 /* WujiStageAZipBridge.c */; };
+		01000000000000000000002F /* mz_crypt.c in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000032 /* mz_crypt.c */; };
+		010000000000000000000030 /* mz_os.c in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000033 /* mz_os.c */; };
+		010000000000000000000031 /* mz_os_posix.c in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000034 /* mz_os_posix.c */; };
+		010000000000000000000032 /* mz_strm.c in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000035 /* mz_strm.c */; };
+		010000000000000000000033 /* mz_strm_buf.c in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000036 /* mz_strm_buf.c */; };
+		010000000000000000000034 /* mz_strm_zlib.c in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000037 /* mz_strm_zlib.c */; };
+		010000000000000000000035 /* mz_strm_mem.c in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000038 /* mz_strm_mem.c */; };
+		010000000000000000000036 /* mz_strm_os_posix.c in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000039 /* mz_strm_os_posix.c */; };
+		010000000000000000000037 /* mz_strm_split.c in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000003A /* mz_strm_split.c */; };
+		010000000000000000000038 /* mz_zip.c in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000003B /* mz_zip.c */; };
+		010000000000000000000039 /* mz_zip_rw.c in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000003C /* mz_zip_rw.c */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -95,6 +116,29 @@
 		020000000000000000000025 /* WujiS4ISHIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiS4ISHIntegrationTests.swift; sourceTree = "<group>"; };
 		020000000000000000000026 /* WujiS4AgentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiS4AgentTests.swift; sourceTree = "<group>"; };
 		020000000000000000000027 /* WujiS4ApprovalViewTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiS4ApprovalViewTests.swift; sourceTree = "<group>"; };
+		020000000000000000000028 /* StageAImportContracts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageAImportContracts.swift; sourceTree = "<group>"; };
+		020000000000000000000029 /* StageAZipArchive.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageAZipArchive.swift; sourceTree = "<group>"; };
+		02000000000000000000002A /* StageAWorkspaceStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageAWorkspaceStore.swift; sourceTree = "<group>"; };
+		02000000000000000000002B /* StageAWorkspaceImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageAWorkspaceImporter.swift; sourceTree = "<group>"; };
+		02000000000000000000002C /* DeepSeekSecureConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepSeekSecureConfiguration.swift; sourceTree = "<group>"; };
+		02000000000000000000002D /* StageAViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageAViewModel.swift; sourceTree = "<group>"; };
+		02000000000000000000002E /* DeepSeekSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepSeekSettingsView.swift; sourceTree = "<group>"; };
+		02000000000000000000002F /* WujiStageAImportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiStageAImportTests.swift; sourceTree = "<group>"; };
+		020000000000000000000030 /* WujiStageASecureConfigurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiStageASecureConfigurationTests.swift; sourceTree = "<group>"; };
+		020000000000000000000031 /* WujiStageAZipBridge.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = WujiStageAZipBridge.c; sourceTree = "<group>"; };
+		020000000000000000000032 /* mz_crypt.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = mz_crypt.c; sourceTree = "<group>"; };
+		020000000000000000000033 /* mz_os.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = mz_os.c; sourceTree = "<group>"; };
+		020000000000000000000034 /* mz_os_posix.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = mz_os_posix.c; sourceTree = "<group>"; };
+		020000000000000000000035 /* mz_strm.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = mz_strm.c; sourceTree = "<group>"; };
+		020000000000000000000036 /* mz_strm_buf.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = mz_strm_buf.c; sourceTree = "<group>"; };
+		020000000000000000000037 /* mz_strm_zlib.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = mz_strm_zlib.c; sourceTree = "<group>"; };
+		020000000000000000000038 /* mz_strm_mem.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = mz_strm_mem.c; sourceTree = "<group>"; };
+		020000000000000000000039 /* mz_strm_os_posix.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = mz_strm_os_posix.c; sourceTree = "<group>"; };
+		02000000000000000000003A /* mz_strm_split.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = mz_strm_split.c; sourceTree = "<group>"; };
+		02000000000000000000003B /* mz_zip.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = mz_zip.c; sourceTree = "<group>"; };
+		02000000000000000000003C /* mz_zip_rw.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = mz_zip_rw.c; sourceTree = "<group>"; };
+		02000000000000000000003D /* WujiStageAZipBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = WujiStageAZipBridge.h; sourceTree = "<group>"; };
+		02000000000000000000003E /* mz_config.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = StageAMinizipConfig/mz_config.h; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -120,6 +164,8 @@
 			children = (
 				030000000000000000000003 /* Wuji */,
 				030000000000000000000004 /* WujiTests */,
+				030000000000000000000005 /* StageA ZIP */,
+				030000000000000000000006 /* StageA Executor */,
 				030000000000000000000002 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -159,6 +205,13 @@
 				020000000000000000000020 /* S4ApprovalView.swift */,
 				020000000000000000000021 /* S4ProbeRunner.swift */,
 				020000000000000000000022 /* S4Fixture */,
+				020000000000000000000028 /* StageAImportContracts.swift */,
+				020000000000000000000029 /* StageAZipArchive.swift */,
+				02000000000000000000002A /* StageAWorkspaceStore.swift */,
+				02000000000000000000002B /* StageAWorkspaceImporter.swift */,
+				02000000000000000000002C /* DeepSeekSecureConfiguration.swift */,
+				02000000000000000000002D /* StageAViewModel.swift */,
+				02000000000000000000002E /* DeepSeekSettingsView.swift */,
 				02000000000000000000000C /* rootfs.tar.gz */,
 				020000000000000000000004 /* Assets.xcassets */,
 				020000000000000000000005 /* Info.plist */,
@@ -180,8 +233,38 @@
 				020000000000000000000025 /* WujiS4ISHIntegrationTests.swift */,
 				020000000000000000000026 /* WujiS4AgentTests.swift */,
 				020000000000000000000027 /* WujiS4ApprovalViewTests.swift */,
+				02000000000000000000002F /* WujiStageAImportTests.swift */,
+				020000000000000000000030 /* WujiStageASecureConfigurationTests.swift */,
 			);
 			path = WujiTests;
+			sourceTree = "<group>";
+		};
+		030000000000000000000005 /* StageA ZIP */ = {
+			isa = PBXGroup;
+			children = (
+				020000000000000000000032 /* mz_crypt.c */,
+				020000000000000000000033 /* mz_os.c */,
+				020000000000000000000034 /* mz_os_posix.c */,
+				020000000000000000000035 /* mz_strm.c */,
+				020000000000000000000036 /* mz_strm_buf.c */,
+				020000000000000000000037 /* mz_strm_zlib.c */,
+				020000000000000000000038 /* mz_strm_mem.c */,
+				020000000000000000000039 /* mz_strm_os_posix.c */,
+				02000000000000000000003A /* mz_strm_split.c */,
+				02000000000000000000003B /* mz_zip.c */,
+				02000000000000000000003C /* mz_zip_rw.c */,
+			);
+			path = ThirdParty/minizip-ng;
+			sourceTree = "<group>";
+		};
+		030000000000000000000006 /* StageA Executor */ = {
+			isa = PBXGroup;
+			children = (
+				020000000000000000000031 /* WujiStageAZipBridge.c */,
+				02000000000000000000003D /* WujiStageAZipBridge.h */,
+				02000000000000000000003E /* mz_config.h */,
+			);
+			path = Executor;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -307,6 +390,25 @@
 				01000000000000000000001C /* S4Agent.swift in Sources */,
 				01000000000000000000001D /* S4ApprovalView.swift in Sources */,
 				01000000000000000000001E /* S4ProbeRunner.swift in Sources */,
+				010000000000000000000025 /* StageAImportContracts.swift in Sources */,
+				010000000000000000000026 /* StageAZipArchive.swift in Sources */,
+				010000000000000000000027 /* StageAWorkspaceStore.swift in Sources */,
+				010000000000000000000028 /* StageAWorkspaceImporter.swift in Sources */,
+				010000000000000000000029 /* DeepSeekSecureConfiguration.swift in Sources */,
+				01000000000000000000002A /* StageAViewModel.swift in Sources */,
+				01000000000000000000002B /* DeepSeekSettingsView.swift in Sources */,
+				01000000000000000000002E /* WujiStageAZipBridge.c in Sources */,
+				01000000000000000000002F /* mz_crypt.c in Sources */,
+				010000000000000000000030 /* mz_os.c in Sources */,
+				010000000000000000000031 /* mz_os_posix.c in Sources */,
+				010000000000000000000032 /* mz_strm.c in Sources */,
+				010000000000000000000033 /* mz_strm_buf.c in Sources */,
+				010000000000000000000034 /* mz_strm_zlib.c in Sources */,
+				010000000000000000000035 /* mz_strm_mem.c in Sources */,
+				010000000000000000000036 /* mz_strm_os_posix.c in Sources */,
+				010000000000000000000037 /* mz_strm_split.c in Sources */,
+				010000000000000000000038 /* mz_zip.c in Sources */,
+				010000000000000000000039 /* mz_zip_rw.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -325,6 +427,8 @@
 				010000000000000000000022 /* WujiS4ISHIntegrationTests.swift in Sources */,
 				010000000000000000000023 /* WujiS4AgentTests.swift in Sources */,
 				010000000000000000000024 /* WujiS4ApprovalViewTests.swift in Sources */,
+				01000000000000000000002C /* WujiStageAImportTests.swift in Sources */,
+				01000000000000000000002D /* WujiStageASecureConfigurationTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -436,7 +540,20 @@
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Wuji/Info.plist;
-				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/Executor";
+				CLANG_C_LANGUAGE_STANDARD = gnu11;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					HAVE_ZLIB=1,
+					ZLIB_COMPAT=1,
+					MZ_ZIP_NO_COMPRESSION=1,
+					MZ_ZIP_NO_ENCRYPTION=1,
+					MZ_ZIP_NO_CRYPTO=1,
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/Executor",
+					"$(PROJECT_DIR)/Executor/StageAMinizipConfig",
+					"$(PROJECT_DIR)/ThirdParty/minizip-ng",
+				);
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.daaixz.wuji;
@@ -449,6 +566,8 @@
 					"$(WUJI_ISH_BUILD_DIR)/libarchive.a",
 					"-lsqlite3",
 					"-lz",
+					"-framework",
+					Security,
 				);
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
@@ -468,7 +587,20 @@
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Wuji/Info.plist;
-				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/Executor";
+				CLANG_C_LANGUAGE_STANDARD = gnu11;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					HAVE_ZLIB=1,
+					ZLIB_COMPAT=1,
+					MZ_ZIP_NO_COMPRESSION=1,
+					MZ_ZIP_NO_ENCRYPTION=1,
+					MZ_ZIP_NO_CRYPTO=1,
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/Executor",
+					"$(PROJECT_DIR)/Executor/StageAMinizipConfig",
+					"$(PROJECT_DIR)/ThirdParty/minizip-ng",
+				);
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.daaixz.wuji;
@@ -481,6 +613,8 @@
 					"$(WUJI_ISH_BUILD_DIR)/libarchive.a",
 					"-lsqlite3",
 					"-lz",
+					"-framework",
+					Security,
 				);
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;

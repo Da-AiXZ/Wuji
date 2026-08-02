@@ -84,6 +84,21 @@ struct DeepSeekEndpoint: Equatable, Sendable {
     }
 }
 
+enum DeepSeekConfigurationValidator {
+    static func validate(baseURL: String, model: String) throws {
+        let modelBytes = model.lengthOfBytes(using: .utf8)
+        guard modelBytes > 0,
+              modelBytes <= ProviderLimits.maximumModelBytes,
+              model == model.trimmingCharacters(in: .whitespacesAndNewlines),
+              model.unicodeScalars.allSatisfy({
+                  !CharacterSet.controlCharacters.contains($0)
+              }) else {
+            throw ProviderConfigurationError.invalidModel
+        }
+        _ = try DeepSeekEndpoint(baseURL: baseURL)
+    }
+}
+
 final class URLSessionProviderTransport: ProviderTransport, @unchecked Sendable {
     private let configuration: URLSessionConfiguration
     private let maximumResponseBytes: Int
@@ -223,15 +238,7 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
         attemptStore: ProviderAttemptRecording,
         now: @escaping @Sendable () -> Date = { Date() }
     ) throws {
-        let modelBytes = model.lengthOfBytes(using: .utf8)
-        guard modelBytes > 0,
-              modelBytes <= ProviderLimits.maximumModelBytes,
-              model == model.trimmingCharacters(in: .whitespacesAndNewlines),
-              model.unicodeScalars.allSatisfy({
-                  !CharacterSet.controlCharacters.contains($0)
-              }) else {
-            throw ProviderConfigurationError.invalidModel
-        }
+        try DeepSeekConfigurationValidator.validate(baseURL: baseURL, model: model)
         endpoint = try DeepSeekEndpoint(baseURL: baseURL)
         self.model = model
         modelSHA256 = ProviderDigest.sha256Hex(model)
