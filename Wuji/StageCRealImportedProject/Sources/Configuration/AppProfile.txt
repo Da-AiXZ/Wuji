@@ -1,0 +1,3 @@
+application_name = Wuji
+release_channel = preview
+telemetry_mode = bounded

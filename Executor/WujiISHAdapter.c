@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -697,6 +698,81 @@ WujiISHRunResult *wuji_ish_run_stage_b_read_only(WujiISHReadOnlyOperation operat
         g_stage_b_workspace_mounted,
         2
     );
+}
+
+static const char stage_c_edit_script[] =
+    "set -eu\n"
+    "p=$1\n"
+    "old=$2\n"
+    "new=$3\n"
+    "before=$4\n"
+    "after=$5\n"
+    "tmp=${p}.wuji-stage-c-tmp\n"
+    "[ -f \"$p\" ] && [ ! -L \"$p\" ] || exit 60\n"
+    "actual=$(sha256sum \"$p\"); actual=${actual%% *}\n"
+    "[ \"$actual\" = \"$before\" ] || exit 61\n"
+    "[ ! -e \"$tmp\" ] || exit 62\n"
+    "trap 'rm -f -- \"$tmp\"' 0 1 2 15\n"
+    "awk -v old=\"$old\" -v new=\"$new\" 'BEGIN { count=0 } { if ($0 == old) { count++; print new } else { print } } END { if (count != 1) exit 63 }' \"$p\" > \"$tmp\"\n"
+    "actual=$(sha256sum \"$tmp\"); actual=${actual%% *}\n"
+    "[ \"$actual\" = \"$after\" ] || exit 64\n"
+    "mv -f -- \"$tmp\" \"$p\"\n"
+    "trap - 0 1 2 15\n"
+    "actual=$(sha256sum \"$p\"); actual=${actual%% *}\n"
+    "[ \"$actual\" = \"$after\" ] || exit 65\n"
+    "printf 'WUJI_STAGE_C_EDIT_OK\\n'\n";
+
+static bool valid_sha256(const char *value);
+
+static bool stage_c_path_has_git_component(const char *path) {
+    const char *component = path;
+    while (component != NULL && *component != '\0') {
+        const char *separator = strchr(component, '/');
+        size_t length = separator == NULL
+            ? strlen(component)
+            : (size_t)(separator - component);
+        if (length == 4 && component[0] == '.' &&
+            (component[1] == 'g' || component[1] == 'G') &&
+            (component[2] == 'i' || component[2] == 'I') &&
+            (component[3] == 't' || component[3] == 'T'))
+            return true;
+        component = separator == NULL ? NULL : separator + 1;
+    }
+    return false;
+}
+
+WujiISHRunResult *wuji_ish_run_stage_c_edit(const char *relative_path,
+                                            const char *expected_old,
+                                            const char *replacement,
+                                            const char *before_sha256,
+                                            const char *after_sha256,
+                                            size_t output_limit) {
+    if (!g_stage_b_workspace_mounted || output_limit == 0 || output_limit > 32768 ||
+        relative_path == NULL || expected_old == NULL || replacement == NULL ||
+        !valid_sha256(before_sha256) || !valid_sha256(after_sha256) ||
+        strcasecmp(relative_path, ".wuji-stage-a-workspace.json") == 0 ||
+        stage_c_path_has_git_component(relative_path) ||
+        strchr(expected_old, '\\') != NULL || strchr(replacement, '\\') != NULL ||
+        strchr(expected_old, '\n') != NULL || strchr(replacement, '\n') != NULL ||
+        strchr(expected_old, '\r') != NULL || strchr(replacement, '\r') != NULL)
+        return NULL;
+
+    char guest_path[2048];
+    if (!build_stage_b_guest_path(relative_path, guest_path, sizeof(guest_path)))
+        return NULL;
+    char arguments[12288] = {0};
+    size_t offset = 0;
+    if (!append_argument(arguments, sizeof(arguments), &offset, "/bin/sh") ||
+        !append_argument(arguments, sizeof(arguments), &offset, "-c") ||
+        !append_argument(arguments, sizeof(arguments), &offset, stage_c_edit_script) ||
+        !append_argument(arguments, sizeof(arguments), &offset, "wuji-stage-c-edit") ||
+        !append_argument(arguments, sizeof(arguments), &offset, guest_path) ||
+        !append_argument(arguments, sizeof(arguments), &offset, expected_old) ||
+        !append_argument(arguments, sizeof(arguments), &offset, replacement) ||
+        !append_argument(arguments, sizeof(arguments), &offset, before_sha256) ||
+        !append_argument(arguments, sizeof(arguments), &offset, after_sha256))
+        return NULL;
+    return run_arguments("/bin/sh", 9, arguments, output_limit);
 }
 
 static bool valid_sha256(const char *value) {

@@ -74,6 +74,19 @@
 		010000000000000000000041 /* StageBRealImportedProject in Resources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000046 /* StageBRealImportedProject */; };
 		010000000000000000000042 /* WujiStageBTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000047 /* WujiStageBTests.swift */; };
 		010000000000000000000043 /* WujiStageBISHIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000048 /* WujiStageBISHIntegrationTests.swift */; };
+		010000000000000000000044 /* StageCContracts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000049 /* StageCContracts.swift */; };
+		010000000000000000000045 /* StageCTaskStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000004A /* StageCTaskStore.swift */; };
+		010000000000000000000046 /* StageCEditPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000004B /* StageCEditPolicy.swift */; };
+		010000000000000000000047 /* ISHStageCEditExecutor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000004C /* ISHStageCEditExecutor.swift */; };
+		010000000000000000000048 /* StageCEditingAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000004D /* StageCEditingAgent.swift */; };
+		010000000000000000000049 /* StageCApprovalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000004E /* StageCApprovalView.swift */; };
+		01000000000000000000004A /* StageCProbeRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000004F /* StageCProbeRunner.swift */; };
+		01000000000000000000004B /* StageCRealImportedProject in Resources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000050 /* StageCRealImportedProject */; };
+		01000000000000000000004C /* WujiStageCContractsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000051 /* WujiStageCContractsTests.swift */; };
+		01000000000000000000004D /* WujiStageCStoreApprovalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000052 /* WujiStageCStoreApprovalTests.swift */; };
+		01000000000000000000004E /* WujiStageCAgentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000053 /* WujiStageCAgentTests.swift */; };
+		01000000000000000000004F /* WujiStageCApprovalViewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000054 /* WujiStageCApprovalViewTests.swift */; };
+		010000000000000000000050 /* WujiStageCISHIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000055 /* WujiStageCISHIntegrationTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -159,6 +172,19 @@
 		020000000000000000000046 /* StageBRealImportedProject */ = {isa = PBXFileReference; lastKnownFileType = folder; path = StageBRealImportedProject; sourceTree = "<group>"; };
 		020000000000000000000047 /* WujiStageBTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiStageBTests.swift; sourceTree = "<group>"; };
 		020000000000000000000048 /* WujiStageBISHIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiStageBISHIntegrationTests.swift; sourceTree = "<group>"; };
+		020000000000000000000049 /* StageCContracts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageCContracts.swift; sourceTree = "<group>"; };
+		02000000000000000000004A /* StageCTaskStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageCTaskStore.swift; sourceTree = "<group>"; };
+		02000000000000000000004B /* StageCEditPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageCEditPolicy.swift; sourceTree = "<group>"; };
+		02000000000000000000004C /* ISHStageCEditExecutor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ISHStageCEditExecutor.swift; sourceTree = "<group>"; };
+		02000000000000000000004D /* StageCEditingAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageCEditingAgent.swift; sourceTree = "<group>"; };
+		02000000000000000000004E /* StageCApprovalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageCApprovalView.swift; sourceTree = "<group>"; };
+		02000000000000000000004F /* StageCProbeRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageCProbeRunner.swift; sourceTree = "<group>"; };
+		020000000000000000000050 /* StageCRealImportedProject */ = {isa = PBXFileReference; lastKnownFileType = folder; path = StageCRealImportedProject; sourceTree = "<group>"; };
+		020000000000000000000051 /* WujiStageCContractsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiStageCContractsTests.swift; sourceTree = "<group>"; };
+		020000000000000000000052 /* WujiStageCStoreApprovalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiStageCStoreApprovalTests.swift; sourceTree = "<group>"; };
+		020000000000000000000053 /* WujiStageCAgentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiStageCAgentTests.swift; sourceTree = "<group>"; };
+		020000000000000000000054 /* WujiStageCApprovalViewTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiStageCApprovalViewTests.swift; sourceTree = "<group>"; };
+		020000000000000000000055 /* WujiStageCISHIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiStageCISHIntegrationTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -240,6 +266,14 @@
 				020000000000000000000044 /* StageBView.swift */,
 				020000000000000000000045 /* StageBProbeRunner.swift */,
 				020000000000000000000046 /* StageBRealImportedProject */,
+				020000000000000000000049 /* StageCContracts.swift */,
+				02000000000000000000004A /* StageCTaskStore.swift */,
+				02000000000000000000004B /* StageCEditPolicy.swift */,
+				02000000000000000000004C /* ISHStageCEditExecutor.swift */,
+				02000000000000000000004D /* StageCEditingAgent.swift */,
+				02000000000000000000004E /* StageCApprovalView.swift */,
+				02000000000000000000004F /* StageCProbeRunner.swift */,
+				020000000000000000000050 /* StageCRealImportedProject */,
 				02000000000000000000000C /* rootfs.tar.gz */,
 				020000000000000000000004 /* Assets.xcassets */,
 				020000000000000000000005 /* Info.plist */,
@@ -265,6 +299,11 @@
 				020000000000000000000030 /* WujiStageASecureConfigurationTests.swift */,
 				020000000000000000000047 /* WujiStageBTests.swift */,
 				020000000000000000000048 /* WujiStageBISHIntegrationTests.swift */,
+				020000000000000000000051 /* WujiStageCContractsTests.swift */,
+				020000000000000000000052 /* WujiStageCStoreApprovalTests.swift */,
+				020000000000000000000053 /* WujiStageCAgentTests.swift */,
+				020000000000000000000054 /* WujiStageCApprovalViewTests.swift */,
+				020000000000000000000055 /* WujiStageCISHIntegrationTests.swift */,
 			);
 			path = WujiTests;
 			sourceTree = "<group>";
@@ -383,6 +422,7 @@
 				010000000000000000000015 /* S3Fixture in Resources */,
 				01000000000000000000001F /* S4Fixture in Resources */,
 				010000000000000000000041 /* StageBRealImportedProject in Resources */,
+				01000000000000000000004B /* StageCRealImportedProject in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -435,6 +475,13 @@
 				01000000000000000000003E /* StageBReadOnlyAgent.swift in Sources */,
 				01000000000000000000003F /* StageBView.swift in Sources */,
 				010000000000000000000040 /* StageBProbeRunner.swift in Sources */,
+				010000000000000000000044 /* StageCContracts.swift in Sources */,
+				010000000000000000000045 /* StageCTaskStore.swift in Sources */,
+				010000000000000000000046 /* StageCEditPolicy.swift in Sources */,
+				010000000000000000000047 /* ISHStageCEditExecutor.swift in Sources */,
+				010000000000000000000048 /* StageCEditingAgent.swift in Sources */,
+				010000000000000000000049 /* StageCApprovalView.swift in Sources */,
+				01000000000000000000004A /* StageCProbeRunner.swift in Sources */,
 				01000000000000000000002E /* WujiStageAZipBridge.c in Sources */,
 				01000000000000000000002F /* mz_crypt.c in Sources */,
 				010000000000000000000030 /* mz_os.c in Sources */,
@@ -469,6 +516,11 @@
 				01000000000000000000002D /* WujiStageASecureConfigurationTests.swift in Sources */,
 				010000000000000000000042 /* WujiStageBTests.swift in Sources */,
 				010000000000000000000043 /* WujiStageBISHIntegrationTests.swift in Sources */,
+				01000000000000000000004C /* WujiStageCContractsTests.swift in Sources */,
+				01000000000000000000004D /* WujiStageCStoreApprovalTests.swift in Sources */,
+				01000000000000000000004E /* WujiStageCAgentTests.swift in Sources */,
+				01000000000000000000004F /* WujiStageCApprovalViewTests.swift in Sources */,
+				010000000000000000000050 /* WujiStageCISHIntegrationTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

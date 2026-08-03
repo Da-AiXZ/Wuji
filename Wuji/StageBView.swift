@@ -188,6 +188,14 @@ struct StageBSessionView: View {
                     LabeledContent("Workspace", value: shortHash(selected.workspaceIdentitySHA256))
                     if let completion = selected.completion {
                         LabeledContent("Result", value: completion.relativePath)
+                        NavigationLink {
+                            StageCApprovalView(
+                                importRecord: viewModel.importRecord,
+                                sessionID: selected.id
+                            )
+                        } label: {
+                            Label("Open bounded edit", systemImage: "square.and.pencil")
+                        }
                     }
                 }
                 Section("Rules") {

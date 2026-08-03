@@ -63,9 +63,16 @@ WujiISHRunResult *wuji_ish_run_s4_read_only(WujiISHReadOnlyOperation operation,
                                              size_t output_limit);
 
 WujiISHRunResult *wuji_ish_run_stage_b_read_only(WujiISHReadOnlyOperation operation,
-                                                  const char *relative_path,
-                                                  const char *query,
-                                                  size_t output_limit);
+                                                   const char *relative_path,
+                                                   const char *query,
+                                                   size_t output_limit);
+
+WujiISHRunResult *wuji_ish_run_stage_c_edit(const char *relative_path,
+                                            const char *expected_old,
+                                            const char *replacement,
+                                            const char *before_sha256,
+                                            const char *after_sha256,
+                                            size_t output_limit);
 
 WujiISHRunResult *wuji_ish_run_s4_edit(const char *relative_path,
                                        const char *expected_old,
