@@ -113,7 +113,7 @@ struct StageBProviderRequestCanonicalizer: Sendable {
               lastExchangeBindings.allSatisfy({
                   $0.contentByteCount >= 0
                       && $0.contentByteCount <= ProviderLimits.maximumTurnMessageBytes
-                      && ($0.contentSHA256.map(validHash) ?? $0.contentByteCount == 0)
+                      && ($0.contentSHA256.map(validHash) ?? ($0.contentByteCount == 0))
               }) else {
             throw StageBError.evidenceUnavailable
         }
