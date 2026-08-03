@@ -6,6 +6,286 @@ struct StageBPreparedSession: Sendable {
     let ruleSet: StageBRuleSet
 }
 
+struct StageBProviderMessageBinding: Codable, Equatable, Sendable {
+    let contentByteCount: Int
+    let contentSHA256: String?
+
+    static func make(_ message: ProviderTurnMessage) -> StageBProviderMessageBinding {
+        StageBProviderMessageBinding(
+            contentByteCount: message.content?.utf8.count ?? 0,
+            contentSHA256: message.content.map(ProviderDigest.sha256Hex)
+        )
+    }
+}
+
+struct StageBCanonicalProviderRequest: Sendable {
+    let request: ProviderInferenceRequest
+    let inputSHA256: String
+}
+
+struct StageBProviderRequestCanonicalizer: Sendable {
+    private struct CanonicalMessage: Codable {
+        let role: ProviderTurnRole
+        let contentByteCount: Int
+        let contentSHA256: String?
+        let toolCalls: [ProviderTurnToolCall]
+        let toolCallID: String?
+    }
+
+    private struct BindingEnvelope: Encodable {
+        let schemaVersion: Int
+        let providerID: String
+        let sessionID: UUID
+        let importID: UUID
+        let workspaceID: UUID
+        let workspaceIdentitySHA256: String
+        let markerSHA256: String
+        let goal: StageBGoal
+        let ruleSetBindingSHA256: String
+        let rules: [StageBRuleDescriptor]
+        let providerTurnOrdinal: Int
+        let completedToolExecutionCount: Int
+        let unresolvedPolicyRejection: Bool
+        let usedToolCallIDHashes: [String]
+        let historyBindingSHA256: String
+        let stageBLimits: [Int]
+        let providerLimits: [Int]
+        let messages: [CanonicalMessage]
+        let tools: [ProviderToolDefinition]
+        let requireTool: Bool
+    }
+
+    private struct ProviderHistoryEvent: Encodable {
+        let category: StageBAttemptCategory
+        let outcome: StageBProviderOutcomeEvidence
+    }
+
+    private struct ObservationHistoryEvent: Encodable {
+        let toolCallIDHash: String
+        let observation: StageBObservationEvidence
+    }
+
+    private struct PolicyHistoryEvent: Encodable {
+        let toolCallIDHashes: [String]
+        let rejection: StageBPolicyRejectionEvidence
+        let feedbackSHA256: String
+    }
+
+    static let emptyHistorySHA256 = ProviderDigest.sha256Hex(
+        "stage-b-provider-history-v1"
+    )
+
+    static func boundedPolicyFeedback(_ rejection: StageBBatchPolicyError) -> String {
+        let index = rejection.callIndex.map(String.init) ?? "none"
+        let value = "{\"status\":\"not_executed\",\"reason\":\"policy_rejected\",\"policy_code\":\"\(rejection.reason.rawValue)\",\"call_index\":\"\(index)\"}"
+        return String(value.prefix(512))
+    }
+
+    let providerID: String
+    let limits: StageBLimits
+
+    func make(
+        session: StageBSessionRecord,
+        ruleSet: StageBRuleSet,
+        observations: [StageBObservationEvidence],
+        lastExchange: [ProviderTurnMessage],
+        lastExchangeBindings: [StageBProviderMessageBinding],
+        historyBindingSHA256: String,
+        completedProviderRequestCount: Int,
+        completedToolExecutionCount: Int,
+        unresolvedPolicyRejection: Bool,
+        usedToolCallIDs: Set<String>,
+        requireTool: Bool
+    ) throws -> StageBCanonicalProviderRequest {
+        guard !providerID.isEmpty,
+              providerID.utf8.count <= ProviderLimits.maximumToolNameBytes,
+              providerID.unicodeScalars.allSatisfy({
+                  !CharacterSet.controlCharacters.contains($0)
+              }),
+              validHash(historyBindingSHA256),
+              session.ruleSetBindingSHA256 == ruleSet.bindingSHA256,
+              session.rules == ruleSet.descriptors,
+              completedProviderRequestCount >= 0,
+              completedProviderRequestCount < limits.maximumProviderTurns,
+              completedToolExecutionCount >= 0,
+              completedToolExecutionCount <= limits.maximumToolExecutions,
+              lastExchange.count == lastExchangeBindings.count,
+              lastExchangeBindings.allSatisfy({
+                  $0.contentByteCount >= 0
+                      && $0.contentByteCount <= ProviderLimits.maximumTurnMessageBytes
+                      && ($0.contentSHA256.map(validHash) ?? $0.contentByteCount == 0)
+              }) else {
+            throw StageBError.evidenceUnavailable
+        }
+        let contextWindow = StageBContextWindow(limits: limits)
+        let baseMessages = try contextWindow.baseMessages(session: session, ruleSet: ruleSet)
+        var exchange: [ProviderTurnMessage] = []
+        if !observations.isEmpty {
+            let lines = observations.map {
+                "tool=\($0.tool.rawValue) path_hash=\(ProviderDigest.sha256Hex($0.relativePath)) rules=\($0.ruleSetSHA256) evidence=\($0.observationSHA256)"
+            }
+            exchange.append(ProviderTurnMessage(
+                role: .user,
+                content: "Harness verified prior read-only observations:\n" + lines.joined(separator: "\n")
+            ))
+        }
+        exchange.append(contentsOf: lastExchange)
+        let request = try contextWindow.request(
+            baseMessages: baseMessages,
+            observations: [],
+            lastExchange: exchange,
+            requireTool: requireTool
+        )
+        let exchangeStart = request.messages.count - lastExchange.count
+        let canonicalMessages = request.messages.enumerated().map { index, message in
+            let binding = index >= exchangeStart
+                ? lastExchangeBindings[index - exchangeStart]
+                : StageBProviderMessageBinding.make(message)
+            return CanonicalMessage(
+                role: message.role,
+                contentByteCount: binding.contentByteCount,
+                contentSHA256: binding.contentSHA256,
+                toolCalls: message.toolCalls,
+                toolCallID: message.toolCallID
+            )
+        }
+        let envelope = BindingEnvelope(
+            schemaVersion: 1,
+            providerID: providerID,
+            sessionID: session.id,
+            importID: session.importID,
+            workspaceID: session.workspaceID,
+            workspaceIdentitySHA256: session.workspaceIdentitySHA256,
+            markerSHA256: session.markerSHA256,
+            goal: session.goal,
+            ruleSetBindingSHA256: ruleSet.bindingSHA256,
+            rules: ruleSet.descriptors,
+            providerTurnOrdinal: completedProviderRequestCount + 1,
+            completedToolExecutionCount: completedToolExecutionCount,
+            unresolvedPolicyRejection: unresolvedPolicyRejection,
+            usedToolCallIDHashes: usedToolCallIDs
+                .map(ProviderDigest.sha256Hex)
+                .sorted(),
+            historyBindingSHA256: historyBindingSHA256,
+            stageBLimits: stageLimitValues,
+            providerLimits: [
+                ProviderLimits.maximumRequestBodyBytes,
+                ProviderLimits.maximumModelBytes,
+                ProviderLimits.maximumResponseBodyBytes,
+                ProviderLimits.maximumOutputBytes,
+                ProviderLimits.maximumChoices,
+                ProviderLimits.maximumTurnMessages,
+                ProviderLimits.maximumTurnMessageBytes,
+                ProviderLimits.maximumToolDefinitions,
+                ProviderLimits.maximumToolNameBytes,
+                ProviderLimits.maximumToolArgumentsBytes,
+                ProviderLimits.maximumToolCallIDBytes
+            ],
+            messages: canonicalMessages,
+            tools: request.tools,
+            requireTool: request.requireTool
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let data = try encoder.encode(envelope)
+        return StageBCanonicalProviderRequest(
+            request: request,
+            inputSHA256: ProviderDigest.sha256Hex(data)
+        )
+    }
+
+    func appendingProviderOutcome(
+        _ outcome: StageBProviderOutcomeEvidence,
+        category: StageBAttemptCategory,
+        to history: String
+    ) -> String? {
+        appendHistory(
+            ProviderHistoryEvent(category: category, outcome: outcome),
+            kind: "provider",
+            to: history
+        )
+    }
+
+    func appendingObservation(
+        _ observation: StageBObservationEvidence,
+        toolCallID: String,
+        to history: String
+    ) -> String? {
+        appendHistory(
+            ObservationHistoryEvent(
+                toolCallIDHash: ProviderDigest.sha256Hex(toolCallID),
+                observation: observation
+            ),
+            kind: "observation",
+            to: history
+        )
+    }
+
+    func appendingPolicyRejection(
+        _ rejection: StageBBatchPolicyError,
+        calls: [ProviderTurnToolCall],
+        feedback: String,
+        to history: String
+    ) -> String? {
+        appendHistory(
+            PolicyHistoryEvent(
+                toolCallIDHashes: calls.map { ProviderDigest.sha256Hex($0.id) },
+                rejection: StageBPolicyRejectionEvidence(
+                    reason: rejection.reason,
+                    callIndex: rejection.callIndex
+                ),
+                feedbackSHA256: ProviderDigest.sha256Hex(feedback)
+            ),
+            kind: "policy_not_executed",
+            to: history
+        )
+    }
+
+    private func appendHistory<Value: Encodable>(
+        _ value: Value,
+        kind: String,
+        to history: String
+    ) -> String? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        guard let data = try? encoder.encode(value) else { return nil }
+        return ProviderDigest.sha256Hex([
+            history,
+            kind,
+            ProviderDigest.sha256Hex(data)
+        ].joined(separator: "\u{0}"))
+    }
+
+    private var stageLimitValues: [Int] {
+        [
+            limits.maximumProviderTurns,
+            limits.maximumToolExecutions,
+            limits.maximumToolCallsPerBatch,
+            limits.maximumGoalBytes,
+            limits.maximumPathBytes,
+            limits.maximumQueryBytes,
+            limits.maximumRuleFiles,
+            limits.maximumRuleFileBytes,
+            limits.maximumRuleAggregateBytes,
+            limits.maximumContextBytes,
+            limits.maximumListEntries,
+            limits.maximumSearchMatches,
+            limits.maximumReadBytes,
+            limits.maximumLineBytes,
+            limits.maximumExecutorStreamBytes,
+            limits.maximumModelObservationBytes,
+            limits.maximumDurableEvidenceBytes,
+            limits.maximumDiagnosticBytes
+        ]
+    }
+
+    private func validHash(_ value: String) -> Bool {
+        value.count == 64 && value.unicodeScalars.allSatisfy {
+            CharacterSet(charactersIn: "0123456789abcdef").contains($0)
+        }
+    }
+}
+
 struct StageBSessionCoordinator: Sendable {
     private let stageAStore: StageAWorkspaceStore
     private let sessionStore: StageBSessionStore
@@ -191,6 +471,8 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
     private struct LoopState: Sendable {
         var observations: [StageBObservationEvidence] = []
         var lastExchange: [ProviderTurnMessage] = []
+        var lastExchangeBindings: [StageBProviderMessageBinding] = []
+        var historyBindingSHA256 = StageBProviderRequestCanonicalizer.emptyHistorySHA256
         var usedToolCallIDs = Set<String>()
         var providerRequestCount = 0
         var toolExecutionCount = 0
@@ -217,6 +499,7 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
     private let workspace: StageBReadyWorkspace
     private let ruleSet: StageBRuleSet
     private let limits: StageBLimits
+    private let requestCanonicalizer: StageBProviderRequestCanonicalizer
     private let now: @Sendable () -> Date
     private let makeUUID: @Sendable () -> UUID
 
@@ -238,6 +521,10 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
         self.workspace = workspace
         self.ruleSet = ruleSet
         self.limits = limits
+        requestCanonicalizer = StageBProviderRequestCanonicalizer(
+            providerID: provider.providerID,
+            limits: limits
+        )
         self.now = now
         self.makeUUID = makeUUID
     }
@@ -256,7 +543,12 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
             return .failure(.workspaceBindingMismatch)
         }
         if session.phase == .completed, let completion = session.completion {
-            guard durableCompletionIsValid(
+            guard case let .state(rebuilt) = rebuild(initial.attempts, session: session),
+                  rebuilt.finishCanComplete,
+                  rebuilt.pendingDecision == nil,
+                  rebuilt.providerRequestCount == completion.providerRequestCount,
+                  rebuilt.toolExecutionCount == completion.toolExecutionCount,
+                  durableCompletionIsValid(
                 completion,
                 session: session,
                 attempts: initial.attempts
@@ -266,11 +558,6 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
         guard session.phase != .completed, session.completion == nil else {
             return await requireReconciliation(session)
         }
-
-        let contextWindow = StageBContextWindow(limits: limits)
-        let baseMessages: [ProviderTurnMessage]
-        do { baseMessages = try contextWindow.baseMessages(session: session, ruleSet: ruleSet) }
-        catch { return await fail(session, .contextLimit) }
 
         var state: LoopState
         switch rebuild(initial.attempts, session: session) {
@@ -323,13 +610,19 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
                 session: session,
                 ruleSet: ruleSet
             )
-            let request: ProviderInferenceRequest
+            let material: StageBCanonicalProviderRequest
             do {
-                request = try inferenceRequest(
-                    contextWindow: contextWindow,
-                    baseMessages: baseMessages,
+                material = try requestCanonicalizer.make(
+                    session: session,
+                    ruleSet: ruleSet,
                     observations: state.observations,
                     lastExchange: state.lastExchange,
+                    lastExchangeBindings: state.lastExchangeBindings,
+                    historyBindingSHA256: state.historyBindingSHA256,
+                    completedProviderRequestCount: state.providerRequestCount,
+                    completedToolExecutionCount: state.toolExecutionCount,
+                    unresolvedPolicyRejection: state.unresolvedPolicyRejection,
+                    usedToolCallIDs: state.usedToolCallIDs,
                     requireTool: verified == nil
                 )
             } catch {
@@ -337,7 +630,7 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
             }
             let providerOperationID = makeUUID()
             let providerAttemptID = makeUUID()
-            let inputHash = inferenceInputHash(request)
+            let inputHash = material.inputSHA256
             guard await record(intent(
                 sessionID: session.id,
                 operationID: providerOperationID,
@@ -347,7 +640,7 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
             )) else { return await fail(session, .evidenceUnavailable) }
 
             state.providerRequestCount += 1
-            let outcome = await provider.infer(request: request, requestID: makeUUID())
+            let outcome = await provider.infer(request: material.request, requestID: makeUUID())
             switch outcome {
             case let .decision(decision):
                 let providerCategory: StageBAttemptCategory
@@ -355,6 +648,7 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
                 case .toolCalls: providerCategory = .providerToolCalls
                 case .finish: providerCategory = .providerFinish
                 }
+                let outcomeEvidence = providerOutcomeEvidence(decision)
                 guard await record(terminal(
                     sessionID: session.id,
                     operationID: providerOperationID,
@@ -364,8 +658,14 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
                     phase: .succeeded,
                     category: providerCategory,
                     result: Data(decision.description.utf8),
-                    providerOutcome: providerOutcomeEvidence(decision)
+                    providerOutcome: outcomeEvidence
                 )) else { return .reconciliationRequired }
+                guard let history = requestCanonicalizer.appendingProviderOutcome(
+                    outcomeEvidence,
+                    category: providerCategory,
+                    to: state.historyBindingSHA256
+                ) else { return .reconciliationRequired }
+                state.historyBindingSHA256 = history
 
                 switch decision {
                 case let .finish(assistant):
@@ -378,13 +678,10 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
                             toolExecutionCount: state.toolExecutionCount
                         )
                     }
-                    state.lastExchange = [
-                        assistant,
-                        ProviderTurnMessage(
-                            role: .user,
-                            content: "Completion rejected by the Swift Harness because the bound list, exact search, read, rule, or reconciliation evidence is incomplete. Continue with allowed typed tools."
-                        )
-                    ]
+                    state.lastExchange = completionRejectedExchange(assistant: assistant)
+                    state.lastExchangeBindings = state.lastExchange.map(
+                        StageBProviderMessageBinding.make
+                    )
 
                 case let .toolCalls(assistant, calls):
                     switch await executeToolBatch(
@@ -451,10 +748,34 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
                   providerPair.intent.toolCallIDHash == nil else {
                 return .reconciliationRequired
             }
-            state.providerRequestCount += 1
-            guard state.providerRequestCount <= limits.maximumProviderTurns else {
+            let verifiedBeforeRequest = StageBCompletionVerifier.verify(
+                observations: state.observations,
+                session: session,
+                ruleSet: ruleSet
+            )
+            let expected: StageBCanonicalProviderRequest
+            do {
+                expected = try requestCanonicalizer.make(
+                    session: session,
+                    ruleSet: ruleSet,
+                    observations: state.observations,
+                    lastExchange: state.lastExchange,
+                    lastExchangeBindings: state.lastExchangeBindings,
+                    historyBindingSHA256: state.historyBindingSHA256,
+                    completedProviderRequestCount: state.providerRequestCount,
+                    completedToolExecutionCount: state.toolExecutionCount,
+                    unresolvedPolicyRejection: state.unresolvedPolicyRejection,
+                    usedToolCallIDs: state.usedToolCallIDs,
+                    requireTool: verifiedBeforeRequest == nil
+                )
+            } catch {
                 return .reconciliationRequired
             }
+            guard expected.inputSHA256 == providerPair.intent.inputSHA256,
+                  expected.inputSHA256 == providerPair.terminal.inputSHA256 else {
+                return .reconciliationRequired
+            }
+            state.providerRequestCount += 1
             switch providerPair.terminal.phase {
             case .failed:
                 guard providerPair.terminal.category == .providerFailure,
@@ -474,6 +795,14 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
                   ) else {
                 return .reconciliationRequired
             }
+            guard let history = requestCanonicalizer.appendingProviderOutcome(
+                outcome,
+                category: providerPair.terminal.category,
+                to: state.historyBindingSHA256
+            ) else {
+                return .reconciliationRequired
+            }
+            state.historyBindingSHA256 = history
 
             let nextProvider = pairs[(cursor + 1)...].firstIndex {
                 $0.intent.kind == .provider
@@ -500,18 +829,23 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
                       executorPairs.isEmpty else {
                     return .reconciliationRequired
                 }
-                let verified = StageBCompletionVerifier.verify(
-                    observations: state.observations,
-                    session: session,
-                    ruleSet: ruleSet
-                )
-                if verified != nil, !state.unresolvedPolicyRejection {
+                if verifiedBeforeRequest != nil, !state.unresolvedPolicyRejection {
                     guard nextProvider == pairs.endIndex else {
                         return .reconciliationRequired
                     }
                     state.finishCanComplete = true
                 } else {
                     state.lastExchange = completionRejectedExchange(assistant: assistant)
+                    let assistantBinding = nextProvider == pairs.endIndex
+                        ? StageBProviderMessageBinding.make(assistant)
+                        : StageBProviderMessageBinding(
+                            contentByteCount: outcome.assistantContentByteCount,
+                            contentSHA256: outcome.assistantContentSHA256
+                        )
+                    state.lastExchangeBindings = [
+                        assistantBinding,
+                        StageBProviderMessageBinding.make(state.lastExchange[1])
+                    ]
                 }
             case let .toolCalls(assistant, calls):
                 guard providerPair.terminal.category == .providerToolCalls else {
@@ -569,11 +903,36 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
                     state.lastExchange = [assistant] + calls.map {
                         ProviderTurnMessage(role: .tool, content: feedback, toolCallID: $0.id)
                     }
+                    let assistantBinding = nextProvider == pairs.endIndex
+                        ? StageBProviderMessageBinding.make(assistant)
+                        : StageBProviderMessageBinding(
+                            contentByteCount: outcome.assistantContentByteCount,
+                            contentSHA256: outcome.assistantContentSHA256
+                        )
+                    state.lastExchangeBindings = [assistantBinding]
+                        + state.lastExchange.dropFirst().map(StageBProviderMessageBinding.make)
+                    guard let policyHistory = requestCanonicalizer.appendingPolicyRejection(
+                        rejection,
+                        calls: calls,
+                        feedback: feedback,
+                        to: state.historyBindingSHA256
+                    ) else {
+                        return .reconciliationRequired
+                    }
+                    state.historyBindingSHA256 = policyHistory
                 } else {
                     guard authorized.count == calls.count else {
                         return .reconciliationRequired
                     }
                     var exchange = [assistant]
+                    var exchangeBindings = [
+                        nextProvider == pairs.endIndex
+                            ? StageBProviderMessageBinding.make(assistant)
+                            : StageBProviderMessageBinding(
+                                contentByteCount: outcome.assistantContentByteCount,
+                                contentSHA256: outcome.assistantContentSHA256
+                            )
+                    ]
                     for ((call, authorizedCall), pair) in zip(zip(calls, authorized), executorPairs) {
                         guard validExecutorPair(pair, for: call),
                               authorizedCall.toolCallID == call.id else {
@@ -601,9 +960,30 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
                             content: feedback,
                             toolCallID: call.id
                         ))
+                        if nextProvider == pairs.endIndex {
+                            exchangeBindings.append(StageBProviderMessageBinding.make(exchange.last!))
+                        } else {
+                            guard let byteCount = pair.terminal.resultByteCount,
+                                  let sha256 = pair.terminal.resultSHA256 else {
+                                return .reconciliationRequired
+                            }
+                            exchangeBindings.append(StageBProviderMessageBinding(
+                                contentByteCount: byteCount,
+                                contentSHA256: sha256
+                            ))
+                        }
+                        guard let observationHistory = requestCanonicalizer.appendingObservation(
+                            observation,
+                            toolCallID: call.id,
+                            to: state.historyBindingSHA256
+                        ) else {
+                            return .reconciliationRequired
+                        }
+                        state.historyBindingSHA256 = observationHistory
                     }
                     state.unresolvedPolicyRejection = false
                     state.lastExchange = exchange
+                    state.lastExchangeBindings = exchangeBindings
                 }
                 state.usedToolCallIDs.formUnion(calls.map(\.id))
             }
@@ -767,6 +1147,16 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
             state.lastExchange = [assistant] + calls.map {
                 ProviderTurnMessage(role: .tool, content: feedback, toolCallID: $0.id)
             }
+            state.lastExchangeBindings = state.lastExchange.map(
+                StageBProviderMessageBinding.make
+            )
+            guard let history = requestCanonicalizer.appendingPolicyRejection(
+                rejection,
+                calls: calls,
+                feedback: feedback,
+                to: state.historyBindingSHA256
+            ) else { return .outcome(.reconciliationRequired) }
+            state.historyBindingSHA256 = history
             state.usedToolCallIDs.formUnion(calls.map(\.id))
             return .state(state)
         }
@@ -786,6 +1176,16 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
             state.lastExchange = [assistant] + calls.map {
                 ProviderTurnMessage(role: .tool, content: feedback, toolCallID: $0.id)
             }
+            state.lastExchangeBindings = state.lastExchange.map(
+                StageBProviderMessageBinding.make
+            )
+            guard let history = requestCanonicalizer.appendingPolicyRejection(
+                rejection,
+                calls: calls,
+                feedback: feedback,
+                to: state.historyBindingSHA256
+            ) else { return .outcome(.reconciliationRequired) }
+            state.historyBindingSHA256 = history
             state.usedToolCallIDs.formUnion(calls.map(\.id))
             return .state(state)
         } catch {
@@ -798,6 +1198,7 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
         state.unresolvedPolicyRejection = false
         state.usedToolCallIDs.formUnion(authorized.map(\.toolCallID))
         var exchange = [assistant]
+        var exchangeBindings = [StageBProviderMessageBinding.make(assistant)]
         for (call, request) in zip(authorized, pending) {
             state.toolExecutionCount += 1
             switch await executor.execute(call.tool) {
@@ -867,6 +1268,13 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
                     content: modelContent,
                     toolCallID: call.toolCallID
                 ))
+                exchangeBindings.append(StageBProviderMessageBinding.make(exchange.last!))
+                guard let history = requestCanonicalizer.appendingObservation(
+                    observationEvidence,
+                    toolCallID: call.toolCallID,
+                    to: state.historyBindingSHA256
+                ) else { return .outcome(.reconciliationRequired) }
+                state.historyBindingSHA256 = history
             case .failure:
                 let recorded = await record(terminal(
                     sessionID: session.id,
@@ -905,33 +1313,8 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
             }
         }
         state.lastExchange = exchange
+        state.lastExchangeBindings = exchangeBindings
         return .state(state)
-    }
-
-    private func inferenceRequest(
-        contextWindow: StageBContextWindow,
-        baseMessages: [ProviderTurnMessage],
-        observations: [StageBObservationEvidence],
-        lastExchange: [ProviderTurnMessage],
-        requireTool: Bool
-    ) throws -> ProviderInferenceRequest {
-        var exchange: [ProviderTurnMessage] = []
-        if !observations.isEmpty {
-            let lines = observations.map {
-                "tool=\($0.tool.rawValue) path_hash=\(ProviderDigest.sha256Hex($0.relativePath)) rules=\($0.ruleSetSHA256) evidence=\($0.observationSHA256)"
-            }
-            exchange.append(ProviderTurnMessage(
-                role: .user,
-                content: "Harness verified prior read-only observations:\n" + lines.joined(separator: "\n")
-            ))
-        }
-        exchange.append(contentsOf: lastExchange)
-        return try contextWindow.request(
-            baseMessages: baseMessages,
-            observations: [],
-            lastExchange: exchange,
-            requireTool: requireTool
-        )
     }
 
     private func restoredObservationFeedback(_ observation: StageBObservationEvidence) -> String? {
@@ -1210,25 +1593,7 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
     }
 
     private func boundedPolicyFeedback(_ rejection: StageBBatchPolicyError) -> String {
-        let index = rejection.callIndex.map(String.init) ?? "none"
-        let value = "{\"status\":\"not_executed\",\"reason\":\"policy_rejected\",\"policy_code\":\"\(rejection.reason.rawValue)\",\"call_index\":\"\(index)\"}"
-        return String(value.prefix(512))
-    }
-
-    private func inferenceInputHash(_ request: ProviderInferenceRequest) -> String {
-        var parts = ["requireTool=\(request.requireTool)"]
-        parts.append(contentsOf: request.tools.map { "tool=\($0.name)" })
-        for message in request.messages {
-            parts.append("role=\(message.role.rawValue)")
-            let contentHash = message.content.map(ProviderDigest.sha256Hex) ?? "none"
-            parts.append("content=\(contentHash)")
-            parts.append(contentsOf: message.toolCalls.map {
-                "call=\(ProviderDigest.sha256Hex($0.id)):\($0.name):\(ProviderDigest.sha256Hex($0.arguments))"
-            })
-            let toolCallIDHash = message.toolCallID.map(ProviderDigest.sha256Hex) ?? "none"
-            parts.append("toolCallID=\(toolCallIDHash)")
-        }
-        return ProviderDigest.sha256Hex(parts.joined(separator: "\n"))
+        StageBProviderRequestCanonicalizer.boundedPolicyFeedback(rejection)
     }
 
     private func intent(

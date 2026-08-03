@@ -222,6 +222,349 @@ final class WujiStageBTests: XCTestCase {
         })
     }
 
+    func testColdResumeProviderPairHashFromDifferentGoalContextRequiresReconciliationWithoutIO() async throws {
+        let fixture = try makeFixture(
+            nestedDirectory: "Sources/Feature",
+            fileName: "FeatureFlag.swift",
+            query: "NestedFeatureReady"
+        )
+        let otherFixture = try makeFixture(
+            nestedDirectory: "Modules/Parser",
+            fileName: "TokenCatalog.swift",
+            query: "DifferentGoalReady"
+        )
+        defer {
+            fixture.cleanup()
+            otherFixture.cleanup()
+        }
+        let prepared = try await prepare(fixture: fixture)
+        let otherPrepared = try await prepare(fixture: otherFixture)
+        try await markRunning(prepared)
+        let calls = [call(id: "wrong-goal-list", name: "list", arguments: ["path": ""])]
+        let wrongButValidHash = try canonicalProviderInputHash(prepared: otherPrepared)
+        try await persistProviderDecision(
+            .toolCalls(ProviderTurnMessage(role: .assistant, toolCalls: calls), calls),
+            prepared: prepared,
+            inputSHA256: wrongButValidHash
+        )
+
+        let provider = StageBScriptedProvider(outcomes: [.failure(.emptyResponse)])
+        let executor = StageBMockExecutor(
+            query: fixture.query,
+            relativePath: fixture.relativeFilePath,
+            topLevelEntry: "Sources"
+        )
+        let outcome = await makeAgent(prepared, provider: provider, executor: executor)
+            .run(sessionID: prepared.context.session.id)
+        let providerCalls = await provider.callCount()
+        let executorCalls = await executor.executedNames()
+
+        XCTAssertEqual(outcome, .reconciliationRequired)
+        XCTAssertEqual(providerCalls, 0)
+        XCTAssertEqual(executorCalls, [])
+    }
+
+    func testColdResumeLaterProviderHashFromDifferentObservationRequiresReconciliationWithoutIO() async throws {
+        let fixture = try makeFixture(
+            nestedDirectory: "Sources/Feature",
+            fileName: "FeatureFlag.swift",
+            query: "NestedFeatureReady"
+        )
+        let otherFixture = try makeFixture(
+            nestedDirectory: "Modules/Parser",
+            fileName: "OtherObservation.swift",
+            query: "OtherObservationReady"
+        )
+        defer {
+            fixture.cleanup()
+            otherFixture.cleanup()
+        }
+        let prepared = try await prepare(fixture: fixture)
+        try await markRunning(prepared)
+        let listCall = call(id: "observation-list", name: "list", arguments: ["path": ""])
+        let firstDecision = ProviderInferenceDecision.toolCalls(
+            ProviderTurnMessage(role: .assistant, toolCalls: [listCall]),
+            [listCall]
+        )
+        try await persistProviderDecision(firstDecision, prepared: prepared)
+        try await persistExecutorObservation(
+            call: listCall,
+            fixture: fixture,
+            prepared: prepared
+        )
+
+        let wrongContext = try observationContext(
+            call: listCall,
+            fixture: otherFixture,
+            prepared: prepared
+        )
+        let canonicalizer = StageBProviderRequestCanonicalizer(
+            providerID: "stage-b-test",
+            limits: prepared.limits
+        )
+        var wrongHistory = try XCTUnwrap(canonicalizer.appendingProviderOutcome(
+            providerOutcomeEvidence(firstDecision),
+            category: .providerToolCalls,
+            to: StageBProviderRequestCanonicalizer.emptyHistorySHA256
+        ))
+        wrongHistory = try XCTUnwrap(canonicalizer.appendingObservation(
+            wrongContext.observation,
+            toolCallID: listCall.id,
+            to: wrongHistory
+        ))
+        let wrongExchange = [
+            wrongContext.assistant,
+            ProviderTurnMessage(
+                role: .tool,
+                content: wrongContext.modelContent,
+                toolCallID: listCall.id
+            )
+        ]
+        let wrongButValidHash = try canonicalProviderInputHash(
+            prepared: prepared,
+            observations: [wrongContext.observation],
+            lastExchange: wrongExchange,
+            historyBindingSHA256: wrongHistory,
+            completedProviderRequestCount: 1,
+            completedToolExecutionCount: 1,
+            usedToolCallIDs: [listCall.id]
+        )
+        let nextCalls = [call(
+            id: "observation-next-search",
+            name: "search",
+            arguments: ["path": "Sources", "query": fixture.query]
+        )]
+        try await persistProviderDecision(
+            .toolCalls(ProviderTurnMessage(role: .assistant, toolCalls: nextCalls), nextCalls),
+            prepared: prepared,
+            inputSHA256: wrongButValidHash
+        )
+
+        let provider = StageBScriptedProvider(outcomes: [.failure(.emptyResponse)])
+        let executor = StageBMockExecutor(
+            query: fixture.query,
+            relativePath: fixture.relativeFilePath,
+            topLevelEntry: "Sources"
+        )
+        let outcome = await makeAgent(prepared, provider: provider, executor: executor)
+            .run(sessionID: prepared.context.session.id)
+        let providerCalls = await provider.callCount()
+        let executorCalls = await executor.executedNames()
+
+        XCTAssertEqual(outcome, .reconciliationRequired)
+        XCTAssertEqual(providerCalls, 0)
+        XCTAssertEqual(executorCalls, [])
+    }
+
+    func testColdResumeLaterProviderHashesAfterObservationAndPolicyFeedbackContinueWithoutRepeat() async throws {
+        let observationFixture = try makeFixture(
+            nestedDirectory: "Sources/Feature",
+            fileName: "FeatureFlag.swift",
+            query: "NestedFeatureReady"
+        )
+        defer { observationFixture.cleanup() }
+        let observationPrepared = try await prepare(fixture: observationFixture)
+        try await markRunning(observationPrepared)
+        let listCall = call(id: "correct-observation-list", name: "list", arguments: ["path": ""])
+        let firstDecision = ProviderInferenceDecision.toolCalls(
+            ProviderTurnMessage(role: .assistant, toolCalls: [listCall]),
+            [listCall]
+        )
+        try await persistProviderDecision(firstDecision, prepared: observationPrepared)
+        try await persistExecutorObservation(
+            call: listCall,
+            fixture: observationFixture,
+            prepared: observationPrepared
+        )
+        let restoredObservationContext = try observationContext(
+            call: listCall,
+            fixture: observationFixture,
+            prepared: observationPrepared
+        )
+        let observationCanonicalizer = StageBProviderRequestCanonicalizer(
+            providerID: "stage-b-test",
+            limits: observationPrepared.limits
+        )
+        var observationHistory = try XCTUnwrap(
+            observationCanonicalizer.appendingProviderOutcome(
+                providerOutcomeEvidence(firstDecision),
+                category: .providerToolCalls,
+                to: StageBProviderRequestCanonicalizer.emptyHistorySHA256
+            )
+        )
+        observationHistory = try XCTUnwrap(
+            observationCanonicalizer.appendingObservation(
+                restoredObservationContext.observation,
+                toolCallID: listCall.id,
+                to: observationHistory
+            )
+        )
+        let observationExchange = [
+            restoredObservationContext.assistant,
+            ProviderTurnMessage(
+                role: .tool,
+                content: restoredObservationContext.modelContent,
+                toolCallID: listCall.id
+            )
+        ]
+        let laterObservationHash = try canonicalProviderInputHash(
+            prepared: observationPrepared,
+            observations: [restoredObservationContext.observation],
+            lastExchange: observationExchange,
+            historyBindingSHA256: observationHistory,
+            completedProviderRequestCount: 1,
+            completedToolExecutionCount: 1,
+            usedToolCallIDs: [listCall.id]
+        )
+        let searchCall = call(
+            id: "correct-observation-search",
+            name: "search",
+            arguments: ["path": "Sources", "query": observationFixture.query]
+        )
+        try await persistProviderDecision(
+            .toolCalls(
+                ProviderTurnMessage(role: .assistant, toolCalls: [searchCall]),
+                [searchCall]
+            ),
+            prepared: observationPrepared,
+            inputSHA256: laterObservationHash
+        )
+        let observationProvider = StageBScriptedProvider(outcomes: [.failure(.emptyResponse)])
+        let observationExecutor = StageBMockExecutor(
+            query: observationFixture.query,
+            relativePath: observationFixture.relativeFilePath,
+            topLevelEntry: "Sources",
+            unknownOnFirstCall: true
+        )
+        let observationOutcome = await makeAgent(
+            observationPrepared,
+            provider: observationProvider,
+            executor: observationExecutor
+        ).run(sessionID: observationPrepared.context.session.id)
+        let observationProviderCalls = await observationProvider.callCount()
+        let observationExecutorCalls = await observationExecutor.executedNames()
+        XCTAssertEqual(observationOutcome, .reconciliationRequired)
+        XCTAssertEqual(observationProviderCalls, 0)
+        XCTAssertEqual(observationExecutorCalls, [.search])
+
+        let policyFixture = try makeFixture(
+            nestedDirectory: "Modules/Parser",
+            fileName: "TokenCatalog.swift",
+            query: "ParserReadyToken"
+        )
+        defer { policyFixture.cleanup() }
+        let policyPrepared = try await prepare(fixture: policyFixture)
+        try await markRunning(policyPrepared)
+        let rejectedCall = call(
+            id: "correct-policy-rejected",
+            name: "read",
+            arguments: ["path": "../outside.txt"]
+        )
+        let policyDecision = ProviderInferenceDecision.toolCalls(
+            ProviderTurnMessage(role: .assistant, toolCalls: [rejectedCall]),
+            [rejectedCall]
+        )
+        try await persistProviderDecision(policyDecision, prepared: policyPrepared)
+        try await persistPolicyNotExecuted(call: rejectedCall, prepared: policyPrepared)
+        let rejection = try policyRejection(call: rejectedCall, prepared: policyPrepared)
+        let feedback = StageBProviderRequestCanonicalizer.boundedPolicyFeedback(rejection)
+        let policyCanonicalizer = StageBProviderRequestCanonicalizer(
+            providerID: "stage-b-test",
+            limits: policyPrepared.limits
+        )
+        var policyHistory = try XCTUnwrap(policyCanonicalizer.appendingProviderOutcome(
+            providerOutcomeEvidence(policyDecision),
+            category: .providerToolCalls,
+            to: StageBProviderRequestCanonicalizer.emptyHistorySHA256
+        ))
+        policyHistory = try XCTUnwrap(policyCanonicalizer.appendingPolicyRejection(
+            rejection,
+            calls: [rejectedCall],
+            feedback: feedback,
+            to: policyHistory
+        ))
+        let policyExchange = [
+            ProviderTurnMessage(role: .assistant, toolCalls: [rejectedCall]),
+            ProviderTurnMessage(role: .tool, content: feedback, toolCallID: rejectedCall.id)
+        ]
+        let laterPolicyHash = try canonicalProviderInputHash(
+            prepared: policyPrepared,
+            lastExchange: policyExchange,
+            historyBindingSHA256: policyHistory,
+            completedProviderRequestCount: 1,
+            unresolvedPolicyRejection: true,
+            usedToolCallIDs: [rejectedCall.id]
+        )
+        let nextListCall = call(id: "correct-policy-list", name: "list", arguments: ["path": ""])
+        try await persistProviderDecision(
+            .toolCalls(
+                ProviderTurnMessage(role: .assistant, toolCalls: [nextListCall]),
+                [nextListCall]
+            ),
+            prepared: policyPrepared,
+            inputSHA256: laterPolicyHash
+        )
+        let policyProvider = StageBScriptedProvider(outcomes: [.failure(.emptyResponse)])
+        let policyExecutor = StageBMockExecutor(
+            query: policyFixture.query,
+            relativePath: policyFixture.relativeFilePath,
+            topLevelEntry: "Modules",
+            unknownOnFirstCall: true
+        )
+        let policyOutcome = await makeAgent(
+            policyPrepared,
+            provider: policyProvider,
+            executor: policyExecutor
+        ).run(sessionID: policyPrepared.context.session.id)
+        let policyProviderCalls = await policyProvider.callCount()
+        let policyExecutorCalls = await policyExecutor.executedNames()
+        XCTAssertEqual(policyOutcome, .reconciliationRequired)
+        XCTAssertEqual(policyProviderCalls, 0)
+        XCTAssertEqual(policyExecutorCalls, [.list])
+    }
+
+    func testColdResumeProviderIdentityOptionsHashMismatchRequiresReconciliationWithoutIO() async throws {
+        let fixture = try makeFixture(
+            nestedDirectory: "Sources/Feature",
+            fileName: "FeatureFlag.swift",
+            query: "NestedFeatureReady"
+        )
+        defer { fixture.cleanup() }
+        let prepared = try await prepare(fixture: fixture)
+        try await markRunning(prepared)
+        let expectedHash = try canonicalProviderInputHash(prepared: prepared)
+        let wrongProviderHash = try canonicalProviderInputHash(
+            prepared: prepared,
+            providerID: "stage-b-test-other-model-options"
+        )
+        let wrongButValidHash = try canonicalProviderInputHash(
+            prepared: prepared,
+            limits: .production
+        )
+        XCTAssertNotEqual(wrongProviderHash, expectedHash)
+        XCTAssertNotEqual(wrongButValidHash, expectedHash)
+        let calls = [call(id: "wrong-provider-list", name: "list", arguments: ["path": ""])]
+        try await persistProviderDecision(
+            .toolCalls(ProviderTurnMessage(role: .assistant, toolCalls: calls), calls),
+            prepared: prepared,
+            inputSHA256: wrongButValidHash
+        )
+        let provider = StageBScriptedProvider(outcomes: [.failure(.emptyResponse)])
+        let executor = StageBMockExecutor(
+            query: fixture.query,
+            relativePath: fixture.relativeFilePath,
+            topLevelEntry: "Sources"
+        )
+        let outcome = await makeAgent(prepared, provider: provider, executor: executor)
+            .run(sessionID: prepared.context.session.id)
+        let providerCalls = await provider.callCount()
+        let executorCalls = await executor.executedNames()
+
+        XCTAssertEqual(outcome, .reconciliationRequired)
+        XCTAssertEqual(providerCalls, 0)
+        XCTAssertEqual(executorCalls, [])
+    }
+
     func testColdResumeAfterReliableProviderSuccessContinuesToToolWithoutResendingProvider() async throws {
         let fixture = try makeFixture(
             nestedDirectory: "Sources/Feature",
@@ -233,6 +576,7 @@ final class WujiStageBTests: XCTestCase {
         try await markRunning(prepared)
         let calls = [call(id: "resume-provider-list", name: "list", arguments: ["path": ""])]
         let rawProviderSentinel = "RAW_PROVIDER_BODY_MUST_NOT_PERSIST"
+        let expectedProviderHash = try canonicalProviderInputHash(prepared: prepared)
         try await persistProviderDecision(
             .toolCalls(ProviderTurnMessage(
                 role: .assistant,
@@ -264,6 +608,9 @@ final class WujiStageBTests: XCTestCase {
             }.count,
             1
         )
+        XCTAssertTrue(snapshot.attempts.filter { $0.kind == .provider }.allSatisfy {
+            $0.inputSHA256 == expectedProviderHash
+        })
         let attemptsFile = prepared.store.rootURL
             .appendingPathComponent("Sessions")
             .appendingPathComponent(prepared.context.session.id.uuidString.lowercased())
@@ -741,6 +1088,23 @@ final class WujiStageBTests: XCTestCase {
             lastExchange: [],
             requireTool: true
         )
+        let canonicalRequest = try StageBProviderRequestCanonicalizer(
+            providerID: "stage-b-test",
+            limits: prepared.limits
+        ).make(
+            session: prepared.context.session,
+            ruleSet: prepared.context.ruleSet,
+            observations: [],
+            lastExchange: [],
+            lastExchangeBindings: [],
+            historyBindingSHA256: StageBProviderRequestCanonicalizer.emptyHistorySHA256,
+            completedProviderRequestCount: 0,
+            completedToolExecutionCount: 0,
+            unresolvedPolicyRejection: false,
+            usedToolCallIDs: [],
+            requireTool: true
+        )
+        XCTAssertEqual(canonicalRequest.request, normalRequest)
         XCTAssertLessThanOrEqual(
             try DeepSeekRequestBodyBounds.maximumEncodedByteCount(for: normalRequest),
             ProviderLimits.maximumRequestBodyBytes
@@ -911,11 +1275,17 @@ final class WujiStageBTests: XCTestCase {
     private func persistProviderDecision(
         _ decision: ProviderInferenceDecision,
         prepared: StageBPreparedTest,
-        includeTypedOutcome: Bool = true
+        includeTypedOutcome: Bool = true,
+        inputSHA256 suppliedInputSHA256: String? = nil
     ) async throws {
         let operationID = UUID()
         let attemptID = UUID()
-        let inputSHA256 = try initialProviderInputHash(prepared)
+        let inputSHA256: String
+        if let suppliedInputSHA256 {
+            inputSHA256 = suppliedInputSHA256
+        } else {
+            inputSHA256 = try canonicalProviderInputHash(prepared: prepared)
+        }
         try await prepared.store.record(attemptEvidence(
             sessionID: prepared.context.session.id,
             operationID: operationID,
@@ -926,23 +1296,13 @@ final class WujiStageBTests: XCTestCase {
             inputSHA256: inputSHA256
         ))
         let category: StageBAttemptCategory
-        let outcome: StageBProviderOutcomeEvidence
         switch decision {
-        case let .toolCalls(assistant, calls):
+        case .toolCalls:
             category = .providerToolCalls
-            outcome = StageBProviderOutcomeEvidence(
-                assistantContentByteCount: assistant.content?.utf8.count ?? 0,
-                assistantContentSHA256: assistant.content.map(ProviderDigest.sha256Hex),
-                toolCalls: calls
-            )
-        case let .finish(assistant):
+        case .finish:
             category = .providerFinish
-            outcome = StageBProviderOutcomeEvidence(
-                assistantContentByteCount: assistant.content?.utf8.count ?? 0,
-                assistantContentSHA256: assistant.content.map(ProviderDigest.sha256Hex),
-                toolCalls: []
-            )
         }
+        let outcome = providerOutcomeEvidence(decision)
         try await prepared.store.record(attemptEvidence(
             sessionID: prepared.context.session.id,
             operationID: operationID,
@@ -1062,34 +1422,104 @@ final class WujiStageBTests: XCTestCase {
     private func initialProviderInputHash(
         _ prepared: StageBPreparedTest
     ) throws -> String {
-        let window = StageBContextWindow(limits: prepared.limits)
-        let base = try window.baseMessages(
-            session: prepared.context.session,
-            ruleSet: prepared.context.ruleSet
-        )
-        let request = try window.request(
-            baseMessages: base,
-            observations: [],
-            lastExchange: [],
-            requireTool: true
-        )
-        return providerInputHash(request)
+        try canonicalProviderInputHash(prepared: prepared)
     }
 
-    private func providerInputHash(_ request: ProviderInferenceRequest) -> String {
-        var parts = ["requireTool=\(request.requireTool)"]
-        parts.append(contentsOf: request.tools.map { "tool=\($0.name)" })
-        for message in request.messages {
-            parts.append("role=\(message.role.rawValue)")
-            parts.append("content=\(message.content.map(ProviderDigest.sha256Hex) ?? "none")")
-            parts.append(contentsOf: message.toolCalls.map {
-                "call=\(ProviderDigest.sha256Hex($0.id)):\($0.name):\(ProviderDigest.sha256Hex($0.arguments))"
-            })
-            parts.append(
-                "toolCallID=\(message.toolCallID.map(ProviderDigest.sha256Hex) ?? "none")"
+    private func canonicalProviderInputHash(
+        prepared: StageBPreparedTest,
+        providerID: String = "stage-b-test",
+        limits: StageBLimits? = nil,
+        observations: [StageBObservationEvidence] = [],
+        lastExchange: [ProviderTurnMessage] = [],
+        lastExchangeBindings: [StageBProviderMessageBinding]? = nil,
+        historyBindingSHA256: String = StageBProviderRequestCanonicalizer.emptyHistorySHA256,
+        completedProviderRequestCount: Int = 0,
+        completedToolExecutionCount: Int = 0,
+        unresolvedPolicyRejection: Bool = false,
+        usedToolCallIDs: Set<String> = [],
+        requireTool: Bool = true
+    ) throws -> String {
+        let canonicalizer = StageBProviderRequestCanonicalizer(
+            providerID: providerID,
+            limits: limits ?? prepared.limits
+        )
+        return try canonicalizer.make(
+            session: prepared.context.session,
+            ruleSet: prepared.context.ruleSet,
+            observations: observations,
+            lastExchange: lastExchange,
+            lastExchangeBindings: lastExchangeBindings
+                ?? lastExchange.map(StageBProviderMessageBinding.make),
+            historyBindingSHA256: historyBindingSHA256,
+            completedProviderRequestCount: completedProviderRequestCount,
+            completedToolExecutionCount: completedToolExecutionCount,
+            unresolvedPolicyRejection: unresolvedPolicyRejection,
+            usedToolCallIDs: usedToolCallIDs,
+            requireTool: requireTool
+        ).inputSHA256
+    }
+
+    private func providerOutcomeEvidence(
+        _ decision: ProviderInferenceDecision
+    ) -> StageBProviderOutcomeEvidence {
+        switch decision {
+        case let .toolCalls(assistant, calls):
+            return StageBProviderOutcomeEvidence(
+                assistantContentByteCount: assistant.content?.utf8.count ?? 0,
+                assistantContentSHA256: assistant.content.map(ProviderDigest.sha256Hex),
+                toolCalls: calls
+            )
+        case let .finish(assistant):
+            return StageBProviderOutcomeEvidence(
+                assistantContentByteCount: assistant.content?.utf8.count ?? 0,
+                assistantContentSHA256: assistant.content.map(ProviderDigest.sha256Hex),
+                toolCalls: []
             )
         }
-        return ProviderDigest.sha256Hex(parts.joined(separator: "\n"))
+    }
+
+    private func observationContext(
+        call providerCall: ProviderTurnToolCall,
+        fixture: StageBTestFixture,
+        prepared: StageBPreparedTest
+    ) throws -> (
+        assistant: ProviderTurnMessage,
+        observation: StageBObservationEvidence,
+        modelContent: String
+    ) {
+        let policy = StageBReadOnlyPolicy(
+            workspace: prepared.context.workspace,
+            ruleSet: prepared.context.ruleSet,
+            limits: prepared.limits
+        )
+        let authorized = try XCTUnwrap(try policy.authorizeBatch([providerCall]).first)
+        let observation = makeObservation(tool: authorized.tool, fixture: fixture)
+        return (
+            ProviderTurnMessage(role: .assistant, toolCalls: [providerCall]),
+            try StageBObservationEvidence.make(
+                observation: observation,
+                exactQuery: fixture.query,
+                limits: prepared.limits
+            ),
+            try StageBModelObservation.render(observation, limits: prepared.limits)
+        )
+    }
+
+    private func policyRejection(
+        call providerCall: ProviderTurnToolCall,
+        prepared: StageBPreparedTest
+    ) throws -> StageBBatchPolicyError {
+        let policy = StageBReadOnlyPolicy(
+            workspace: prepared.context.workspace,
+            ruleSet: prepared.context.ruleSet,
+            limits: prepared.limits
+        )
+        do {
+            _ = try policy.authorizeBatch([providerCall])
+            throw StageBSessionStoreError.invalidEvidence
+        } catch let rejection as StageBBatchPolicyError {
+            return rejection
+        }
     }
 
     private func toolInputHash(_ call: ProviderTurnToolCall) -> String {
