@@ -333,7 +333,7 @@ jobs:
           import pathlib, re, subprocess
           baseline = "5529dbcc5ac6f01e121db45f082f4d6a5378e325"
           changed = subprocess.check_output(["git", "diff", "--name-only", baseline + "..HEAD"], text=True).splitlines()
-          allowed = re.compile(r"^(?:Wuji\.xcodeproj/project\.pbxproj|Executor/WujiISHAdapter\.[ch]|Wuji/(?:WujiApp|StageBView|StageC[^/]*)\.swift|Wuji/StageCRealImportedProject/.*|WujiTests/WujiStageC.*Tests\.swift|\.github/workflows/stage-c-bounded-edit\.yml|docs/PROJECT_CONTROL_CENTER\.md)$")
+          allowed = re.compile(r"^(?:Wuji\.xcodeproj/project\.pbxproj|Executor/WujiISHAdapter\.[ch]|Wuji/(?:WujiApp|StageBView|ISHStageCEditExecutor|StageC[^/]*)\.swift|Wuji/StageCRealImportedProject/.*|WujiTests/WujiStageC.*Tests\.swift|\.github/workflows/stage-c-bounded-edit\.yml|docs/PROJECT_CONTROL_CENTER\.md)$")
           unexpected = [p for p in changed if not allowed.fullmatch(p)]
           if unexpected:
               raise SystemExit("Stage C scope escaped: " + ", ".join(unexpected))

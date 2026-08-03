@@ -461,6 +461,7 @@ final class StageCEditingAgent: @unchecked Sendable {
                         }
                     }
                 }
+            }
 
             case .unknown:
                 await recordReconciliation(
@@ -487,8 +488,6 @@ final class StageCEditingAgent: @unchecked Sendable {
             }
         }
         return await fail(.completionRejected)
-    }
-
     }
 
     private func resume(
