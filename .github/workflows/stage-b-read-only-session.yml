@@ -1,0 +1,541 @@
+name: Stage B Read-Only Session
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  stage-b-validation:
+    name: Apple build, Stage B tests, real iSH, and real DeepSeek session
+    runs-on: macos-15
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out exact candidate without recursive submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0
+
+      - name: Fail closed unless the existing DeepSeek secrets are configured
+        shell: bash
+        env:
+          DEEPSEEK_BASE_URL: ${{ secrets.DEEPSEEK_BASE_URL }}
+          DEEPSEEK_MODEL: ${{ secrets.DEEPSEEK_MODEL }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          set -euo pipefail
+          set +x
+          test -n "$DEEPSEEK_BASE_URL"
+          test -n "$DEEPSEEK_MODEL"
+          test -n "$DEEPSEEK_API_KEY"
+          echo 'STAGE_B_SECRET_PREFLIGHT=PASS'
+
+      - name: Verify exact head and approved fixed sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git submodule update --init ThirdParty/ish
+          git -C ThirdParty/ish submodule update --init deps/libarchive
+          Scripts/verify-source-lock.sh
+          Scripts/verify-minizip-lock.sh
+          test "$(git rev-parse d31c40b5ef5b1aefc695ea044d6ce62797993905^{tree})" = \
+            "e13054d55c636da9e758602e8187350c869678ce"
+
+      - name: Install fixed-source build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake meson ninja llvm lld
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
+
+      - name: Verify rootfs and build fixed iSH static closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          Scripts/fetch-rootfs.sh
+          Scripts/build-ish.sh "$RUNNER_TEMP/wuji-ish"
+
+      - name: Verify Apple toolchain and Xcode project
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcodebuild -list -project Wuji.xcodeproj
+
+      - name: Build exact-head unsigned ARM64 app
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          WUJI_ISH_BUILD_DIR="$RUNNER_TEMP/wuji-ish" xcodebuild \
+            -project Wuji.xcodeproj \
+            -scheme Wuji \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "generic/platform=iOS Simulator" \
+            -derivedDataPath "$RUNNER_TEMP/wuji-stage-b-derived" \
+            clean build \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee "$RUNNER_TEMP/wuji-stage-b-build.log"
+
+      - name: Select and boot an ARM64 iPad simulator
+        id: simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          simulator_id="$({ xcrun simctl list devices available -j; } | /usr/bin/python3 -c 'import json, sys; groups = json.load(sys.stdin)["devices"]; devices = [device for group in groups.values() for device in group if device.get("isAvailable") and "iPad" in device.get("name", "")]; print(devices[0]["udid"] if devices else "")')"
+          test -n "$simulator_id"
+          xcrun simctl bootstatus "$simulator_id" -b
+          echo "id=$simulator_id" >> "$GITHUB_OUTPUT"
+
+      - name: Run focused Provider, secure configuration, Stage B boundary, recovery, and real iSH tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          WUJI_ISH_BUILD_DIR="$RUNNER_TEMP/wuji-ish" xcodebuild \
+            -project Wuji.xcodeproj \
+            -scheme Wuji \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.id }}" \
+            -derivedDataPath "$RUNNER_TEMP/wuji-stage-b-derived" \
+            -resultBundlePath "$RUNNER_TEMP/wuji-stage-b-tests.xcresult" \
+            -only-testing:"WujiTests/WujiProviderTests" \
+            -only-testing:"WujiTests/WujiStageASecureConfigurationTests" \
+            -only-testing:"WujiTests/WujiStageBTests" \
+            -only-testing:"WujiTests/WujiStageBISHIntegrationTests" \
+            test \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            2>&1 | tee "$RUNNER_TEMP/wuji-stage-b-tests.log"
+
+      - name: Audit focused XCTest names and results
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun xcresulttool get test-results summary \
+            --path "$RUNNER_TEMP/wuji-stage-b-tests.xcresult" --format json \
+            > "$RUNNER_TEMP/wuji-stage-b-summary.json"
+          xcrun xcresulttool get test-results tests \
+            --path "$RUNNER_TEMP/wuji-stage-b-tests.xcresult" --format json \
+            > "$RUNNER_TEMP/wuji-stage-b-test-details.json"
+          /usr/bin/python3 - "$RUNNER_TEMP/wuji-stage-b-test-details.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          serialized = json.dumps(payload, sort_keys=True)
+          required = [
+              "testProductionDefaultsAreExactInjectableImplementationValues",
+              "testStageAReadyMarkerCreatesExactSessionBindingAndColdOpenPreservesIt",
+              "testRootAndNestedAgentsRulesAreScopedAndBoundToAdmission",
+              "testGeneralDifferentDirectoryFileGoalAndQueryCompletesWithoutS3FixtureContract",
+              "testWholeBatchRejectionReturnsEveryOriginalIDAndPerformsZeroExecutorIO",
+              "testProviderUnknownColdRecoveryDoesNotCreateSecondAttempt",
+              "testExecutorUnknownColdRecoveryDoesNotCreateSecondAttempt",
+              "testExecutorIntentIsDurableBeforeExecuteBoundary",
+              "testWriteShellGitNetworkInstallAndMalformedToolsFailWholeBatchBeforeIO",
+              "testAbsoluteParentMarkerOtherWorkspaceAndSymlinkEscapeFailClosed",
+              "testProviderContextIsProvenBoundedBeforeSendWithoutSilentRuleTruncation",
+              "testDurableEvidenceStoresRuleHashesAndNecessaryFactsWithoutRuleOrSourceCopies",
+              "testProviderFinishWithoutEvidenceCannotComplete",
+              "testReadingSessionProjectionCannotChangeExecutionTruth",
+              "testRealISHReadsActualStageAImportedProject",
+              "testURLProtocolCoversEndpointHeaderBodyAndSecretExclusion",
+              "testDurableIntentIsWrittenBeforeNetworkIO",
+              "testUncertainTransportResultRequiresReconciliationAndNeverRetries",
+              "testConfigurationReachesReplaceableProviderWithoutPersistingSecret",
+          ]
+          missing = [name for name in required if name not in serialized]
+          if missing:
+              raise SystemExit("missing Stage B XCTest evidence: " + ", ".join(missing))
+          print(f"STAGE_B_REQUIRED_XCTEST_CASES={len(required)}")
+          print("STAGE_B_XCRESULT_AUDIT=PASS")
+          print("STAGE_B_REQUEST_BODY_SECRET_TEST=PASS")
+          PY
+
+      - name: Install the exact-head test-built app
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/wuji-stage-b-derived/Build/Products/Debug-iphonesimulator/Wuji.app"
+          test -d "$app"
+          test -d "$app/StageBRealImportedProject"
+          test -f "$app/StageBRealImportedProject/AGENTS.md"
+          test -f "$app/StageBRealImportedProject/Sources/AGENTS.md"
+          test -f "$app/rootfs.tar.gz"
+          xcrun simctl uninstall "${{ steps.simulator.outputs.id }}" com.daaixz.wuji >/dev/null 2>&1 || true
+          xcrun simctl install "${{ steps.simulator.outputs.id }}" "$app"
+
+      - name: Run production Stage B loop with real DeepSeek and production iSH
+        shell: bash
+        env:
+          DEEPSEEK_BASE_URL: ${{ secrets.DEEPSEEK_BASE_URL }}
+          DEEPSEEK_MODEL: ${{ secrets.DEEPSEEK_MODEL }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          WUJI_STAGE_B_SIMULATOR_ID: ${{ steps.simulator.outputs.id }}
+        run: |
+          set -euo pipefail
+          set +x
+          simulator_id="$WUJI_STAGE_B_SIMULATOR_ID"
+          data_container="$(xcrun simctl get_app_container "$simulator_id" com.daaixz.wuji data)"
+          summary_file="$data_container/Documents/wuji-stage-b-summary.json"
+          rm -f "$summary_file"
+
+          export SIMCTL_CHILD_WUJI_STAGE_B_PROBE_MODE=1
+          export SIMCTL_CHILD_DEEPSEEK_BASE_URL="$DEEPSEEK_BASE_URL"
+          export SIMCTL_CHILD_DEEPSEEK_MODEL="$DEEPSEEK_MODEL"
+          export SIMCTL_CHILD_DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY"
+          xcrun simctl launch --terminate-running-process \
+            "$simulator_id" com.daaixz.wuji \
+            > "$RUNNER_TEMP/wuji-stage-b-launch.log" 2>&1
+          unset SIMCTL_CHILD_WUJI_STAGE_B_PROBE_MODE
+          unset SIMCTL_CHILD_DEEPSEEK_BASE_URL
+          unset SIMCTL_CHILD_DEEPSEEK_MODEL
+          unset SIMCTL_CHILD_DEEPSEEK_API_KEY
+
+          ps ax -o command= > "$RUNNER_TEMP/wuji-stage-b-process-args.txt"
+          for _ in $(seq 1 300); do
+            [[ -f "$summary_file" ]] && break
+            sleep 2
+          done
+          xcrun simctl terminate "$simulator_id" com.daaixz.wuji >/dev/null 2>&1 || true
+          test -f "$summary_file"
+
+          export WUJI_STAGE_B_DATA_CONTAINER="$data_container"
+          export WUJI_STAGE_B_SUMMARY_FILE="$summary_file"
+          /usr/bin/python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+
+          data_container = pathlib.Path(os.environ["WUJI_STAGE_B_DATA_CONTAINER"])
+          summary = json.loads(pathlib.Path(os.environ["WUJI_STAGE_B_SUMMARY_FILE"]).read_text(encoding="utf-8"))
+          expected_keys = {
+              "result_category", "session_id", "import_id", "workspace_identity_sha256",
+              "goal_binding_sha256", "rule_set_binding_sha256", "rule_sources",
+              "relative_path", "provider_request_count", "tool_execution_count",
+              "tool_sequence", "evidence_chain_sha256",
+              "external_attempt_count_before_cold_restore",
+              "external_attempt_count_after_cold_restore", "cold_restore_category",
+          }
+          if set(summary) != expected_keys:
+              raise SystemExit("unexpected Stage B summary shape")
+          if summary["result_category"] != "completed":
+              print("STAGE_B_REAL_LOOP_FAILURE=" + json.dumps(summary, sort_keys=True, separators=(",", ":")))
+              raise SystemExit("real Stage B loop did not complete")
+          if summary["relative_path"] != "Sources/Telemetry/StatusCatalog.swift":
+              raise SystemExit("unexpected Stage B completion path")
+          if summary["rule_sources"] != ["AGENTS.md", "Sources/AGENTS.md"]:
+              raise SystemExit("root/nested rule discovery mismatch")
+          for key in [
+              "workspace_identity_sha256", "goal_binding_sha256",
+              "rule_set_binding_sha256", "evidence_chain_sha256",
+          ]:
+              if not re.fullmatch(r"[0-9a-f]{64}", summary[key]):
+                  raise SystemExit("invalid Stage B binding hash")
+          if not (1 <= summary["provider_request_count"] <= 12):
+              raise SystemExit("provider request count outside Stage B default")
+          if not (3 <= summary["tool_execution_count"] <= 24):
+              raise SystemExit("tool execution count outside Stage B default")
+          sequence = summary["tool_sequence"]
+          cursor = -1
+          for required in ["list", "search", "read"]:
+              matches = [index for index in range(cursor + 1, len(sequence)) if sequence[index] == required]
+              if not matches:
+                  raise SystemExit("ordered Stage B evidence chain missing")
+              cursor = matches[0]
+          if summary["external_attempt_count_before_cold_restore"] != summary["external_attempt_count_after_cold_restore"]:
+              raise SystemExit("cold restore created a second external attempt")
+          if summary["cold_restore_category"] != "durable_completed":
+              raise SystemExit("cold restore did not rebuild from durable completion")
+
+          support = data_container / "Library" / "Application Support"
+          stage_a = support / "WujiStageA"
+          stage_b = support / "WujiStageB"
+          records = list((stage_a / "ImportRecords").glob("*.json"))
+          workspaces = [path for path in (stage_a / "Workspaces").iterdir() if path.is_dir()]
+          if len(records) != 1 or len(workspaces) != 1:
+              raise SystemExit("Stage B imported workspace identity is not unique")
+          import_record = json.loads(records[0].read_text(encoding="utf-8"))
+          if import_record["phase"] != "ready" or import_record["id"].lower() != summary["import_id"]:
+              raise SystemExit("Stage A ready record does not bind Stage B session")
+          workspace = workspaces[0]
+          marker = json.loads((workspace / ".wuji-stage-a-workspace.json").read_text(encoding="utf-8"))
+          if marker["importID"].lower() != summary["import_id"]:
+              raise SystemExit("Stage A marker/import binding mismatch")
+          if not (workspace / "Sources" / "Telemetry" / "StatusCatalog.swift").is_file():
+              raise SystemExit("actual imported project file missing")
+
+          session_dirs = [path for path in (stage_b / "Sessions").iterdir() if path.is_dir()]
+          if len(session_dirs) != 1 or session_dirs[0].name != summary["session_id"]:
+              raise SystemExit("Stage B durable session identity is not unique")
+          session = json.loads((session_dirs[0] / "session.json").read_text(encoding="utf-8"))
+          if session["phase"] != "completed":
+              raise SystemExit("durable Stage B session not completed")
+          if session["workspaceIdentitySHA256"] != summary["workspace_identity_sha256"]:
+              raise SystemExit("durable workspace binding mismatch")
+          if [item["relativePath"] for item in session["rules"]] != summary["rule_sources"]:
+              raise SystemExit("durable rule source binding mismatch")
+          durable_session_text = json.dumps(session, sort_keys=True)
+          for forbidden in ["Project rules never authorize", "Within Sources, use exact", "enum StatusCatalog"]:
+              if forbidden in durable_session_text:
+                  raise SystemExit("durable session copied full project rule/source content")
+
+          attempts = [
+              json.loads(line)
+              for line in (session_dirs[0] / "attempts.jsonl").read_text(encoding="utf-8").splitlines()
+              if line
+          ]
+          if any(item["phase"] == "reconciliation_required" for item in attempts):
+              raise SystemExit("successful Stage B evidence contains unknown result")
+          if any(item["category"] == "policy_not_executed" for item in attempts):
+              raise SystemExit("successful Stage B evidence has unresolved policy rejection")
+          operations = {}
+          for item in attempts:
+              operations.setdefault(item["operationID"], []).append(item)
+          for records_for_operation in operations.values():
+              phases = [item["phase"] for item in records_for_operation]
+              if phases not in (["intent_recorded", "succeeded"], ["intent_recorded", "failed"]):
+                  raise SystemExit("Stage B intent/terminal ordering invalid")
+          external_intents = [
+              item for item in attempts
+              if item["kind"] in {"provider", "executor"} and item["phase"] == "intent_recorded"
+          ]
+          if len(external_intents) != summary["external_attempt_count_after_cold_restore"]:
+              raise SystemExit("external intent count mismatch")
+          tool_sequence = [
+              item["observation"]["tool"]
+              for item in attempts
+              if item.get("observation") is not None
+          ]
+          if tool_sequence != sequence:
+              raise SystemExit("durable observation sequence mismatch")
+          print("STAGE_B_REAL_LOOP_SUMMARY=" + json.dumps(summary, sort_keys=True, separators=(",", ":")))
+          print("STAGE_B_READY_WORKSPACE_AUDIT=PASS")
+          print("STAGE_B_DURABLE_BINDING_AUDIT=PASS")
+          print("STAGE_B_COLD_RESTORE_NO_RETRY=PASS")
+          print("STAGE_B_REAL_ISH_DEEPSEEK_LOOP=PASS")
+          PY
+
+      - name: Scan exact secret across source, prompt evidence, diagnostics, process args, xcresult, app data, and products
+        if: always()
+        shell: bash
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          WUJI_STAGE_B_SIMULATOR_ID: ${{ steps.simulator.outputs.id }}
+        run: |
+          set -euo pipefail
+          set +x
+          data_container="$(xcrun simctl get_app_container "$WUJI_STAGE_B_SIMULATOR_ID" com.daaixz.wuji data)"
+          export WUJI_STAGE_B_SCAN_CONTAINER="$data_container"
+          /usr/bin/python3 <<'PY'
+          import os
+          import pathlib
+          import subprocess
+
+          secret = os.environ["DEEPSEEK_API_KEY"].encode()
+          if not secret:
+              raise SystemExit("secret unavailable to Stage B scanner")
+          workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          runner_temp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          roots = [
+              workspace,
+              runner_temp / "wuji-stage-b-build.log",
+              runner_temp / "wuji-stage-b-tests.log",
+              runner_temp / "wuji-stage-b-launch.log",
+              runner_temp / "wuji-stage-b-process-args.txt",
+              runner_temp / "wuji-stage-b-tests.xcresult",
+              runner_temp / "wuji-stage-b-derived" / "Build" / "Products",
+              pathlib.Path(os.environ["WUJI_STAGE_B_SCAN_CONTAINER"]),
+          ]
+
+          def files(root):
+              if root.is_file():
+                  yield root
+              elif root.is_dir():
+                  for path in root.rglob("*"):
+                      if path.is_file() and ".git" not in path.parts:
+                          yield path
+
+          checked = 0
+          for root in roots:
+              if not root.exists():
+                  raise SystemExit(f"required Stage B secret surface missing: {root}")
+              for path in files(root):
+                  checked += 1
+                  try:
+                      if secret in path.read_bytes():
+                          raise SystemExit(f"exact secret found in Stage B retained surface: {path}")
+                  except (OSError, PermissionError):
+                      continue
+          if checked == 0:
+              raise SystemExit("Stage B secret scan inspected no files")
+          print(f"STAGE_B_SECRET_SCAN_FILES={checked}")
+          print("STAGE_B_EXACT_SECRET_SCAN=PASS")
+          PY
+
+      - name: Audit Stage B scope, forbidden capabilities, and protected history
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test ! -e Wuji.ipa
+          test ! -d Payload
+          /usr/bin/python3 <<'PY'
+          import pathlib
+          import re
+          import subprocess
+
+          baseline = "d31c40b5ef5b1aefc695ea044d6ce62797993905"
+          changed = subprocess.check_output(
+              ["git", "diff", "--name-only", baseline + "..HEAD"], text=True
+          ).splitlines()
+          allowed = re.compile(
+              r"^(?:"
+              r"Wuji\.xcodeproj/project\.pbxproj|"
+              r"Wuji/(?:ContentView|WujiApp|DeepSeekProvider|StageB[^/]*|ISHStageBReadOnlyExecutor)\.swift|"
+              r"Wuji/StageBRealImportedProject/.*|"
+              r"WujiTests/WujiStageB.*Tests\.swift|"
+              r"Executor/WujiISHAdapter\.[ch]|"
+              r"\.github/workflows/stage-b-read-only-session\.yml|"
+              r"docs/PROJECT_CONTROL_CENTER\.md"
+              r")$"
+          )
+          unexpected = [path for path in changed if not allowed.fullmatch(path)]
+          if unexpected:
+              raise SystemExit("Stage B scope escaped: " + ", ".join(unexpected))
+
+          policy = pathlib.Path("Wuji/StageBReadOnlyPolicy.swift").read_text(encoding="utf-8")
+          contracts = pathlib.Path("Wuji/StageBContracts.swift").read_text(encoding="utf-8")
+          adapter = pathlib.Path("Executor/WujiISHAdapter.c").read_text(encoding="utf-8")
+          if "Set([\"list\", \"search\", \"read\"])" not in pathlib.Path("WujiTests/WujiStageBTests.swift").read_text(encoding="utf-8"):
+              raise SystemExit("Stage B typed allowlist assertion missing")
+          for forbidden in ["URLSession.shared", "Process(", "NSTask", "package install"]:
+              if forbidden in policy + contracts:
+                  raise SystemExit("forbidden generic capability in Stage B policy")
+          stage_b_start = adapter.index("static WujiISHRunResult *run_read_only_operation")
+          stage_b_end = adapter.index("static bool valid_sha256")
+          stage_b_body = adapter[stage_b_start:stage_b_end]
+          for forbidden in ["/bin/sh", '"-c"', "/bin/curl", "/bin/wget", "/bin/rm", "/bin/mv", "/bin/cp"]:
+              if forbidden in stage_b_body:
+                  raise SystemExit("forbidden executable in Stage B read-only entry")
+          for required in [
+              "/bin/ls", "/bin/busybox", '"find"', "/bin/grep", "/bin/cat",
+              "/wuji-stage-b/.wuji-stage-a-workspace.json", '"-prune"',
+              "workspace_kind == 2 ? 32768 : 4096",
+              "workspace_kind == 2 ? 512 : 256",
+              "valid_relative_path_with_limit(path, 512)",
+              "valid_relative_path_with_limit(relative_path, 1024)",
+              "wuji_ish_result_stdout_length",
+              "wuji_ish_result_stderr_length",
+          ]:
+              if required not in adapter:
+                  raise SystemExit("required Stage B adapter boundary missing")
+          print("STAGE_B_SCOPE_AUDIT=PASS")
+          print("STAGE_B_FORBIDDEN_CAPABILITY_SCAN=PASS")
+          PY
+          git diff --quiet d31c40b5ef5b1aefc695ea044d6ce62797993905..HEAD -- \
+            AGENTS.md docs/IMPLEMENTATION_PLAN.md \
+            ThirdParty/ish ThirdParty/minizip-ng \
+            Wuji/S3Fixture Wuji/S4Fixture \
+            WujiTests/WujiStageAImportTests.swift \
+            .github/workflows/s0-apple-build.yml \
+            .github/workflows/s1-ish-executor.yml \
+            .github/workflows/s2-provider.yml \
+            .github/workflows/s3-read-only-agent.yml \
+            .github/workflows/s4-modification-agent.yml \
+            .github/workflows/stage-a-production-entry.yml
+          echo 'STAGE_B_PROTECTED_HISTORY_UNCHANGED=PASS'
+
+  raw-log-audit:
+    name: Exact Stage B raw-log and artifact audit
+    if: always()
+    needs: stage-b-validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Download the completed Stage B validation job raw log
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          jobs_json="$RUNNER_TEMP/stage-b-jobs.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" > "$jobs_json"
+          job_id="$(python3 - "$jobs_json" <<'PY'
+          import json
+          import sys
+          jobs = json.load(open(sys.argv[1], encoding="utf-8"))["jobs"]
+          matches = [
+              job["id"] for job in jobs
+              if job["name"].endswith("Apple build, Stage B tests, real iSH, and real DeepSeek session")
+          ]
+          if len(matches) != 1:
+              raise SystemExit("Stage B validation job identity is not unique")
+          print(matches[0])
+          PY
+          )"
+          gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$job_id/logs" \
+            > "$RUNNER_TEMP/stage-b-validation-job.log"
+
+      - name: Scan raw log for exact secret and bounded success markers
+        shell: bash
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          WUJI_STAGE_B_MAIN_RESULT: ${{ needs.stage-b-validation.result }}
+        run: |
+          set -euo pipefail
+          set +x
+          export WUJI_STAGE_B_RAW_LOG="$RUNNER_TEMP/stage-b-validation-job.log"
+          python3 <<'PY'
+          import os
+          import pathlib
+
+          log = pathlib.Path(os.environ["WUJI_STAGE_B_RAW_LOG"]).read_bytes()
+          secret = os.environ["DEEPSEEK_API_KEY"].encode()
+          if not secret:
+              raise SystemExit("secret unavailable to raw-log scanner")
+          if secret in log:
+              raise SystemExit("exact secret found in Stage B raw log")
+          if os.environ["WUJI_STAGE_B_MAIN_RESULT"] == "success":
+              markers = [
+                  b"** BUILD SUCCEEDED **",
+                  b"** TEST SUCCEEDED **",
+                  b"STAGE_B_XCRESULT_AUDIT=PASS",
+                  b"STAGE_B_REQUEST_BODY_SECRET_TEST=PASS",
+                  b"STAGE_B_REAL_ISH_DEEPSEEK_LOOP=PASS",
+                  b"STAGE_B_COLD_RESTORE_NO_RETRY=PASS",
+                  b"STAGE_B_EXACT_SECRET_SCAN=PASS",
+                  b"STAGE_B_SCOPE_AUDIT=PASS",
+                  b"STAGE_B_FORBIDDEN_CAPABILITY_SCAN=PASS",
+                  b"STAGE_B_PROTECTED_HISTORY_UNCHANGED=PASS",
+              ]
+              missing = [marker.decode() for marker in markers if marker not in log]
+              if missing:
+                  raise SystemExit("required Stage B marker missing: " + ", ".join(missing))
+          print("STAGE_B_RAW_LOG_SECRET_SCAN=PASS")
+          PY
+
+      - name: Confirm this run published no artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --jq '.total_count')" = "0"
+          echo 'STAGE_B_ARTIFACT_COUNT=0'

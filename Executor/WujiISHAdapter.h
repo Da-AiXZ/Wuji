@@ -45,6 +45,10 @@ int wuji_ish_mount_s4_workspace(const char *host_path,
                                 char *error_buffer,
                                 size_t error_buffer_size);
 
+int wuji_ish_mount_stage_b_workspace(const char *host_path,
+                                     char *error_buffer,
+                                     size_t error_buffer_size);
+
 WujiISHRunResult *wuji_ish_run_self_test(WujiISHSelfTestCase test_case,
                                          size_t output_limit);
 
@@ -54,9 +58,14 @@ WujiISHRunResult *wuji_ish_run_read_only(WujiISHReadOnlyOperation operation,
                                          size_t output_limit);
 
 WujiISHRunResult *wuji_ish_run_s4_read_only(WujiISHReadOnlyOperation operation,
-                                            const char *relative_path,
-                                            const char *query,
-                                            size_t output_limit);
+                                             const char *relative_path,
+                                             const char *query,
+                                             size_t output_limit);
+
+WujiISHRunResult *wuji_ish_run_stage_b_read_only(WujiISHReadOnlyOperation operation,
+                                                  const char *relative_path,
+                                                  const char *query,
+                                                  size_t output_limit);
 
 WujiISHRunResult *wuji_ish_run_s4_edit(const char *relative_path,
                                        const char *expected_old,
@@ -74,6 +83,8 @@ WujiISHCancelDelivery wuji_ish_request_cancel(void);
 
 const char *wuji_ish_result_stdout(const WujiISHRunResult *result);
 const char *wuji_ish_result_stderr(const WujiISHRunResult *result);
+size_t wuji_ish_result_stdout_length(const WujiISHRunResult *result);
+size_t wuji_ish_result_stderr_length(const WujiISHRunResult *result);
 bool wuji_ish_result_stdout_eof(const WujiISHRunResult *result);
 bool wuji_ish_result_stderr_eof(const WujiISHRunResult *result);
 bool wuji_ish_result_root_exited(const WujiISHRunResult *result);

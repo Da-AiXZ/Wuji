@@ -24,7 +24,15 @@ struct ContentView: View {
                             .foregroundColor(.secondary)
                     } else {
                         ForEach(viewModel.records) { record in
-                            WorkspaceImportRow(record: record)
+                            if record.isReady {
+                                NavigationLink {
+                                    StageBSessionView(importRecord: record)
+                                } label: {
+                                    WorkspaceImportRow(record: record)
+                                }
+                            } else {
+                                WorkspaceImportRow(record: record)
+                            }
                         }
                     }
                     if viewModel.isImporting {
@@ -78,7 +86,11 @@ struct ContentView: View {
             .sheet(isPresented: $viewModel.isSettingsPresented) {
                 DeepSeekSettingsView(viewModel: viewModel)
             }
-            .task { await viewModel.load() }
+            .task {
+                if !StageBProbeRunner.isRequested {
+                    await viewModel.load()
+                }
+            }
             .alert("无极", isPresented: Binding(
                 get: { viewModel.notice != nil },
                 set: { if !$0 { viewModel.notice = nil } }

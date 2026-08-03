@@ -52,6 +52,8 @@ static bool g_workspace_mounted = false;
 static char g_workspace_source[4096];
 static bool g_s4_workspace_mounted = false;
 static char g_s4_workspace_source[4096];
+static bool g_stage_b_workspace_mounted = false;
+static char g_stage_b_workspace_source[4096];
 static struct task *g_init_task = NULL;
 static struct WujiISHRunResult *g_active_result = NULL;
 static int g_active_pid = -1;
@@ -214,6 +216,51 @@ int wuji_ish_mount_s4_workspace(const char *host_path,
     return 0;
 }
 
+int wuji_ish_mount_stage_b_workspace(const char *host_path,
+                                     char *error_buffer,
+                                     size_t error_buffer_size) {
+    if (host_path == NULL || host_path[0] == '\0') {
+        set_error(error_buffer, error_buffer_size, "invalid Stage B workspace path");
+        return -1;
+    }
+    char canonical_path[sizeof(g_stage_b_workspace_source)];
+    if (realpath(host_path, canonical_path) == NULL) {
+        set_error(error_buffer, error_buffer_size, "Stage B workspace canonicalization failed");
+        return -1;
+    }
+    struct stat status;
+    if (lstat(canonical_path, &status) != 0 || !S_ISDIR(status.st_mode)) {
+        set_error(error_buffer, error_buffer_size, "Stage B workspace is unavailable");
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_boot_lock);
+    if (!g_booted) {
+        set_error(error_buffer, error_buffer_size, "iSH is not prepared");
+        pthread_mutex_unlock(&g_boot_lock);
+        return -1;
+    }
+    if (g_stage_b_workspace_mounted) {
+        bool same_source = strcmp(g_stage_b_workspace_source, canonical_path) == 0;
+        if (!same_source)
+            set_error(error_buffer, error_buffer_size, "different Stage B workspace already mounted");
+        pthread_mutex_unlock(&g_boot_lock);
+        return same_source ? 0 : -1;
+    }
+
+    unsigned long flags = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC;
+    int error = do_mount(&realfs, canonical_path, "/wuji-stage-b", "", flags);
+    if (error < 0) {
+        set_error(error_buffer, error_buffer_size, "Stage B workspace mount failed");
+        pthread_mutex_unlock(&g_boot_lock);
+        return error;
+    }
+    snprintf(g_stage_b_workspace_source, sizeof(g_stage_b_workspace_source), "%s", canonical_path);
+    g_stage_b_workspace_mounted = true;
+    pthread_mutex_unlock(&g_boot_lock);
+    return 0;
+}
+
 static bool attach_host_fd(struct task *task, int guest_fd, int host_fd) {
     struct fd *fd = adhoc_fd_create(&realfs_fdops);
     if (fd == NULL)
@@ -282,11 +329,11 @@ static bool append_argument(char *buffer,
     return true;
 }
 
-static bool valid_relative_path(const char *path) {
+static bool valid_relative_path_with_limit(const char *path, size_t maximum_length) {
     if (path == NULL)
         return false;
     size_t length = strlen(path);
-    if (length > 512 || path[0] == '/' || path[0] == '\\')
+    if (length > maximum_length || path[0] == '/' || path[0] == '\\')
         return false;
     if (strchr(path, '\\') != NULL || strchr(path, '%') != NULL)
         return false;
@@ -313,6 +360,10 @@ static bool valid_relative_path(const char *path) {
     return true;
 }
 
+static bool valid_relative_path(const char *path) {
+    return valid_relative_path_with_limit(path, 512);
+}
+
 static bool build_guest_path(const char *relative_path, char *output, size_t output_size) {
     if (!valid_relative_path(relative_path))
         return false;
@@ -331,11 +382,20 @@ static bool build_s4_guest_path(const char *relative_path, char *output, size_t 
     return count > 0 && (size_t)count < output_size;
 }
 
-static bool valid_query(const char *query) {
+static bool build_stage_b_guest_path(const char *relative_path, char *output, size_t output_size) {
+    if (!valid_relative_path_with_limit(relative_path, 1024))
+        return false;
+    int count = relative_path[0] == '\0'
+        ? snprintf(output, output_size, "/wuji-stage-b")
+        : snprintf(output, output_size, "/wuji-stage-b/%s", relative_path);
+    return count > 0 && (size_t)count < output_size;
+}
+
+static bool valid_query(const char *query, size_t maximum_length) {
     if (query == NULL)
         return false;
     size_t length = strlen(query);
-    if (length == 0 || length > 256)
+    if (length == 0 || length > maximum_length)
         return false;
     for (size_t index = 0; index < length; index++) {
         unsigned char byte = (unsigned char)query[index];
@@ -515,14 +575,17 @@ static WujiISHRunResult *run_read_only_operation(WujiISHReadOnlyOperation operat
                                                  const char *query,
                                                  size_t output_limit,
                                                  bool mounted,
-                                                 bool s4_workspace) {
-    if (!mounted || output_limit == 0 || output_limit > 4096)
+                                                 int workspace_kind) {
+    size_t maximum_output = workspace_kind == 2 ? 32768 : 4096;
+    if (!mounted || output_limit == 0 || output_limit > maximum_output)
         return NULL;
 
-    char guest_path[1024];
-    bool valid_path = s4_workspace
-        ? build_s4_guest_path(relative_path, guest_path, sizeof(guest_path))
-        : build_guest_path(relative_path, guest_path, sizeof(guest_path));
+    char guest_path[2048];
+    bool valid_path = workspace_kind == 2
+        ? build_stage_b_guest_path(relative_path, guest_path, sizeof(guest_path))
+        : workspace_kind == 1
+            ? build_s4_guest_path(relative_path, guest_path, sizeof(guest_path))
+            : build_guest_path(relative_path, guest_path, sizeof(guest_path));
     if (!valid_path)
         return NULL;
 
@@ -541,19 +604,44 @@ static WujiISHRunResult *run_read_only_operation(WujiISHReadOnlyOperation operat
                 return NULL;
             break;
         case WUJI_ISH_READ_ONLY_SEARCH:
-            if (!valid_query(query))
+            if (!valid_query(query, workspace_kind == 2 ? 512 : 256))
                 return NULL;
-            executable = "/bin/grep";
-            argument_count = 8;
-            if (!append_argument(arguments, sizeof(arguments), &offset, executable) ||
-                !append_argument(arguments, sizeof(arguments), &offset, "-r") ||
-                !append_argument(arguments, sizeof(arguments), &offset, "-n") ||
-                !append_argument(arguments, sizeof(arguments), &offset, "-F") ||
-                !append_argument(arguments, sizeof(arguments), &offset, "-H") ||
-                !append_argument(arguments, sizeof(arguments), &offset, "--") ||
-                !append_argument(arguments, sizeof(arguments), &offset, query) ||
-                !append_argument(arguments, sizeof(arguments), &offset, guest_path))
-                return NULL;
+            if (workspace_kind == 2) {
+                executable = "/bin/busybox";
+                argument_count = 18;
+                if (!append_argument(arguments, sizeof(arguments), &offset, executable) ||
+                    !append_argument(arguments, sizeof(arguments), &offset, "find") ||
+                    !append_argument(arguments, sizeof(arguments), &offset, guest_path) ||
+                    !append_argument(arguments, sizeof(arguments), &offset, "-path") ||
+                    !append_argument(arguments, sizeof(arguments), &offset,
+                                     "/wuji-stage-b/.wuji-stage-a-workspace.json") ||
+                    !append_argument(arguments, sizeof(arguments), &offset, "-prune") ||
+                    !append_argument(arguments, sizeof(arguments), &offset, "-o") ||
+                    !append_argument(arguments, sizeof(arguments), &offset, "-type") ||
+                    !append_argument(arguments, sizeof(arguments), &offset, "f") ||
+                    !append_argument(arguments, sizeof(arguments), &offset, "-exec") ||
+                    !append_argument(arguments, sizeof(arguments), &offset, "/bin/grep") ||
+                    !append_argument(arguments, sizeof(arguments), &offset, "-n") ||
+                    !append_argument(arguments, sizeof(arguments), &offset, "-F") ||
+                    !append_argument(arguments, sizeof(arguments), &offset, "-H") ||
+                    !append_argument(arguments, sizeof(arguments), &offset, "--") ||
+                    !append_argument(arguments, sizeof(arguments), &offset, query) ||
+                    !append_argument(arguments, sizeof(arguments), &offset, "{}") ||
+                    !append_argument(arguments, sizeof(arguments), &offset, ";"))
+                    return NULL;
+            } else {
+                executable = "/bin/grep";
+                argument_count = 8;
+                if (!append_argument(arguments, sizeof(arguments), &offset, executable) ||
+                    !append_argument(arguments, sizeof(arguments), &offset, "-r") ||
+                    !append_argument(arguments, sizeof(arguments), &offset, "-n") ||
+                    !append_argument(arguments, sizeof(arguments), &offset, "-F") ||
+                    !append_argument(arguments, sizeof(arguments), &offset, "-H") ||
+                    !append_argument(arguments, sizeof(arguments), &offset, "--") ||
+                    !append_argument(arguments, sizeof(arguments), &offset, query) ||
+                    !append_argument(arguments, sizeof(arguments), &offset, guest_path))
+                    return NULL;
+            }
             break;
         case WUJI_ISH_READ_ONLY_READ:
             executable = "/bin/cat";
@@ -579,7 +667,7 @@ WujiISHRunResult *wuji_ish_run_read_only(WujiISHReadOnlyOperation operation,
         query,
         output_limit,
         g_workspace_mounted,
-        false
+        0
     );
 }
 
@@ -593,7 +681,21 @@ WujiISHRunResult *wuji_ish_run_s4_read_only(WujiISHReadOnlyOperation operation,
         query,
         output_limit,
         g_s4_workspace_mounted,
-        true
+        1
+    );
+}
+
+WujiISHRunResult *wuji_ish_run_stage_b_read_only(WujiISHReadOnlyOperation operation,
+                                                  const char *relative_path,
+                                                  const char *query,
+                                                  size_t output_limit) {
+    return run_read_only_operation(
+        operation,
+        relative_path,
+        query,
+        output_limit,
+        g_stage_b_workspace_mounted,
+        2
     );
 }
 
@@ -740,6 +842,8 @@ WujiISHCancelDelivery wuji_ish_request_cancel(void) {
 
 const char *wuji_ish_result_stdout(const WujiISHRunResult *result) { return result->stdout_stream.bytes; }
 const char *wuji_ish_result_stderr(const WujiISHRunResult *result) { return result->stderr_stream.bytes; }
+size_t wuji_ish_result_stdout_length(const WujiISHRunResult *result) { return result->stdout_stream.length; }
+size_t wuji_ish_result_stderr_length(const WujiISHRunResult *result) { return result->stderr_stream.length; }
 bool wuji_ish_result_stdout_eof(const WujiISHRunResult *result) { return result->stdout_stream.eof; }
 bool wuji_ish_result_stderr_eof(const WujiISHRunResult *result) { return result->stderr_stream.eof; }
 bool wuji_ish_result_root_exited(const WujiISHRunResult *result) { return result->root_exited; }

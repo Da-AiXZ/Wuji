@@ -461,18 +461,7 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
 
         let body: Data
         do {
-            let messages = request.messages.map(OpenAIChatMessage.init)
-            let tools = request.tools.map {
-                OpenAIToolDefinitionEnvelope(type: "function", function: $0)
-            }
-            body = try JSONEncoder().encode(OpenAIChatCompletionRequest(
-                model: model,
-                messages: messages,
-                maxTokens: 10_000,
-                stream: false,
-                tools: tools.isEmpty ? nil : tools,
-                toolChoice: nil
-            ))
+            body = try DeepSeekRequestBodyBounds.encode(request: request, model: model)
             guard body.count <= ProviderLimits.maximumRequestBodyBytes else {
                 return await finishInferenceFailure(
                     .invalidInput,
@@ -876,6 +865,32 @@ final class DeepSeekProvider: CloudProvider, AgentInferenceProvider, @unchecked 
             responseSHA256: responseSHA256,
             toolExchangeDiagnostic: toolExchangeDiagnostic
         )
+    }
+}
+
+enum DeepSeekRequestBodyBounds {
+    static func maximumEncodedByteCount(for request: ProviderInferenceRequest) throws -> Int {
+        // Backslash is a valid one-byte model character with the maximum JSON expansion.
+        let worstCaseModel = String(repeating: "\\", count: ProviderLimits.maximumModelBytes)
+        return try encode(request: request, model: worstCaseModel).count
+    }
+
+    fileprivate static func encode(
+        request: ProviderInferenceRequest,
+        model: String
+    ) throws -> Data {
+        let messages = request.messages.map(OpenAIChatMessage.init)
+        let tools = request.tools.map {
+            OpenAIToolDefinitionEnvelope(type: "function", function: $0)
+        }
+        return try JSONEncoder().encode(OpenAIChatCompletionRequest(
+            model: model,
+            messages: messages,
+            maxTokens: 10_000,
+            stream: false,
+            tools: tools.isEmpty ? nil : tools,
+            toolChoice: nil
+        ))
     }
 }
 

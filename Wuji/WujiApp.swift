@@ -7,6 +7,7 @@ struct WujiApp: App {
     init() {
         S3ProbeRunner.startIfRequested()
         S4ProbeRunner.startIfRequested()
+        StageBProbeRunner.startIfRequested()
     }
 
     var body: some Scene {

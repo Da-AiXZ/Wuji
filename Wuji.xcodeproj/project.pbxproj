@@ -64,6 +64,16 @@
 		010000000000000000000037 /* mz_strm_split.c in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000003A /* mz_strm_split.c */; };
 		010000000000000000000038 /* mz_zip.c in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000003B /* mz_zip.c */; };
 		010000000000000000000039 /* mz_zip_rw.c in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000003C /* mz_zip_rw.c */; };
+		01000000000000000000003A /* StageBContracts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000003F /* StageBContracts.swift */; };
+		01000000000000000000003B /* StageBSessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000040 /* StageBSessionStore.swift */; };
+		01000000000000000000003C /* StageBReadOnlyPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000041 /* StageBReadOnlyPolicy.swift */; };
+		01000000000000000000003D /* ISHStageBReadOnlyExecutor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000042 /* ISHStageBReadOnlyExecutor.swift */; };
+		01000000000000000000003E /* StageBReadOnlyAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000043 /* StageBReadOnlyAgent.swift */; };
+		01000000000000000000003F /* StageBView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000044 /* StageBView.swift */; };
+		010000000000000000000040 /* StageBProbeRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000045 /* StageBProbeRunner.swift */; };
+		010000000000000000000041 /* StageBRealImportedProject in Resources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000046 /* StageBRealImportedProject */; };
+		010000000000000000000042 /* WujiStageBTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000047 /* WujiStageBTests.swift */; };
+		010000000000000000000043 /* WujiStageBISHIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000048 /* WujiStageBISHIntegrationTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -139,6 +149,16 @@
 		02000000000000000000003C /* mz_zip_rw.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = mz_zip_rw.c; sourceTree = "<group>"; };
 		02000000000000000000003D /* WujiStageAZipBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = WujiStageAZipBridge.h; sourceTree = "<group>"; };
 		02000000000000000000003E /* mz_config.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = StageAMinizipConfig/mz_config.h; sourceTree = "<group>"; };
+		02000000000000000000003F /* StageBContracts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageBContracts.swift; sourceTree = "<group>"; };
+		020000000000000000000040 /* StageBSessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageBSessionStore.swift; sourceTree = "<group>"; };
+		020000000000000000000041 /* StageBReadOnlyPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageBReadOnlyPolicy.swift; sourceTree = "<group>"; };
+		020000000000000000000042 /* ISHStageBReadOnlyExecutor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ISHStageBReadOnlyExecutor.swift; sourceTree = "<group>"; };
+		020000000000000000000043 /* StageBReadOnlyAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageBReadOnlyAgent.swift; sourceTree = "<group>"; };
+		020000000000000000000044 /* StageBView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageBView.swift; sourceTree = "<group>"; };
+		020000000000000000000045 /* StageBProbeRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageBProbeRunner.swift; sourceTree = "<group>"; };
+		020000000000000000000046 /* StageBRealImportedProject */ = {isa = PBXFileReference; lastKnownFileType = folder; path = StageBRealImportedProject; sourceTree = "<group>"; };
+		020000000000000000000047 /* WujiStageBTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiStageBTests.swift; sourceTree = "<group>"; };
+		020000000000000000000048 /* WujiStageBISHIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiStageBISHIntegrationTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -212,6 +232,14 @@
 				02000000000000000000002C /* DeepSeekSecureConfiguration.swift */,
 				02000000000000000000002D /* StageAViewModel.swift */,
 				02000000000000000000002E /* DeepSeekSettingsView.swift */,
+				02000000000000000000003F /* StageBContracts.swift */,
+				020000000000000000000040 /* StageBSessionStore.swift */,
+				020000000000000000000041 /* StageBReadOnlyPolicy.swift */,
+				020000000000000000000042 /* ISHStageBReadOnlyExecutor.swift */,
+				020000000000000000000043 /* StageBReadOnlyAgent.swift */,
+				020000000000000000000044 /* StageBView.swift */,
+				020000000000000000000045 /* StageBProbeRunner.swift */,
+				020000000000000000000046 /* StageBRealImportedProject */,
 				02000000000000000000000C /* rootfs.tar.gz */,
 				020000000000000000000004 /* Assets.xcassets */,
 				020000000000000000000005 /* Info.plist */,
@@ -235,6 +263,8 @@
 				020000000000000000000027 /* WujiS4ApprovalViewTests.swift */,
 				02000000000000000000002F /* WujiStageAImportTests.swift */,
 				020000000000000000000030 /* WujiStageASecureConfigurationTests.swift */,
+				020000000000000000000047 /* WujiStageBTests.swift */,
+				020000000000000000000048 /* WujiStageBISHIntegrationTests.swift */,
 			);
 			path = WujiTests;
 			sourceTree = "<group>";
@@ -352,6 +382,7 @@
 				010000000000000000000009 /* rootfs.tar.gz in Resources */,
 				010000000000000000000015 /* S3Fixture in Resources */,
 				01000000000000000000001F /* S4Fixture in Resources */,
+				010000000000000000000041 /* StageBRealImportedProject in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -397,6 +428,13 @@
 				010000000000000000000029 /* DeepSeekSecureConfiguration.swift in Sources */,
 				01000000000000000000002A /* StageAViewModel.swift in Sources */,
 				01000000000000000000002B /* DeepSeekSettingsView.swift in Sources */,
+				01000000000000000000003A /* StageBContracts.swift in Sources */,
+				01000000000000000000003B /* StageBSessionStore.swift in Sources */,
+				01000000000000000000003C /* StageBReadOnlyPolicy.swift in Sources */,
+				01000000000000000000003D /* ISHStageBReadOnlyExecutor.swift in Sources */,
+				01000000000000000000003E /* StageBReadOnlyAgent.swift in Sources */,
+				01000000000000000000003F /* StageBView.swift in Sources */,
+				010000000000000000000040 /* StageBProbeRunner.swift in Sources */,
 				01000000000000000000002E /* WujiStageAZipBridge.c in Sources */,
 				01000000000000000000002F /* mz_crypt.c in Sources */,
 				010000000000000000000030 /* mz_os.c in Sources */,
@@ -429,6 +467,8 @@
 				010000000000000000000024 /* WujiS4ApprovalViewTests.swift in Sources */,
 				01000000000000000000002C /* WujiStageAImportTests.swift in Sources */,
 				01000000000000000000002D /* WujiStageASecureConfigurationTests.swift in Sources */,
+				010000000000000000000042 /* WujiStageBTests.swift in Sources */,
+				010000000000000000000043 /* WujiStageBISHIntegrationTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
