@@ -48,9 +48,33 @@ actor StageCTaskStore {
         recordsURL = rootURL.appendingPathComponent("Tasks", isDirectory: true)
         encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        encoder.dateEncodingStrategy = .millisecondsSince1970
+        encoder.dateEncodingStrategy = .custom { date, encoder in
+            var container = encoder.singleValueContainer()
+            let milliseconds = date.timeIntervalSince1970 * 1_000
+            guard milliseconds.isFinite,
+                  milliseconds >= Double(Int64.min),
+                  milliseconds <= Double(Int64.max) else {
+                throw EncodingError.invalidValue(
+                    date,
+                    .init(codingPath: encoder.codingPath, debugDescription: "Date is outside durable range")
+                )
+            }
+            try container.encode(Int64(milliseconds.rounded()))
+        }
         decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .millisecondsSince1970
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let milliseconds = try container.decode(Double.self)
+            guard milliseconds.isFinite,
+                  milliseconds >= Double(Int64.min),
+                  milliseconds <= Double(Int64.max) else {
+                throw DecodingError.dataCorruptedError(
+                    in: container,
+                    debugDescription: "Durable date is outside supported range"
+                )
+            }
+            return Date(timeIntervalSince1970: milliseconds.rounded() / 1_000)
+        }
         try fileManager.createDirectory(at: recordsURL, withIntermediateDirectories: true)
     }
 
@@ -112,15 +136,14 @@ actor StageCTaskStore {
             attempts: [],
             completion: nil
         )
-        try persist(record)
-        return record
+        return try persist(record)
     }
 
     func record(_ record: StageCTaskRecord) throws {
         guard fileManager.fileExists(atPath: recordURL(record.id).path) else {
             throw StageCTaskStoreError.notFound
         }
-        try persist(record)
+        _ = try persist(record)
     }
 
     func update(
@@ -141,8 +164,7 @@ actor StageCTaskStore {
         if let attempt { record.attempts.append(attempt) }
         if let completion { record.completion = completion }
         record.updatedAt = now
-        try persist(record)
-        return record
+        return try persist(record)
     }
 
     func snapshot(taskID: UUID) throws -> StageCTaskRecord { try load(taskID) }
@@ -179,20 +201,22 @@ actor StageCTaskStore {
         return record
     }
 
-    private func persist(_ record: StageCTaskRecord) throws {
-        guard valid(record) else { throw StageCTaskStoreError.invalidRecord }
+    private func persist(_ record: StageCTaskRecord) throws -> StageCTaskRecord {
         do {
             let data = try encoder.encode(record)
             guard data.count <= limits.maximumDurableEvidenceBytes else {
                 throw StageCTaskStoreError.evidenceLimit
             }
-            if record.proposal != nil {
-                let proposalData = try encoder.encode(record.proposal)
+            let canonical = try decoder.decode(StageCTaskRecord.self, from: data)
+            guard valid(canonical) else { throw StageCTaskStoreError.invalidRecord }
+            if canonical.proposal != nil {
+                let proposalData = try encoder.encode(canonical.proposal)
                 guard proposalData.count <= limits.maximumProposalRecordBytes else {
                     throw StageCTaskStoreError.evidenceLimit
                 }
             }
             try data.write(to: recordURL(record.id), options: [.atomic])
+            return canonical
         } catch let error as StageCTaskStoreError {
             throw error
         } catch {

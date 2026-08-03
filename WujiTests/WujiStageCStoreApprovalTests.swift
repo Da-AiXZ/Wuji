@@ -50,6 +50,40 @@ final class WujiStageCStoreApprovalTests: XCTestCase {
         let durable = try await prepared.taskStore.snapshot(taskID: prepared.task.id)
         XCTAssertEqual(durable.approvals.map(\.state), [.pending, .approved])
         XCTAssertTrue(durable.approvals.allSatisfy { $0.request == request })
+        let operationID = UUID()
+        let attemptID = UUID()
+        let input = ProviderDigest.sha256Hex("sub-millisecond-attempt")
+        let intent = StageCAttemptEvidence(
+            taskID: prepared.task.id,
+            operationID: operationID,
+            attemptID: attemptID,
+            ioKind: .provider,
+            inputSHA256: input,
+            toolCallID: nil,
+            recordedAt: Date(timeIntervalSince1970: 2_000.000499),
+            phase: .intentRecorded,
+            resultSHA256: nil,
+            facts: nil
+        )
+        _ = try await prepared.taskStore.update(taskID: prepared.task.id, attempt: intent)
+        _ = try await prepared.taskStore.update(
+            taskID: prepared.task.id,
+            attempt: .init(
+                taskID: prepared.task.id,
+                operationID: operationID,
+                attemptID: attemptID,
+                ioKind: .provider,
+                inputSHA256: input,
+                toolCallID: nil,
+                recordedAt: Date(timeIntervalSince1970: 2_000.000501),
+                phase: .succeeded,
+                resultSHA256: ProviderDigest.sha256Hex("terminal"),
+                facts: nil
+            )
+        )
+        let paired = try await prepared.taskStore.snapshot(taskID: prepared.task.id)
+        XCTAssertEqual(paired.attempts.count, 2)
+        XCTAssertLessThanOrEqual(paired.attempts[0].recordedAt, paired.attempts[1].recordedAt)
     }
 
     func testExpiredWrongNonceAndBindingDriftFailClosed() async throws {
