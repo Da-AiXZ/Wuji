@@ -1000,12 +1000,15 @@ final class StageCEditingAgent: @unchecked Sendable {
             facts: nil,
             succeeded: true
         )
-        _ = try await taskStore.update(
+        let persisted = try await taskStore.update(
             taskID: task.id,
             phase: .completed,
             completion: completion
         )
-        return .completed(completion)
+        guard let canonicalCompletion = persisted.completion else {
+            throw StageCError.evidenceFailure
+        }
+        return .completed(canonicalCompletion)
     }
 
     private func reliableMutationSucceeded(

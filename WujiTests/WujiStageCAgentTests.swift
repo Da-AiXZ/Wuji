@@ -140,6 +140,7 @@ final class WujiStageCAgentTests: XCTestCase {
     func testCompletedColdReopenCreatesZeroProviderAndExecutorAttempts() async throws {
         let prepared = try await StageCTestSupport.prepare()
         defer { prepared.cleanup() }
+        let fixedNow = Date(timeIntervalSince1970: 4_000.123_456)
         let provider = StageCScriptedProvider([
             .decision(.toolCalls(
                 ProviderTurnMessage(role: .assistant, toolCalls: [StageCTestSupport.editCall(id: "complete-edit")]),
@@ -151,13 +152,18 @@ final class WujiStageCAgentTests: XCTestCase {
             targetURL: prepared.targetURL, taskStore: prepared.taskStore,
             taskID: prepared.task.id, outcome: .applied
         )
-        let agent = makeAgent(prepared, provider: provider, editor: editor, approval: .approve)
+        let agent = makeAgent(
+            prepared, provider: provider, editor: editor, approval: .approve,
+            now: { fixedNow }
+        )
         let firstOutcome = await agent.run()
         guard case let .completed(first) = firstOutcome else {
             let snapshot = try await prepared.taskStore.snapshot(taskID: prepared.task.id)
             return XCTFail("not complete: outcome=\(firstOutcome) \(diagnostic(snapshot))")
         }
         let beforeSnapshot = try await prepared.taskStore.snapshot(taskID: prepared.task.id)
+        let durableCompletion = try XCTUnwrap(beforeSnapshot.completion)
+        XCTAssertEqual(first, durableCompletion)
         let before = beforeSnapshot.attempts.count
         let task = try await prepared.taskStore.snapshot(taskID: prepared.task.id)
         let coldProvider = StageCScriptedProvider([])
@@ -531,14 +537,15 @@ final class WujiStageCAgentTests: XCTestCase {
         _ prepared: StageCTestPrepared,
         provider: StageCScriptedProvider,
         editor: StageCMockEditExecutor,
-        approval: StageCImmediateApproval.Mode
+        approval: StageCImmediateApproval.Mode,
+        now: @escaping @Sendable () -> Date = Date.init
     ) -> StageCEditingAgent {
         StageCEditingAgent(
             provider: provider, readExecutor: StageCMockReadExecutor(),
             editExecutor: editor, approvalAuthorizer: StageCImmediateApproval(approval),
             taskStore: prepared.taskStore, task: prepared.task, session: prepared.session,
             workspace: prepared.workspace, ruleSet: prepared.ruleSet,
-            limits: prepared.limits, readLimits: prepared.readLimits
+            limits: prepared.limits, readLimits: prepared.readLimits, now: now
         )
     }
 
