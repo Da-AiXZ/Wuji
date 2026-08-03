@@ -424,7 +424,7 @@ jobs:
           adapter = pathlib.Path("Executor/WujiISHAdapter.c").read_text(encoding="utf-8")
           if "Set([\"list\", \"search\", \"read\"])" not in pathlib.Path("WujiTests/WujiStageBTests.swift").read_text(encoding="utf-8"):
               raise SystemExit("Stage B typed allowlist assertion missing")
-          for forbidden in ["URLSession.shared", "Process(", "NSTask", "package install"]:
+          for forbidden in ["URLSession.shared", "Process(", "NSTask", "import Network"]:
               if forbidden in policy + contracts:
                   raise SystemExit("forbidden generic capability in Stage B policy")
           stage_b_start = adapter.index("static WujiISHRunResult *run_read_only_operation")

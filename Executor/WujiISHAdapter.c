@@ -248,7 +248,7 @@ int wuji_ish_mount_stage_b_workspace(const char *host_path,
         return same_source ? 0 : -1;
     }
 
-    unsigned long flags = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC;
+    int flags = MS_READONLY_ | MS_NOSUID_ | MS_NODEV_ | MS_NOEXEC_;
     int error = do_mount(&realfs, canonical_path, "/wuji-stage-b", "", flags);
     if (error < 0) {
         set_error(error_buffer, error_buffer_size, "Stage B workspace mount failed");
