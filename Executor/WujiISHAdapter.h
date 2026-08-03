@@ -49,6 +49,10 @@ int wuji_ish_mount_stage_b_workspace(const char *host_path,
                                      char *error_buffer,
                                      size_t error_buffer_size);
 
+int wuji_ish_mount_stage_c_workspace(const char *host_path,
+                                     char *error_buffer,
+                                     size_t error_buffer_size);
+
 WujiISHRunResult *wuji_ish_run_self_test(WujiISHSelfTestCase test_case,
                                          size_t output_limit);
 

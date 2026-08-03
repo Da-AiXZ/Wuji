@@ -20,8 +20,10 @@ final class WujiStageCAgentTests: XCTestCase {
             outcome: .applied
         )
         let agent = makeAgent(prepared, provider: provider, editor: editor, approval: .approve)
-        guard case let .completed(completion) = await agent.run() else {
-            return XCTFail("Stage C did not complete")
+        let outcome = await agent.run()
+        guard case let .completed(completion) = outcome else {
+            let snapshot = try await prepared.taskStore.snapshot(taskID: prepared.task.id)
+            return XCTFail("Stage C did not complete: outcome=\(outcome) \(diagnostic(snapshot))")
         }
         let snapshot = try await prepared.taskStore.snapshot(taskID: prepared.task.id)
         let sawIntent = await editor.intentWasVisible()
@@ -150,7 +152,11 @@ final class WujiStageCAgentTests: XCTestCase {
             taskID: prepared.task.id, outcome: .applied
         )
         let agent = makeAgent(prepared, provider: provider, editor: editor, approval: .approve)
-        guard case let .completed(first) = await agent.run() else { return XCTFail("not complete") }
+        let firstOutcome = await agent.run()
+        guard case let .completed(first) = firstOutcome else {
+            let snapshot = try await prepared.taskStore.snapshot(taskID: prepared.task.id)
+            return XCTFail("not complete: outcome=\(firstOutcome) \(diagnostic(snapshot))")
+        }
         let beforeSnapshot = try await prepared.taskStore.snapshot(taskID: prepared.task.id)
         let before = beforeSnapshot.attempts.count
         let task = try await prepared.taskStore.snapshot(taskID: prepared.task.id)
@@ -262,9 +268,9 @@ final class WujiStageCAgentTests: XCTestCase {
             proposal: proposal,
             approval: .init(
                 request: request,
-                state: .consumed,
+                state: .pending,
                 recordedAt: request.createdAt,
-                grant: grant
+                grant: nil
             ),
             attempt: .init(
                 taskID: prepared.task.id,
@@ -277,6 +283,26 @@ final class WujiStageCAgentTests: XCTestCase {
                 phase: .intentRecorded,
                 resultSHA256: nil,
                 facts: nil
+            )
+        )
+        _ = try await prepared.taskStore.update(
+            taskID: prepared.task.id,
+            phase: .approved,
+            approval: .init(
+                request: request,
+                state: .approved,
+                recordedAt: request.createdAt,
+                grant: grant
+            )
+        )
+        _ = try await prepared.taskStore.update(
+            taskID: prepared.task.id,
+            phase: .mutating,
+            approval: .init(
+                request: request,
+                state: .consumed,
+                recordedAt: request.createdAt,
+                grant: grant
             )
         )
         _ = try await prepared.taskStore.update(
@@ -457,12 +483,16 @@ final class WujiStageCAgentTests: XCTestCase {
             taskID: prepared.task.id,
             outcome: .applied
         )
-        guard case .completed = await makeAgent(
+        let setupOutcome = await makeAgent(
             prepared,
             provider: provider,
             editor: editor,
             approval: .approve
-        ).run() else { return XCTFail("setup did not complete") }
+        ).run()
+        guard case .completed = setupOutcome else {
+            let snapshot = try await prepared.taskStore.snapshot(taskID: prepared.task.id)
+            return XCTFail("setup did not complete: outcome=\(setupOutcome) \(diagnostic(snapshot))")
+        }
         var interrupted = try await prepared.taskStore.snapshot(taskID: prepared.task.id)
         interrupted.phase = .running
         interrupted.completion = nil
@@ -510,6 +540,13 @@ final class WujiStageCAgentTests: XCTestCase {
             workspace: prepared.workspace, ruleSet: prepared.ruleSet,
             limits: prepared.limits, readLimits: prepared.readLimits
         )
+    }
+
+    private func diagnostic(_ record: StageCTaskRecord) -> String {
+        let attempts = Dictionary(grouping: record.attempts, by: { $0.ioKind.rawValue })
+            .mapValues(\.count)
+        return "phase=\(record.phase.rawValue) finish=\(record.providerFinishObserved) "
+            + "approvals=\(record.approvals.map { $0.state.rawValue }) attempts=\(attempts)"
     }
 }
 

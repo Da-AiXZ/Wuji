@@ -257,6 +257,8 @@ struct StageCEditPolicy: Sendable {
               proposal.relativePath == task.targetRelativePath else {
             throw StageCError.approvalTampered
         }
+        let createdAt = durableDate(now)
+        let expiresAt = durableDate(now.addingTimeInterval(limits.maximumApprovalSeconds))
         return StageCApprovalRequest(
             requestID: requestID,
             taskID: task.id,
@@ -275,8 +277,8 @@ struct StageCEditPolicy: Sendable {
             afterSHA256: proposal.afterSHA256,
             diffSHA256: proposal.diffSHA256,
             nonce: nonce,
-            createdAt: now,
-            expiresAt: now.addingTimeInterval(limits.maximumApprovalSeconds)
+            createdAt: createdAt,
+            expiresAt: expiresAt
         )
     }
 
@@ -433,5 +435,9 @@ struct StageCEditPolicy: Sendable {
         let candidateComponents = candidate.pathComponents
         return candidateComponents.count >= rootComponents.count
             && Array(candidateComponents.prefix(rootComponents.count)) == rootComponents
+    }
+
+    private func durableDate(_ date: Date) -> Date {
+        Date(timeIntervalSince1970: (date.timeIntervalSince1970 * 1_000).rounded() / 1_000)
     }
 }

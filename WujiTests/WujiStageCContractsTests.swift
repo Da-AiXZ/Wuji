@@ -216,6 +216,7 @@ final class WujiStageCContractsTests: XCTestCase {
         ], previouslyUsedIDs: [], baseline: try linkPolicy.captureWorkspaceBaseline())) {
             XCTAssertEqual($0 as? StageCError, .symlinkRejected)
         }
+        try FileManager.default.removeItem(at: linkURL)
 
         let ordinaryName = prepared.workspace.canonicalRootURL
             .appendingPathComponent("notes.gitignore.txt")

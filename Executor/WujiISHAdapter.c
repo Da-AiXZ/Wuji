@@ -55,6 +55,8 @@ static bool g_s4_workspace_mounted = false;
 static char g_s4_workspace_source[4096];
 static bool g_stage_b_workspace_mounted = false;
 static char g_stage_b_workspace_source[4096];
+static bool g_stage_c_workspace_mounted = false;
+static char g_stage_c_workspace_source[4096];
 static struct task *g_init_task = NULL;
 static struct WujiISHRunResult *g_active_result = NULL;
 static int g_active_pid = -1;
@@ -262,6 +264,51 @@ int wuji_ish_mount_stage_b_workspace(const char *host_path,
     return 0;
 }
 
+int wuji_ish_mount_stage_c_workspace(const char *host_path,
+                                     char *error_buffer,
+                                     size_t error_buffer_size) {
+    if (host_path == NULL || host_path[0] == '\0') {
+        set_error(error_buffer, error_buffer_size, "invalid Stage C workspace path");
+        return -1;
+    }
+    char canonical_path[sizeof(g_stage_c_workspace_source)];
+    if (realpath(host_path, canonical_path) == NULL) {
+        set_error(error_buffer, error_buffer_size, "Stage C workspace canonicalization failed");
+        return -1;
+    }
+    struct stat info;
+    if (stat(canonical_path, &info) < 0 || !S_ISDIR(info.st_mode)) {
+        set_error(error_buffer, error_buffer_size, "Stage C workspace is unavailable");
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_boot_lock);
+    if (!g_booted) {
+        set_error(error_buffer, error_buffer_size, "iSH is not prepared");
+        pthread_mutex_unlock(&g_boot_lock);
+        return -1;
+    }
+    if (g_stage_c_workspace_mounted) {
+        bool same_source = strcmp(g_stage_c_workspace_source, canonical_path) == 0;
+        if (!same_source)
+            set_error(error_buffer, error_buffer_size, "different Stage C workspace already mounted");
+        pthread_mutex_unlock(&g_boot_lock);
+        return same_source ? 0 : -1;
+    }
+
+    int flags = MS_NOSUID_ | MS_NODEV_ | MS_NOEXEC_;
+    int error = do_mount(&realfs, canonical_path, "/wuji-stage-c", "", flags);
+    if (error < 0) {
+        set_error(error_buffer, error_buffer_size, "Stage C workspace mount failed");
+        pthread_mutex_unlock(&g_boot_lock);
+        return error;
+    }
+    snprintf(g_stage_c_workspace_source, sizeof(g_stage_c_workspace_source), "%s", canonical_path);
+    g_stage_c_workspace_mounted = true;
+    pthread_mutex_unlock(&g_boot_lock);
+    return 0;
+}
+
 static bool attach_host_fd(struct task *task, int guest_fd, int host_fd) {
     struct fd *fd = adhoc_fd_create(&realfs_fdops);
     if (fd == NULL)
@@ -389,6 +436,15 @@ static bool build_stage_b_guest_path(const char *relative_path, char *output, si
     int count = relative_path[0] == '\0'
         ? snprintf(output, output_size, "/wuji-stage-b")
         : snprintf(output, output_size, "/wuji-stage-b/%s", relative_path);
+    return count > 0 && (size_t)count < output_size;
+}
+
+static bool build_stage_c_guest_path(const char *relative_path, char *output, size_t output_size) {
+    if (!valid_relative_path_with_limit(relative_path, 1024))
+        return false;
+    int count = relative_path[0] == '\0'
+        ? snprintf(output, output_size, "/wuji-stage-c")
+        : snprintf(output, output_size, "/wuji-stage-c/%s", relative_path);
     return count > 0 && (size_t)count < output_size;
 }
 
@@ -747,7 +803,7 @@ WujiISHRunResult *wuji_ish_run_stage_c_edit(const char *relative_path,
                                             const char *before_sha256,
                                             const char *after_sha256,
                                             size_t output_limit) {
-    if (!g_stage_b_workspace_mounted || output_limit == 0 || output_limit > 32768 ||
+    if (!g_stage_c_workspace_mounted || output_limit == 0 || output_limit > 32768 ||
         relative_path == NULL || expected_old == NULL || replacement == NULL ||
         !valid_sha256(before_sha256) || !valid_sha256(after_sha256) ||
         strcasecmp(relative_path, ".wuji-stage-a-workspace.json") == 0 ||
@@ -758,7 +814,7 @@ WujiISHRunResult *wuji_ish_run_stage_c_edit(const char *relative_path,
         return NULL;
 
     char guest_path[2048];
-    if (!build_stage_b_guest_path(relative_path, guest_path, sizeof(guest_path)))
+    if (!build_stage_c_guest_path(relative_path, guest_path, sizeof(guest_path)))
         return NULL;
     char arguments[12288] = {0};
     size_t offset = 0;

@@ -91,7 +91,7 @@ final class ISHStageCEditExecutor: StageCEditExecuting, @unchecked Sendable {
             guard prepareStatus == 0 else { return false }
             error = [CChar](repeating: 0, count: 512)
             let mountStatus = workspace.canonicalRootURL.path.withCString {
-                wuji_ish_mount_stage_b_workspace($0, &error, error.count)
+                wuji_ish_mount_stage_c_workspace($0, &error, error.count)
             }
             guard mountStatus == 0 else { return false }
             prepared = true

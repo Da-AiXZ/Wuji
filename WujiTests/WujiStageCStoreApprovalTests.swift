@@ -9,7 +9,7 @@ final class WujiStageCStoreApprovalTests: XCTestCase {
         let proposal = try prepared.policy.proposeEdit([
             StageCTestSupport.editCall(id: "approval-binding")
         ], previouslyUsedIDs: [], baseline: try prepared.policy.captureWorkspaceBaseline())
-        let now = Date(timeIntervalSince1970: 1_000)
+        let now = Date(timeIntervalSince1970: 1_000.123456)
         let request = try prepared.policy.approvalRequest(for: proposal, now: now)
         let grant = StageCApprovalGrant(
             requestID: request.requestID,
@@ -26,6 +26,30 @@ final class WujiStageCStoreApprovalTests: XCTestCase {
         XCTAssertEqual(request.goalBindingSHA256, prepared.task.goalBindingSHA256)
         XCTAssertEqual(request.ruleSetBindingSHA256, prepared.task.ruleSetBindingSHA256)
         XCTAssertEqual(request.proposalSHA256, proposal.proposalSHA256)
+        _ = try await prepared.taskStore.update(
+            taskID: prepared.task.id,
+            phase: .pendingApproval,
+            proposal: proposal,
+            approval: .init(
+                request: request,
+                state: .pending,
+                recordedAt: request.createdAt,
+                grant: nil
+            )
+        )
+        _ = try await prepared.taskStore.update(
+            taskID: prepared.task.id,
+            phase: .approved,
+            approval: .init(
+                request: request,
+                state: .approved,
+                recordedAt: grant.approvedAt,
+                grant: grant
+            )
+        )
+        let durable = try await prepared.taskStore.snapshot(taskID: prepared.task.id)
+        XCTAssertEqual(durable.approvals.map(\.state), [.pending, .approved])
+        XCTAssertTrue(durable.approvals.allSatisfy { $0.request == request })
     }
 
     func testExpiredWrongNonceAndBindingDriftFailClosed() async throws {
