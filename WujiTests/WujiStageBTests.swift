@@ -222,6 +222,335 @@ final class WujiStageBTests: XCTestCase {
         })
     }
 
+    func testColdResumeAfterReliableProviderSuccessContinuesToToolWithoutResendingProvider() async throws {
+        let fixture = try makeFixture(
+            nestedDirectory: "Sources/Feature",
+            fileName: "FeatureFlag.swift",
+            query: "NestedFeatureReady"
+        )
+        defer { fixture.cleanup() }
+        let prepared = try await prepare(fixture: fixture)
+        try await markRunning(prepared)
+        let calls = [call(id: "resume-provider-list", name: "list", arguments: ["path": ""])]
+        let rawProviderSentinel = "RAW_PROVIDER_BODY_MUST_NOT_PERSIST"
+        try await persistProviderDecision(
+            .toolCalls(ProviderTurnMessage(
+                role: .assistant,
+                content: rawProviderSentinel,
+                toolCalls: calls
+            ), calls),
+            prepared: prepared
+        )
+
+        let provider = StageBScriptedProvider(outcomes: [.failure(.emptyResponse)])
+        let executor = StageBMockExecutor(
+            query: fixture.query,
+            relativePath: fixture.relativeFilePath,
+            topLevelEntry: "Sources",
+            unknownOnFirstCall: true
+        )
+        let outcome = await makeAgent(prepared, provider: provider, executor: executor)
+            .run(sessionID: prepared.context.session.id)
+        let providerCalls = await provider.callCount()
+        let executorCalls = await executor.executedNames()
+
+        XCTAssertEqual(outcome, .reconciliationRequired)
+        XCTAssertEqual(providerCalls, 0)
+        XCTAssertEqual(executorCalls, [.list])
+        let snapshot = try await prepared.store.snapshot(sessionID: prepared.context.session.id)
+        XCTAssertEqual(
+            snapshot.attempts.filter {
+                $0.kind == .provider && $0.phase == .intentRecorded
+            }.count,
+            1
+        )
+        let attemptsFile = prepared.store.rootURL
+            .appendingPathComponent("Sessions")
+            .appendingPathComponent(prepared.context.session.id.uuidString.lowercased())
+            .appendingPathComponent("attempts.jsonl")
+        let durableText = try String(contentsOf: attemptsFile, encoding: .utf8)
+        XCTAssertFalse(durableText.contains(rawProviderSentinel))
+    }
+
+    func testColdResumeAfterReliableExecutorSuccessUsesDurableObservationWithoutReexecution() async throws {
+        let fixture = try makeFixture(
+            nestedDirectory: "Sources/Feature",
+            fileName: "FeatureFlag.swift",
+            query: "NestedFeatureReady"
+        )
+        defer { fixture.cleanup() }
+        let prepared = try await prepare(fixture: fixture)
+        try await markRunning(prepared)
+        let listCall = call(id: "resume-executor-list", name: "list", arguments: ["path": ""])
+        try await persistProviderDecision(
+            .toolCalls(ProviderTurnMessage(role: .assistant, toolCalls: [listCall]), [listCall]),
+            prepared: prepared
+        )
+        try await persistExecutorObservation(
+            call: listCall,
+            fixture: fixture,
+            prepared: prepared
+        )
+
+        let provider = StageBScriptedProvider(outcomes: [.unknown(.reconciliationRequired)])
+        let executor = StageBMockExecutor(
+            query: fixture.query,
+            relativePath: fixture.relativeFilePath,
+            topLevelEntry: "Sources"
+        )
+        let outcome = await makeAgent(prepared, provider: provider, executor: executor)
+            .run(sessionID: prepared.context.session.id)
+        let executorCalls = await executor.executedNames()
+        let providerCalls = await provider.callCount()
+        let requests = await provider.requests()
+
+        XCTAssertEqual(outcome, .reconciliationRequired)
+        XCTAssertEqual(executorCalls, [])
+        XCTAssertEqual(providerCalls, 1)
+        let request = try XCTUnwrap(requests.first)
+        let restoredTool = try XCTUnwrap(request.messages.first { $0.role == .tool })
+        XCTAssertEqual(restoredTool.toolCallID, listCall.id)
+        XCTAssertTrue(restoredTool.content?.contains("observation_sha256") == true)
+    }
+
+    func testColdResumeAfterPolicyNotExecutedPreservesOriginalIDFeedbackAndZeroExecutorIO() async throws {
+        let fixture = try makeFixture(
+            nestedDirectory: "Sources/Feature",
+            fileName: "FeatureFlag.swift",
+            query: "NestedFeatureReady"
+        )
+        defer { fixture.cleanup() }
+        let prepared = try await prepare(fixture: fixture)
+        try await markRunning(prepared)
+        let rejected = call(
+            id: "resume-policy-original-id",
+            name: "read",
+            arguments: ["path": "../outside.txt"]
+        )
+        try await persistProviderDecision(
+            .toolCalls(ProviderTurnMessage(role: .assistant, toolCalls: [rejected]), [rejected]),
+            prepared: prepared
+        )
+        try await persistPolicyNotExecuted(call: rejected, prepared: prepared)
+
+        let provider = StageBScriptedProvider(outcomes: [.unknown(.reconciliationRequired)])
+        let executor = StageBMockExecutor(
+            query: fixture.query,
+            relativePath: fixture.relativeFilePath,
+            topLevelEntry: "Sources"
+        )
+        let outcome = await makeAgent(prepared, provider: provider, executor: executor)
+            .run(sessionID: prepared.context.session.id)
+        let executorCalls = await executor.executedNames()
+        let providerCalls = await provider.callCount()
+        let requests = await provider.requests()
+
+        XCTAssertEqual(outcome, .reconciliationRequired)
+        XCTAssertEqual(executorCalls, [])
+        XCTAssertEqual(providerCalls, 1)
+        let request = try XCTUnwrap(requests.first)
+        let feedback = try XCTUnwrap(request.messages.first { $0.role == .tool })
+        XCTAssertEqual(feedback.toolCallID, rejected.id)
+        XCTAssertTrue(feedback.content?.contains("not_executed") == true)
+        XCTAssertTrue(feedback.content?.contains("path_rejected") == true)
+    }
+
+    func testCompletedColdResumeCreatesZeroProviderAndExecutorAttempts() async throws {
+        let fixture = try makeFixture(
+            nestedDirectory: "Modules/Parser",
+            fileName: "TokenCatalog.swift",
+            query: "ParserReadyToken"
+        )
+        defer { fixture.cleanup() }
+        let prepared = try await prepare(fixture: fixture)
+        let calls = [
+            call(id: "completed-list", name: "list", arguments: ["path": ""]),
+            call(id: "completed-search", name: "search", arguments: [
+                "path": "Modules", "query": fixture.query
+            ]),
+            call(id: "completed-read", name: "read", arguments: ["path": fixture.relativeFilePath])
+        ]
+        let firstProvider = StageBScriptedProvider(outcomes: [
+            .decision(.toolCalls(ProviderTurnMessage(role: .assistant, toolCalls: calls), calls)),
+            .decision(.finish(ProviderTurnMessage(role: .assistant, content: "done")))
+        ])
+        let firstExecutor = StageBMockExecutor(
+            query: fixture.query,
+            relativePath: fixture.relativeFilePath,
+            topLevelEntry: "Modules"
+        )
+        let completed = await makeAgent(
+            prepared,
+            provider: firstProvider,
+            executor: firstExecutor
+        ).run(sessionID: prepared.context.session.id)
+        guard case .completed = completed else { return XCTFail("fixture did not complete") }
+
+        let coldProvider = StageBScriptedProvider(outcomes: [.failure(.emptyResponse)])
+        let coldExecutor = StageBMockExecutor(
+            query: fixture.query,
+            relativePath: fixture.relativeFilePath,
+            topLevelEntry: "Modules"
+        )
+        let cold = await makeAgent(
+            prepared,
+            provider: coldProvider,
+            executor: coldExecutor
+        ).run(sessionID: prepared.context.session.id)
+        let coldProviderCalls = await coldProvider.callCount()
+        let coldExecutorCalls = await coldExecutor.executedNames()
+
+        XCTAssertEqual(cold, completed)
+        XCTAssertEqual(coldProviderCalls, 0)
+        XCTAssertEqual(coldExecutorCalls, [])
+    }
+
+    func testColdResumeOrphanExternalIntentRequiresReconciliationWithoutRetry() async throws {
+        let fixture = try makeFixture(
+            nestedDirectory: "Sources/Feature",
+            fileName: "FeatureFlag.swift",
+            query: "NestedFeatureReady"
+        )
+        defer { fixture.cleanup() }
+        let prepared = try await prepare(fixture: fixture)
+        try await markRunning(prepared)
+        try await prepared.store.record(attemptEvidence(
+            sessionID: prepared.context.session.id,
+            kind: .provider,
+            phase: .intentRecorded,
+            category: .none,
+            inputSHA256: try initialProviderInputHash(prepared)
+        ))
+        let provider = StageBScriptedProvider(outcomes: [.failure(.emptyResponse)])
+        let executor = StageBMockExecutor(
+            query: fixture.query,
+            relativePath: fixture.relativeFilePath,
+            topLevelEntry: "Sources"
+        )
+
+        let outcome = await makeAgent(prepared, provider: provider, executor: executor)
+            .run(sessionID: prepared.context.session.id)
+        let providerCalls = await provider.callCount()
+        let executorCalls = await executor.executedNames()
+        XCTAssertEqual(outcome, .reconciliationRequired)
+        XCTAssertEqual(providerCalls, 0)
+        XCTAssertEqual(executorCalls, [])
+    }
+
+    func testColdResumeMissingTypedOutcomeOrObservationRequiresReconciliationWithoutRetry() async throws {
+        let providerFixture = try makeFixture(
+            nestedDirectory: "Sources/Feature",
+            fileName: "ProviderGap.swift",
+            query: "ProviderGapReady"
+        )
+        defer { providerFixture.cleanup() }
+        let providerPrepared = try await prepare(fixture: providerFixture)
+        try await markRunning(providerPrepared)
+        let providerCall = call(id: "missing-provider-outcome", name: "list", arguments: ["path": ""])
+        try await persistProviderDecision(
+            .toolCalls(
+                ProviderTurnMessage(role: .assistant, toolCalls: [providerCall]),
+                [providerCall]
+            ),
+            prepared: providerPrepared,
+            includeTypedOutcome: false
+        )
+        let missingProvider = StageBScriptedProvider(outcomes: [.failure(.emptyResponse)])
+        let providerExecutor = StageBMockExecutor(
+            query: providerFixture.query,
+            relativePath: providerFixture.relativeFilePath,
+            topLevelEntry: "Sources"
+        )
+        let missingProviderOutcome = await makeAgent(
+            providerPrepared,
+            provider: missingProvider,
+            executor: providerExecutor
+        ).run(sessionID: providerPrepared.context.session.id)
+        let missingProviderCalls = await missingProvider.callCount()
+        let providerExecutorCalls = await providerExecutor.executedNames()
+        XCTAssertEqual(missingProviderOutcome, .reconciliationRequired)
+        XCTAssertEqual(missingProviderCalls, 0)
+        XCTAssertEqual(providerExecutorCalls, [])
+
+        let observationFixture = try makeFixture(
+            nestedDirectory: "Modules/Parser",
+            fileName: "ObservationGap.swift",
+            query: "ObservationGapReady"
+        )
+        defer { observationFixture.cleanup() }
+        let observationPrepared = try await prepare(fixture: observationFixture)
+        try await markRunning(observationPrepared)
+        let observationCall = call(id: "missing-observation", name: "list", arguments: ["path": ""])
+        try await persistProviderDecision(
+            .toolCalls(
+                ProviderTurnMessage(role: .assistant, toolCalls: [observationCall]),
+                [observationCall]
+            ),
+            prepared: observationPrepared
+        )
+        try await persistExecutorObservation(
+            call: observationCall,
+            fixture: observationFixture,
+            prepared: observationPrepared,
+            includeObservation: false
+        )
+        let observationProvider = StageBScriptedProvider(outcomes: [.failure(.emptyResponse)])
+        let missingObservationExecutor = StageBMockExecutor(
+            query: observationFixture.query,
+            relativePath: observationFixture.relativeFilePath,
+            topLevelEntry: "Modules"
+        )
+        let missingObservationOutcome = await makeAgent(
+            observationPrepared,
+            provider: observationProvider,
+            executor: missingObservationExecutor
+        ).run(sessionID: observationPrepared.context.session.id)
+        let observationProviderCalls = await observationProvider.callCount()
+        let missingObservationExecutorCalls = await missingObservationExecutor.executedNames()
+        XCTAssertEqual(missingObservationOutcome, .reconciliationRequired)
+        XCTAssertEqual(observationProviderCalls, 0)
+        XCTAssertEqual(missingObservationExecutorCalls, [])
+    }
+
+    func testColdResumeAttemptBindingMismatchRequiresReconciliationWithoutRetry() async throws {
+        let fixture = try makeFixture(
+            nestedDirectory: "Sources/Feature",
+            fileName: "FeatureFlag.swift",
+            query: "NestedFeatureReady"
+        )
+        defer { fixture.cleanup() }
+        let prepared = try await prepare(fixture: fixture)
+        try await markRunning(prepared)
+        let providerCall = call(id: "binding-mismatch", name: "list", arguments: ["path": ""])
+        try await persistProviderDecision(
+            .toolCalls(
+                ProviderTurnMessage(role: .assistant, toolCalls: [providerCall]),
+                [providerCall]
+            ),
+            prepared: prepared
+        )
+        try await persistExecutorObservation(
+            call: providerCall,
+            fixture: fixture,
+            prepared: prepared,
+            terminalInputSHA256: ProviderDigest.sha256Hex("different-binding")
+        )
+        let provider = StageBScriptedProvider(outcomes: [.failure(.emptyResponse)])
+        let executor = StageBMockExecutor(
+            query: fixture.query,
+            relativePath: fixture.relativeFilePath,
+            topLevelEntry: "Sources"
+        )
+
+        let outcome = await makeAgent(prepared, provider: provider, executor: executor)
+            .run(sessionID: prepared.context.session.id)
+        let providerCalls = await provider.callCount()
+        let executorCalls = await executor.executedNames()
+        XCTAssertEqual(outcome, .reconciliationRequired)
+        XCTAssertEqual(providerCalls, 0)
+        XCTAssertEqual(executorCalls, [])
+    }
+
     func testProviderUnknownColdRecoveryDoesNotCreateSecondAttempt() async throws {
         let fixture = try makeFixture(
             nestedDirectory: "Sources/Feature",
@@ -571,6 +900,282 @@ final class WujiStageBTests: XCTestCase {
             workspace: prepared.context.workspace,
             ruleSet: prepared.context.ruleSet,
             limits: prepared.limits
+        )
+    }
+
+    private func markRunning(_ prepared: StageBPreparedTest) async throws {
+        let snapshot = try await prepared.store.snapshot(sessionID: prepared.context.session.id)
+        _ = try await prepared.store.transition(snapshot.session, to: .running)
+    }
+
+    private func persistProviderDecision(
+        _ decision: ProviderInferenceDecision,
+        prepared: StageBPreparedTest,
+        includeTypedOutcome: Bool = true
+    ) async throws {
+        let operationID = UUID()
+        let attemptID = UUID()
+        let inputSHA256 = try initialProviderInputHash(prepared)
+        try await prepared.store.record(attemptEvidence(
+            sessionID: prepared.context.session.id,
+            operationID: operationID,
+            attemptID: attemptID,
+            kind: .provider,
+            phase: .intentRecorded,
+            category: .none,
+            inputSHA256: inputSHA256
+        ))
+        let category: StageBAttemptCategory
+        let outcome: StageBProviderOutcomeEvidence
+        switch decision {
+        case let .toolCalls(assistant, calls):
+            category = .providerToolCalls
+            outcome = StageBProviderOutcomeEvidence(
+                assistantContentByteCount: assistant.content?.utf8.count ?? 0,
+                assistantContentSHA256: assistant.content.map(ProviderDigest.sha256Hex),
+                toolCalls: calls
+            )
+        case let .finish(assistant):
+            category = .providerFinish
+            outcome = StageBProviderOutcomeEvidence(
+                assistantContentByteCount: assistant.content?.utf8.count ?? 0,
+                assistantContentSHA256: assistant.content.map(ProviderDigest.sha256Hex),
+                toolCalls: []
+            )
+        }
+        try await prepared.store.record(attemptEvidence(
+            sessionID: prepared.context.session.id,
+            operationID: operationID,
+            attemptID: attemptID,
+            kind: .provider,
+            phase: .succeeded,
+            category: category,
+            inputSHA256: inputSHA256,
+            result: Data(decision.description.utf8),
+            providerOutcome: includeTypedOutcome ? outcome : nil
+        ))
+    }
+
+    private func persistExecutorObservation(
+        call providerCall: ProviderTurnToolCall,
+        fixture: StageBTestFixture,
+        prepared: StageBPreparedTest,
+        includeObservation: Bool = true,
+        terminalInputSHA256: String? = nil
+    ) async throws {
+        let policy = StageBReadOnlyPolicy(
+            workspace: prepared.context.workspace,
+            ruleSet: prepared.context.ruleSet,
+            limits: prepared.limits
+        )
+        let authorized = try XCTUnwrap(try policy.authorizeBatch([providerCall]).first)
+        let observation = makeObservation(
+            tool: authorized.tool,
+            fixture: fixture
+        )
+        let evidence = try StageBObservationEvidence.make(
+            observation: observation,
+            exactQuery: fixture.query,
+            limits: prepared.limits
+        )
+        let modelContent = try StageBModelObservation.render(
+            observation,
+            limits: prepared.limits
+        )
+        let operationID = UUID()
+        let attemptID = UUID()
+        let inputSHA256 = toolInputHash(providerCall)
+        try await prepared.store.record(attemptEvidence(
+            sessionID: prepared.context.session.id,
+            operationID: operationID,
+            attemptID: attemptID,
+            kind: .executor,
+            toolName: authorized.tool.name,
+            toolCallID: providerCall.id,
+            phase: .intentRecorded,
+            category: .none,
+            inputSHA256: inputSHA256
+        ))
+        try await prepared.store.record(attemptEvidence(
+            sessionID: prepared.context.session.id,
+            operationID: operationID,
+            attemptID: attemptID,
+            kind: .executor,
+            toolName: authorized.tool.name,
+            toolCallID: providerCall.id,
+            phase: .succeeded,
+            category: .observation,
+            inputSHA256: terminalInputSHA256 ?? inputSHA256,
+            result: Data(modelContent.utf8),
+            observation: includeObservation ? evidence : nil
+        ))
+    }
+
+    private func persistPolicyNotExecuted(
+        call providerCall: ProviderTurnToolCall,
+        prepared: StageBPreparedTest
+    ) async throws {
+        let policy = StageBReadOnlyPolicy(
+            workspace: prepared.context.workspace,
+            ruleSet: prepared.context.ruleSet,
+            limits: prepared.limits
+        )
+        let rejection: StageBBatchPolicyError
+        do {
+            _ = try policy.authorizeBatch([providerCall])
+            throw StageBSessionStoreError.invalidEvidence
+        } catch let error as StageBBatchPolicyError {
+            rejection = error
+        }
+        let operationID = UUID()
+        let attemptID = UUID()
+        let inputSHA256 = toolInputHash(providerCall)
+        try await prepared.store.record(attemptEvidence(
+            sessionID: prepared.context.session.id,
+            operationID: operationID,
+            attemptID: attemptID,
+            kind: .executor,
+            toolName: StageBToolName(rawValue: providerCall.name),
+            toolCallID: providerCall.id,
+            phase: .intentRecorded,
+            category: .none,
+            inputSHA256: inputSHA256
+        ))
+        try await prepared.store.record(attemptEvidence(
+            sessionID: prepared.context.session.id,
+            operationID: operationID,
+            attemptID: attemptID,
+            kind: .executor,
+            toolName: StageBToolName(rawValue: providerCall.name),
+            toolCallID: providerCall.id,
+            phase: .failed,
+            category: .policyNotExecuted,
+            inputSHA256: inputSHA256,
+            resultSHA256: ProviderDigest.sha256Hex(rejection.reason.rawValue),
+            policyRejection: StageBPolicyRejectionEvidence(
+                reason: rejection.reason,
+                callIndex: rejection.callIndex
+            )
+        ))
+    }
+
+    private func initialProviderInputHash(
+        _ prepared: StageBPreparedTest
+    ) throws -> String {
+        let window = StageBContextWindow(limits: prepared.limits)
+        let base = try window.baseMessages(
+            session: prepared.context.session,
+            ruleSet: prepared.context.ruleSet
+        )
+        let request = try window.request(
+            baseMessages: base,
+            observations: [],
+            lastExchange: [],
+            requireTool: true
+        )
+        return providerInputHash(request)
+    }
+
+    private func providerInputHash(_ request: ProviderInferenceRequest) -> String {
+        var parts = ["requireTool=\(request.requireTool)"]
+        parts.append(contentsOf: request.tools.map { "tool=\($0.name)" })
+        for message in request.messages {
+            parts.append("role=\(message.role.rawValue)")
+            parts.append("content=\(message.content.map(ProviderDigest.sha256Hex) ?? "none")")
+            parts.append(contentsOf: message.toolCalls.map {
+                "call=\(ProviderDigest.sha256Hex($0.id)):\($0.name):\(ProviderDigest.sha256Hex($0.arguments))"
+            })
+            parts.append(
+                "toolCallID=\(message.toolCallID.map(ProviderDigest.sha256Hex) ?? "none")"
+            )
+        }
+        return ProviderDigest.sha256Hex(parts.joined(separator: "\n"))
+    }
+
+    private func toolInputHash(_ call: ProviderTurnToolCall) -> String {
+        ProviderDigest.sha256Hex(
+            "tool-request\u{0}\(call.name)\u{0}\(ProviderDigest.sha256Hex(call.arguments))"
+        )
+    }
+
+    private func makeObservation(
+        tool: StageBAuthorizedTool,
+        fixture: StageBTestFixture
+    ) -> StageBToolObservation {
+        let facts = StageBExecutorFacts(
+            rootExitObserved: true,
+            stdoutEOFObserved: true,
+            stderrEOFObserved: true,
+            finalStateKind: "exited",
+            finalStateValue: 0,
+            stdoutByteCount: 64,
+            stderrByteCount: 0,
+            stdoutSHA256: ProviderDigest.sha256Hex("interrupted-observation"),
+            stderrSHA256: ProviderDigest.sha256Hex(Data()),
+            truncated: false
+        )
+        let payload: StageBObservationPayload
+        switch tool.name {
+        case .list:
+            payload = .list(entries: [
+                fixture.relativeFilePath.split(separator: "/").first.map(String.init)!,
+                "AGENTS.md",
+                "README.md"
+            ])
+        case .search:
+            payload = .search(matches: [StageBSearchMatch(
+                path: fixture.relativeFilePath,
+                line: 1,
+                text: "let stageBValue = \"\(fixture.query)\""
+            )])
+        case .read:
+            payload = .read(
+                path: fixture.relativeFilePath,
+                content: "let stageBValue = \"\(fixture.query)\"\n"
+            )
+        }
+        return StageBToolObservation(
+            tool: tool.name,
+            relativePath: tool.relativePath,
+            query: tool.query,
+            ruleSetSHA256: tool.ruleSetSHA256,
+            payload: payload,
+            facts: facts
+        )
+    }
+
+    private func attemptEvidence(
+        sessionID: UUID,
+        operationID: UUID = UUID(),
+        attemptID: UUID = UUID(),
+        kind: StageBAttemptKind,
+        toolName: StageBToolName? = nil,
+        toolCallID: String? = nil,
+        phase: StageBAttemptPhase,
+        category: StageBAttemptCategory,
+        inputSHA256: String,
+        result: Data? = nil,
+        resultSHA256: String? = nil,
+        observation: StageBObservationEvidence? = nil,
+        providerOutcome: StageBProviderOutcomeEvidence? = nil,
+        policyRejection: StageBPolicyRejectionEvidence? = nil
+    ) -> StageBAttemptEvidence {
+        StageBAttemptEvidence(
+            sessionID: sessionID,
+            operationID: operationID,
+            attemptID: attemptID,
+            kind: kind,
+            toolName: toolName,
+            toolCallIDHash: toolCallID.map(ProviderDigest.sha256Hex),
+            inputSHA256: inputSHA256,
+            recordedAt: Date(),
+            phase: phase,
+            category: category,
+            resultByteCount: result?.count,
+            resultSHA256: resultSHA256 ?? result.map(ProviderDigest.sha256Hex),
+            observation: observation,
+            providerOutcome: providerOutcome,
+            policyRejection: policyRejection
         )
     }
 

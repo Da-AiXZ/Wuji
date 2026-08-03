@@ -181,6 +181,35 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
         let inputSHA256: String
     }
 
+    private struct ExternalAttemptPair: Sendable {
+        let intentIndex: Int
+        let terminalIndex: Int
+        let intent: StageBAttemptEvidence
+        let terminal: StageBAttemptEvidence
+    }
+
+    private struct LoopState: Sendable {
+        var observations: [StageBObservationEvidence] = []
+        var lastExchange: [ProviderTurnMessage] = []
+        var usedToolCallIDs = Set<String>()
+        var providerRequestCount = 0
+        var toolExecutionCount = 0
+        var unresolvedPolicyRejection = false
+        var pendingDecision: ProviderInferenceDecision?
+        var finishCanComplete = false
+    }
+
+    private enum ReplayResult: Sendable {
+        case state(LoopState)
+        case failure(StageBError)
+        case reconciliationRequired
+    }
+
+    private enum ToolBatchResult: Sendable {
+        case state(LoopState)
+        case outcome(StageBLoopOutcome)
+    }
+
     private let provider: AgentInferenceProvider
     private let executor: StageBReadOnlyExecuting
     private let policy: StageBReadOnlyPolicy
@@ -226,36 +255,16 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
               session.rules == ruleSet.descriptors else {
             return .failure(.workspaceBindingMismatch)
         }
-        if hasUnresolvedExternalAttempt(initial.attempts) {
-            _ = try? await sessionStore.transition(
-                session,
-                to: .reconciliationRequired,
-                diagnostic: "external_attempt_requires_reconciliation",
-                now: now()
-            )
-            return .reconciliationRequired
-        }
         if session.phase == .completed, let completion = session.completion {
             guard durableCompletionIsValid(
                 completion,
                 session: session,
                 attempts: initial.attempts
-            ) else { return .reconciliationRequired }
+            ) else { return await requireReconciliation(session) }
             return .completed(completion)
         }
-        if initial.attempts.contains(where: { $0.kind == .provider || $0.kind == .executor }) {
-            _ = try? await sessionStore.transition(
-                session,
-                to: .reconciliationRequired,
-                diagnostic: "external_attempt_requires_reconciliation",
-                now: now()
-            )
-            return .reconciliationRequired
-        }
-        do {
-            session = try await sessionStore.transition(session, to: .running, now: now())
-        } catch {
-            return .failure(.evidenceUnavailable)
+        guard session.phase != .completed, session.completion == nil else {
+            return await requireReconciliation(session)
         }
 
         let contextWindow = StageBContextWindow(limits: limits)
@@ -263,25 +272,64 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
         do { baseMessages = try contextWindow.baseMessages(session: session, ruleSet: ruleSet) }
         catch { return await fail(session, .contextLimit) }
 
-        var observations: [StageBToolObservation] = []
-        var lastExchange: [ProviderTurnMessage] = []
-        var usedToolCallIDs = Set<String>()
-        var providerRequestCount = 0
-        var toolExecutionCount = 0
-        var unresolvedPolicyRejection = false
+        var state: LoopState
+        switch rebuild(initial.attempts, session: session) {
+        case let .state(rebuilt):
+            state = rebuilt
+        case let .failure(error):
+            return .failure(error)
+        case .reconciliationRequired:
+            return await requireReconciliation(session)
+        }
+        do {
+            session = try await sessionStore.transition(session, to: .running, now: now())
+        } catch {
+            return .failure(.evidenceUnavailable)
+        }
 
-        for _ in 0..<limits.maximumProviderTurns {
+        if state.finishCanComplete,
+           let verified = StageBCompletionVerifier.verify(
+               observations: state.observations,
+               session: session,
+               ruleSet: ruleSet
+           ) {
+            return await establishCompletion(
+                session: session,
+                verified: verified,
+                observations: state.observations,
+                providerRequestCount: state.providerRequestCount,
+                toolExecutionCount: state.toolExecutionCount
+            )
+        }
+        if let pending = state.pendingDecision {
+            guard case let .toolCalls(assistant, calls) = pending else {
+                return await requireReconciliation(session)
+            }
+            state.pendingDecision = nil
+            switch await executeToolBatch(
+                session: session,
+                assistant: assistant,
+                calls: calls,
+                state: state
+            ) {
+            case let .state(updated): state = updated
+            case let .outcome(outcome): return outcome
+            }
+        }
+
+        while state.providerRequestCount < limits.maximumProviderTurns {
             let verified = StageBCompletionVerifier.verify(
-                observations: observations,
+                observations: state.observations,
                 session: session,
                 ruleSet: ruleSet
             )
             let request: ProviderInferenceRequest
             do {
-                request = try contextWindow.request(
+                request = try inferenceRequest(
+                    contextWindow: contextWindow,
                     baseMessages: baseMessages,
-                    observations: observations,
-                    lastExchange: lastExchange,
+                    observations: state.observations,
+                    lastExchange: state.lastExchange,
                     requireTool: verified == nil
                 )
             } catch {
@@ -298,7 +346,7 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
                 inputSHA256: inputHash
             )) else { return await fail(session, .evidenceUnavailable) }
 
-            providerRequestCount += 1
+            state.providerRequestCount += 1
             let outcome = await provider.infer(request: request, requestID: makeUUID())
             switch outcome {
             case let .decision(decision):
@@ -315,21 +363,22 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
                     inputSHA256: inputHash,
                     phase: .succeeded,
                     category: providerCategory,
-                    result: Data(decision.description.utf8)
+                    result: Data(decision.description.utf8),
+                    providerOutcome: providerOutcomeEvidence(decision)
                 )) else { return .reconciliationRequired }
 
                 switch decision {
                 case let .finish(assistant):
-                    if let verified, !unresolvedPolicyRejection {
+                    if let verified, !state.unresolvedPolicyRejection {
                         return await establishCompletion(
                             session: session,
                             verified: verified,
-                            observations: observations,
-                            providerRequestCount: providerRequestCount,
-                            toolExecutionCount: toolExecutionCount
+                            observations: state.observations,
+                            providerRequestCount: state.providerRequestCount,
+                            toolExecutionCount: state.toolExecutionCount
                         )
                     }
-                    lastExchange = [
+                    state.lastExchange = [
                         assistant,
                         ProviderTurnMessage(
                             role: .user,
@@ -338,175 +387,15 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
                     ]
 
                 case let .toolCalls(assistant, calls):
-                    let pending = calls.map { call in
-                        PendingToolAttempt(
-                            call: call,
-                            operationID: makeUUID(),
-                            attemptID: makeUUID(),
-                            inputSHA256: ProviderDigest.sha256Hex(
-                                "tool-request\u{0}\(call.name)\u{0}\(ProviderDigest.sha256Hex(call.arguments))"
-                            )
-                        )
+                    switch await executeToolBatch(
+                        session: session,
+                        assistant: assistant,
+                        calls: calls,
+                        state: state
+                    ) {
+                    case let .state(updated): state = updated
+                    case let .outcome(outcome): return outcome
                     }
-                    for request in pending {
-                        guard await record(intent(
-                            sessionID: session.id,
-                            operationID: request.operationID,
-                            attemptID: request.attemptID,
-                            kind: .executor,
-                            toolName: StageBToolName(rawValue: request.call.name),
-                            toolCallID: request.call.id,
-                            inputSHA256: request.inputSHA256
-                        )) else { return .reconciliationRequired }
-                    }
-                    if toolExecutionCount + calls.count > limits.maximumToolExecutions {
-                        let rejection = StageBBatchPolicyError(
-                            reason: .limitsExceeded,
-                            callIndex: nil
-                        )
-                        unresolvedPolicyRejection = true
-                        guard await recordNotExecutedBatch(
-                            sessionID: session.id,
-                            pending: pending,
-                            rejection: rejection
-                        ) else { return await fail(session, .evidenceUnavailable) }
-                        let feedback = boundedPolicyFeedback(rejection)
-                        lastExchange = [assistant] + calls.map {
-                            ProviderTurnMessage(role: .tool, content: feedback, toolCallID: $0.id)
-                        }
-                        usedToolCallIDs.formUnion(calls.map(\.id))
-                        continue
-                    }
-                    let authorized: [StageBAuthorizedToolCall]
-                    do {
-                        authorized = try policy.authorizeBatch(
-                            calls,
-                            previouslyUsedIDs: usedToolCallIDs
-                        )
-                    } catch let rejection as StageBBatchPolicyError {
-                        unresolvedPolicyRejection = true
-                        guard await recordNotExecutedBatch(
-                            sessionID: session.id,
-                            pending: pending,
-                            rejection: rejection
-                        ) else { return await fail(session, .evidenceUnavailable) }
-                        let feedback = boundedPolicyFeedback(rejection)
-                        lastExchange = [assistant] + calls.map {
-                            ProviderTurnMessage(role: .tool, content: feedback, toolCallID: $0.id)
-                        }
-                        usedToolCallIDs.formUnion(calls.map(\.id))
-                        continue
-                    } catch {
-                        return await fail(session, .invalidArguments)
-                    }
-
-                    unresolvedPolicyRejection = false
-                    usedToolCallIDs.formUnion(authorized.map(\.toolCallID))
-                    var exchange = [assistant]
-                    guard authorized.count == pending.count else {
-                        return .reconciliationRequired
-                    }
-                    for (call, request) in zip(authorized, pending) {
-                        toolExecutionCount += 1
-                        switch await executor.execute(call.tool) {
-                        case let .observation(observation):
-                            guard observation.ruleSetSHA256 == call.tool.ruleSetSHA256,
-                                  observation.tool == call.tool.name,
-                                  observation.relativePath == call.tool.relativePath,
-                                  observation.query == call.tool.query else {
-                                let recorded = await record(terminal(
-                                    sessionID: session.id,
-                                    operationID: request.operationID,
-                                    attemptID: request.attemptID,
-                                    kind: .executor,
-                                    toolName: call.tool.name,
-                                    toolCallID: call.toolCallID,
-                                    inputSHA256: request.inputSHA256,
-                                    phase: .failed,
-                                    category: .executorFailure
-                                ))
-                                if recorded { return await fail(session, .executorFailure) }
-                                return .reconciliationRequired
-                            }
-                            let modelContent: String
-                            let observationEvidence: StageBObservationEvidence
-                            do {
-                                modelContent = try StageBModelObservation.render(observation, limits: limits)
-                                observationEvidence = try StageBObservationEvidence.make(
-                                    observation: observation,
-                                    exactQuery: session.goal.exactQuery,
-                                    limits: limits
-                                )
-                            } catch {
-                                let recorded = await record(terminal(
-                                    sessionID: session.id,
-                                    operationID: request.operationID,
-                                    attemptID: request.attemptID,
-                                    kind: .executor,
-                                    toolName: call.tool.name,
-                                    toolCallID: call.toolCallID,
-                                    inputSHA256: request.inputSHA256,
-                                    phase: .failed,
-                                    category: .executorFailure
-                                ))
-                                if recorded { return await fail(session, .executorFailure) }
-                                return .reconciliationRequired
-                            }
-                            guard await record(terminal(
-                                sessionID: session.id,
-                                operationID: request.operationID,
-                                attemptID: request.attemptID,
-                                kind: .executor,
-                                toolName: call.tool.name,
-                                toolCallID: call.toolCallID,
-                                inputSHA256: request.inputSHA256,
-                                phase: .succeeded,
-                                category: .observation,
-                                result: Data(modelContent.utf8),
-                                observation: observationEvidence
-                            )) else { return .reconciliationRequired }
-                            observations.append(observation)
-                            exchange.append(ProviderTurnMessage(
-                                role: .tool,
-                                content: modelContent,
-                                toolCallID: call.toolCallID
-                            ))
-                        case .failure:
-                            let recorded = await record(terminal(
-                                sessionID: session.id,
-                                operationID: request.operationID,
-                                attemptID: request.attemptID,
-                                kind: .executor,
-                                toolName: call.tool.name,
-                                toolCallID: call.toolCallID,
-                                inputSHA256: request.inputSHA256,
-                                phase: .failed,
-                                category: .executorFailure
-                            ))
-                            if recorded { return await fail(session, .executorFailure) }
-                            return .reconciliationRequired
-                        case .unknown:
-                            _ = await record(terminal(
-                                sessionID: session.id,
-                                operationID: request.operationID,
-                                attemptID: request.attemptID,
-                                kind: .executor,
-                                toolName: call.tool.name,
-                                toolCallID: call.toolCallID,
-                                inputSHA256: request.inputSHA256,
-                                phase: .reconciliationRequired,
-                                category: .executorUnknown
-                            ))
-                            _ = try? await sessionStore.transition(
-                                session,
-                                to: .reconciliationRequired,
-                                diagnostic: "executor_unknown",
-                                now: now()
-                            )
-                            return .reconciliationRequired
-                        }
-                    }
-                    lastExchange = exchange
                 }
 
             case .failure:
@@ -543,10 +432,595 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
         return await fail(session, .completionNotEstablished)
     }
 
+    private func rebuild(
+        _ attempts: [StageBAttemptEvidence],
+        session: StageBSessionRecord
+    ) -> ReplayResult {
+        guard let pairs = externalAttemptPairs(attempts) else {
+            return .reconciliationRequired
+        }
+        if pairs.contains(where: { $0.terminal.phase == .reconciliationRequired }) {
+            return .reconciliationRequired
+        }
+        var state = LoopState()
+        var cursor = 0
+        while cursor < pairs.count {
+            let providerPair = pairs[cursor]
+            guard providerPair.intent.kind == .provider,
+                  providerPair.intent.toolName == nil,
+                  providerPair.intent.toolCallIDHash == nil else {
+                return .reconciliationRequired
+            }
+            state.providerRequestCount += 1
+            guard state.providerRequestCount <= limits.maximumProviderTurns else {
+                return .reconciliationRequired
+            }
+            switch providerPair.terminal.phase {
+            case .failed:
+                guard providerPair.terminal.category == .providerFailure,
+                      cursor == pairs.count - 1 else {
+                    return .reconciliationRequired
+                }
+                return .failure(.providerFailure)
+            case .succeeded:
+                break
+            case .intentRecorded, .reconciliationRequired:
+                return .reconciliationRequired
+            }
+            guard let outcome = providerPair.terminal.providerOutcome,
+                  providerPair.terminal.resultByteCount == outcome.resultDescription.utf8.count,
+                  providerPair.terminal.resultSHA256 == ProviderDigest.sha256Hex(
+                      outcome.resultDescription
+                  ) else {
+                return .reconciliationRequired
+            }
+
+            let nextProvider = pairs[(cursor + 1)...].firstIndex {
+                $0.intent.kind == .provider
+            } ?? pairs.endIndex
+            let executorPairs = Array(pairs[(cursor + 1)..<nextProvider])
+            if !executorPairs.isEmpty {
+                guard executorPairs.allSatisfy({
+                    $0.intent.kind == .executor
+                        && $0.intentIndex > providerPair.terminalIndex
+                }),
+                let firstTerminalIndex = executorPairs.map(\.terminalIndex).min(),
+                executorPairs.allSatisfy({ $0.intentIndex < firstTerminalIndex }),
+                executorPairs.map(\.terminalIndex) == executorPairs.map(\.terminalIndex).sorted(),
+                nextProvider == pairs.endIndex
+                    || executorPairs.allSatisfy({
+                        $0.terminalIndex < pairs[nextProvider].intentIndex
+                    }) else {
+                    return .reconciliationRequired
+                }
+            }
+            switch outcome.decision {
+            case let .finish(assistant):
+                guard providerPair.terminal.category == .providerFinish,
+                      executorPairs.isEmpty else {
+                    return .reconciliationRequired
+                }
+                let verified = StageBCompletionVerifier.verify(
+                    observations: state.observations,
+                    session: session,
+                    ruleSet: ruleSet
+                )
+                if verified != nil, !state.unresolvedPolicyRejection {
+                    guard nextProvider == pairs.endIndex else {
+                        return .reconciliationRequired
+                    }
+                    state.finishCanComplete = true
+                } else {
+                    state.lastExchange = completionRejectedExchange(assistant: assistant)
+                }
+            case let .toolCalls(assistant, calls):
+                guard providerPair.terminal.category == .providerToolCalls else {
+                    return .reconciliationRequired
+                }
+                if executorPairs.isEmpty {
+                    guard nextProvider == pairs.endIndex else {
+                        return .reconciliationRequired
+                    }
+                    state.pendingDecision = .toolCalls(assistant, calls)
+                    return .state(state)
+                }
+                guard executorPairs.count == calls.count else {
+                    return .reconciliationRequired
+                }
+                let expectedRejection: StageBBatchPolicyError?
+                let authorized: [StageBAuthorizedToolCall]
+                if state.toolExecutionCount + calls.count > limits.maximumToolExecutions {
+                    expectedRejection = StageBBatchPolicyError(
+                        reason: .limitsExceeded,
+                        callIndex: nil
+                    )
+                    authorized = []
+                } else {
+                    do {
+                        authorized = try policy.authorizeBatch(
+                            calls,
+                            previouslyUsedIDs: state.usedToolCallIDs
+                        )
+                        expectedRejection = nil
+                    } catch let rejection as StageBBatchPolicyError {
+                        expectedRejection = rejection
+                        authorized = []
+                    } catch {
+                        return .reconciliationRequired
+                    }
+                }
+                if let rejection = expectedRejection {
+                    guard zip(calls, executorPairs).allSatisfy({ call, pair in
+                        validExecutorPair(pair, for: call)
+                            && pair.terminal.phase == .failed
+                            && pair.terminal.category == .policyNotExecuted
+                            && pair.terminal.policyRejection == StageBPolicyRejectionEvidence(
+                                reason: rejection.reason,
+                                callIndex: rejection.callIndex
+                            )
+                            && pair.terminal.resultSHA256 == ProviderDigest.sha256Hex(
+                                rejection.reason.rawValue
+                            )
+                    }) else {
+                        return .reconciliationRequired
+                    }
+                    state.unresolvedPolicyRejection = true
+                    let feedback = boundedPolicyFeedback(rejection)
+                    state.lastExchange = [assistant] + calls.map {
+                        ProviderTurnMessage(role: .tool, content: feedback, toolCallID: $0.id)
+                    }
+                } else {
+                    guard authorized.count == calls.count else {
+                        return .reconciliationRequired
+                    }
+                    var exchange = [assistant]
+                    for ((call, authorizedCall), pair) in zip(zip(calls, authorized), executorPairs) {
+                        guard validExecutorPair(pair, for: call),
+                              authorizedCall.toolCallID == call.id else {
+                            return .reconciliationRequired
+                        }
+                        state.toolExecutionCount += 1
+                        if pair.terminal.phase == .failed {
+                            guard pair.terminal.category == .executorFailure,
+                                  pair.intent.operationID == executorPairs.last?.intent.operationID,
+                                  nextProvider == pairs.endIndex else {
+                                return .reconciliationRequired
+                            }
+                            return .failure(.executorFailure)
+                        }
+                        guard pair.terminal.phase == .succeeded,
+                              pair.terminal.category == .observation,
+                              let observation = pair.terminal.observation,
+                              validObservation(observation, for: authorizedCall.tool),
+                              let feedback = restoredObservationFeedback(observation) else {
+                            return .reconciliationRequired
+                        }
+                        state.observations.append(observation)
+                        exchange.append(ProviderTurnMessage(
+                            role: .tool,
+                            content: feedback,
+                            toolCallID: call.id
+                        ))
+                    }
+                    state.unresolvedPolicyRejection = false
+                    state.lastExchange = exchange
+                }
+                state.usedToolCallIDs.formUnion(calls.map(\.id))
+            }
+            cursor = nextProvider
+        }
+        return .state(state)
+    }
+
+    private func externalAttemptPairs(
+        _ attempts: [StageBAttemptEvidence]
+    ) -> [ExternalAttemptPair]? {
+        let indexed = attempts.enumerated().compactMap { index, evidence in
+            evidence.kind == .provider || evidence.kind == .executor
+                ? (index: index, evidence: evidence)
+                : nil
+        }
+        let groups = Dictionary(grouping: indexed, by: { $0.evidence.operationID })
+        var pairs: [ExternalAttemptPair] = []
+        for records in groups.values {
+            let ordered = records.sorted { $0.index < $1.index }
+            guard ordered.count == 2 else { return nil }
+            let intent = ordered[0].evidence
+            let terminal = ordered[1].evidence
+            guard intent.phase == .intentRecorded,
+                  intent.category == .none,
+                  intent.resultByteCount == nil,
+                  intent.resultSHA256 == nil,
+                  intent.observation == nil,
+                  intent.providerOutcome == nil,
+                  intent.policyRejection == nil,
+                  terminal.phase != .intentRecorded,
+                  terminal.sessionID == intent.sessionID,
+                  terminal.operationID == intent.operationID,
+                  terminal.attemptID == intent.attemptID,
+                  terminal.kind == intent.kind,
+                  terminal.toolName == intent.toolName,
+                  terminal.toolCallIDHash == intent.toolCallIDHash,
+                  terminal.inputSHA256 == intent.inputSHA256 else {
+                return nil
+            }
+            pairs.append(ExternalAttemptPair(
+                intentIndex: ordered[0].index,
+                terminalIndex: ordered[1].index,
+                intent: intent,
+                terminal: terminal
+            ))
+        }
+        let orderedPairs = pairs.sorted { $0.intentIndex < $1.intentIndex }
+        guard Set(orderedPairs.map { $0.intent.attemptID }).count == orderedPairs.count else {
+            return nil
+        }
+        for pair in orderedPairs {
+            switch (pair.intent.kind, pair.terminal.phase, pair.terminal.category) {
+            case (.provider, .succeeded, .providerToolCalls),
+                 (.provider, .succeeded, .providerFinish):
+                guard pair.terminal.observation == nil,
+                      pair.terminal.policyRejection == nil else { return nil }
+            case (.provider, .failed, .providerFailure),
+                 (.provider, .reconciliationRequired, .providerUnknown):
+                guard pair.terminal.observation == nil,
+                      pair.terminal.providerOutcome == nil,
+                      pair.terminal.policyRejection == nil else { return nil }
+            case (.executor, .succeeded, .observation):
+                guard pair.terminal.providerOutcome == nil,
+                      pair.terminal.policyRejection == nil else { return nil }
+            case (.executor, .failed, .policyNotExecuted):
+                guard pair.terminal.observation == nil,
+                      pair.terminal.providerOutcome == nil else { return nil }
+            case (.executor, .failed, .executorFailure),
+                 (.executor, .reconciliationRequired, .executorUnknown):
+                guard pair.terminal.observation == nil,
+                      pair.terminal.providerOutcome == nil,
+                      pair.terminal.policyRejection == nil else { return nil }
+            default:
+                return nil
+            }
+        }
+        return orderedPairs
+    }
+
+    private func validExecutorPair(
+        _ pair: ExternalAttemptPair,
+        for call: ProviderTurnToolCall
+    ) -> Bool {
+        pair.intent.kind == .executor
+            && pair.intent.toolName == StageBToolName(rawValue: call.name)
+            && pair.intent.toolCallIDHash == ProviderDigest.sha256Hex(call.id)
+            && pair.intent.inputSHA256 == ProviderDigest.sha256Hex(
+                "tool-request\u{0}\(call.name)\u{0}\(ProviderDigest.sha256Hex(call.arguments))"
+            )
+    }
+
+    private func validObservation(
+        _ observation: StageBObservationEvidence,
+        for tool: StageBAuthorizedTool
+    ) -> Bool {
+        guard observation.tool == tool.name,
+              observation.relativePath == tool.relativePath,
+              observation.querySHA256 == tool.query.map(ProviderDigest.sha256Hex),
+              observation.ruleSetSHA256 == tool.ruleSetSHA256,
+              observation.executorFacts.completionBarrierSatisfied,
+              observation.executorFacts.exitedSuccessfully,
+              !observation.executorFacts.truncated else {
+            return false
+        }
+        switch tool.name {
+        case .list:
+            return observation.listedEntries != nil
+                && observation.matches == nil
+                && observation.readContentSHA256 == nil
+        case .search:
+            return observation.listedEntries == nil
+                && observation.matches != nil
+                && observation.readContentSHA256 == nil
+        case .read:
+            return observation.listedEntries == nil
+                && observation.matches == nil
+                && observation.readContentSHA256 != nil
+                && observation.readContentByteCount != nil
+        }
+    }
+
+    private func executeToolBatch(
+        session: StageBSessionRecord,
+        assistant: ProviderTurnMessage,
+        calls: [ProviderTurnToolCall],
+        state initial: LoopState
+    ) async -> ToolBatchResult {
+        var state = initial
+        let pending = calls.map { call in
+            PendingToolAttempt(
+                call: call,
+                operationID: makeUUID(),
+                attemptID: makeUUID(),
+                inputSHA256: ProviderDigest.sha256Hex(
+                    "tool-request\u{0}\(call.name)\u{0}\(ProviderDigest.sha256Hex(call.arguments))"
+                )
+            )
+        }
+        for request in pending {
+            guard await record(intent(
+                sessionID: session.id,
+                operationID: request.operationID,
+                attemptID: request.attemptID,
+                kind: .executor,
+                toolName: StageBToolName(rawValue: request.call.name),
+                toolCallID: request.call.id,
+                inputSHA256: request.inputSHA256
+            )) else { return .outcome(.reconciliationRequired) }
+        }
+        let authorized: [StageBAuthorizedToolCall]
+        if state.toolExecutionCount + calls.count > limits.maximumToolExecutions {
+            let rejection = StageBBatchPolicyError(reason: .limitsExceeded, callIndex: nil)
+            state.unresolvedPolicyRejection = true
+            guard await recordNotExecutedBatch(
+                sessionID: session.id,
+                pending: pending,
+                rejection: rejection
+            ) else { return .outcome(await fail(session, .evidenceUnavailable)) }
+            let feedback = boundedPolicyFeedback(rejection)
+            state.lastExchange = [assistant] + calls.map {
+                ProviderTurnMessage(role: .tool, content: feedback, toolCallID: $0.id)
+            }
+            state.usedToolCallIDs.formUnion(calls.map(\.id))
+            return .state(state)
+        }
+        do {
+            authorized = try policy.authorizeBatch(
+                calls,
+                previouslyUsedIDs: state.usedToolCallIDs
+            )
+        } catch let rejection as StageBBatchPolicyError {
+            state.unresolvedPolicyRejection = true
+            guard await recordNotExecutedBatch(
+                sessionID: session.id,
+                pending: pending,
+                rejection: rejection
+            ) else { return .outcome(await fail(session, .evidenceUnavailable)) }
+            let feedback = boundedPolicyFeedback(rejection)
+            state.lastExchange = [assistant] + calls.map {
+                ProviderTurnMessage(role: .tool, content: feedback, toolCallID: $0.id)
+            }
+            state.usedToolCallIDs.formUnion(calls.map(\.id))
+            return .state(state)
+        } catch {
+            return .outcome(await fail(session, .invalidArguments))
+        }
+
+        guard authorized.count == pending.count else {
+            return .outcome(.reconciliationRequired)
+        }
+        state.unresolvedPolicyRejection = false
+        state.usedToolCallIDs.formUnion(authorized.map(\.toolCallID))
+        var exchange = [assistant]
+        for (call, request) in zip(authorized, pending) {
+            state.toolExecutionCount += 1
+            switch await executor.execute(call.tool) {
+            case let .observation(observation):
+                guard observation.ruleSetSHA256 == call.tool.ruleSetSHA256,
+                      observation.tool == call.tool.name,
+                      observation.relativePath == call.tool.relativePath,
+                      observation.query == call.tool.query else {
+                    let recorded = await record(terminal(
+                        sessionID: session.id,
+                        operationID: request.operationID,
+                        attemptID: request.attemptID,
+                        kind: .executor,
+                        toolName: call.tool.name,
+                        toolCallID: call.toolCallID,
+                        inputSHA256: request.inputSHA256,
+                        phase: .failed,
+                        category: .executorFailure
+                    ))
+                    if recorded {
+                        return .outcome(await fail(session, .executorFailure))
+                    }
+                    return .outcome(.reconciliationRequired)
+                }
+                let modelContent: String
+                let observationEvidence: StageBObservationEvidence
+                do {
+                    modelContent = try StageBModelObservation.render(observation, limits: limits)
+                    observationEvidence = try StageBObservationEvidence.make(
+                        observation: observation,
+                        exactQuery: session.goal.exactQuery,
+                        limits: limits
+                    )
+                } catch {
+                    let recorded = await record(terminal(
+                        sessionID: session.id,
+                        operationID: request.operationID,
+                        attemptID: request.attemptID,
+                        kind: .executor,
+                        toolName: call.tool.name,
+                        toolCallID: call.toolCallID,
+                        inputSHA256: request.inputSHA256,
+                        phase: .failed,
+                        category: .executorFailure
+                    ))
+                    if recorded {
+                        return .outcome(await fail(session, .executorFailure))
+                    }
+                    return .outcome(.reconciliationRequired)
+                }
+                guard await record(terminal(
+                    sessionID: session.id,
+                    operationID: request.operationID,
+                    attemptID: request.attemptID,
+                    kind: .executor,
+                    toolName: call.tool.name,
+                    toolCallID: call.toolCallID,
+                    inputSHA256: request.inputSHA256,
+                    phase: .succeeded,
+                    category: .observation,
+                    result: Data(modelContent.utf8),
+                    observation: observationEvidence
+                )) else { return .outcome(.reconciliationRequired) }
+                state.observations.append(observationEvidence)
+                exchange.append(ProviderTurnMessage(
+                    role: .tool,
+                    content: modelContent,
+                    toolCallID: call.toolCallID
+                ))
+            case .failure:
+                let recorded = await record(terminal(
+                    sessionID: session.id,
+                    operationID: request.operationID,
+                    attemptID: request.attemptID,
+                    kind: .executor,
+                    toolName: call.tool.name,
+                    toolCallID: call.toolCallID,
+                    inputSHA256: request.inputSHA256,
+                    phase: .failed,
+                    category: .executorFailure
+                ))
+                if recorded {
+                    return .outcome(await fail(session, .executorFailure))
+                }
+                return .outcome(.reconciliationRequired)
+            case .unknown:
+                _ = await record(terminal(
+                    sessionID: session.id,
+                    operationID: request.operationID,
+                    attemptID: request.attemptID,
+                    kind: .executor,
+                    toolName: call.tool.name,
+                    toolCallID: call.toolCallID,
+                    inputSHA256: request.inputSHA256,
+                    phase: .reconciliationRequired,
+                    category: .executorUnknown
+                ))
+                _ = try? await sessionStore.transition(
+                    session,
+                    to: .reconciliationRequired,
+                    diagnostic: "executor_unknown",
+                    now: now()
+                )
+                return .outcome(.reconciliationRequired)
+            }
+        }
+        state.lastExchange = exchange
+        return .state(state)
+    }
+
+    private func inferenceRequest(
+        contextWindow: StageBContextWindow,
+        baseMessages: [ProviderTurnMessage],
+        observations: [StageBObservationEvidence],
+        lastExchange: [ProviderTurnMessage],
+        requireTool: Bool
+    ) throws -> ProviderInferenceRequest {
+        var exchange: [ProviderTurnMessage] = []
+        if !observations.isEmpty {
+            let lines = observations.map {
+                "tool=\($0.tool.rawValue) path_hash=\(ProviderDigest.sha256Hex($0.relativePath)) rules=\($0.ruleSetSHA256) evidence=\($0.observationSHA256)"
+            }
+            exchange.append(ProviderTurnMessage(
+                role: .user,
+                content: "Harness verified prior read-only observations:\n" + lines.joined(separator: "\n")
+            ))
+        }
+        exchange.append(contentsOf: lastExchange)
+        return try contextWindow.request(
+            baseMessages: baseMessages,
+            observations: [],
+            lastExchange: exchange,
+            requireTool: requireTool
+        )
+    }
+
+    private func restoredObservationFeedback(_ observation: StageBObservationEvidence) -> String? {
+        var value: [String: Any] = [
+            "status": "succeeded",
+            "tool": observation.tool.rawValue,
+            "path": observation.relativePath,
+            "rules_sha256": observation.ruleSetSHA256,
+            "observation_sha256": observation.observationSHA256
+        ]
+        if let entries = observation.listedEntries {
+            value["entry_count"] = entries.count
+        }
+        if let matches = observation.matches {
+            value["match_count"] = matches.count
+            if matches.count == 1 {
+                value["match"] = [
+                    "path": matches[0].path,
+                    "line": matches[0].line,
+                    "text_sha256": matches[0].textSHA256,
+                    "exact_query_occurrences": matches[0].exactQueryOccurrences
+                ]
+            }
+        }
+        if let count = observation.readContentByteCount {
+            value["read_content_bytes"] = count
+        }
+        if let hash = observation.readContentSHA256 {
+            value["read_content_sha256"] = hash
+        }
+        if let occurrences = observation.exactQueryOccurrences {
+            value["exact_query_occurrences"] = occurrences
+        }
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+              data.count <= limits.maximumModelObservationBytes,
+              data.count <= ProviderLimits.maximumTurnMessageBytes else {
+            return nil
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private func completionRejectedExchange(
+        assistant: ProviderTurnMessage
+    ) -> [ProviderTurnMessage] {
+        [
+            assistant,
+            ProviderTurnMessage(
+                role: .user,
+                content: "Completion rejected by the Swift Harness because the bound list, exact search, read, rule, or reconciliation evidence is incomplete. Continue with allowed typed tools."
+            )
+        ]
+    }
+
+    private func providerOutcomeEvidence(
+        _ decision: ProviderInferenceDecision
+    ) -> StageBProviderOutcomeEvidence {
+        switch decision {
+        case let .toolCalls(assistant, calls):
+            return StageBProviderOutcomeEvidence(
+                assistantContentByteCount: assistant.content?.utf8.count ?? 0,
+                assistantContentSHA256: assistant.content.map(ProviderDigest.sha256Hex),
+                toolCalls: calls
+            )
+        case let .finish(assistant):
+            return StageBProviderOutcomeEvidence(
+                assistantContentByteCount: assistant.content?.utf8.count ?? 0,
+                assistantContentSHA256: assistant.content.map(ProviderDigest.sha256Hex),
+                toolCalls: []
+            )
+        }
+    }
+
+    private func requireReconciliation(
+        _ session: StageBSessionRecord
+    ) async -> StageBLoopOutcome {
+        _ = try? await sessionStore.transition(
+            session,
+            to: .reconciliationRequired,
+            diagnostic: "external_attempt_requires_reconciliation",
+            now: now()
+        )
+        return .reconciliationRequired
+    }
+
     private func establishCompletion(
         session: StageBSessionRecord,
         verified: StageBCompletionVerifier.Verified,
-        observations: [StageBToolObservation],
+        observations: [StageBObservationEvidence],
         providerRequestCount: Int,
         toolExecutionCount: Int
     ) async -> StageBLoopOutcome {
@@ -620,13 +1094,8 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
     }
 
     private func hasUnresolvedExternalAttempt(_ attempts: [StageBAttemptEvidence]) -> Bool {
-        let external = attempts.filter { $0.kind == .provider || $0.kind == .executor }
-        let groups = Dictionary(grouping: external, by: \.attemptID)
-        return groups.values.contains { records in
-            records.contains(where: { $0.phase == .intentRecorded })
-                && !records.contains(where: { $0.phase != .intentRecorded })
-                || records.contains(where: { $0.phase == .reconciliationRequired })
-        }
+        guard let pairs = externalAttemptPairs(attempts) else { return true }
+        return pairs.contains { $0.terminal.phase == .reconciliationRequired }
     }
 
     private func durableCompletionIsValid(
@@ -643,16 +1112,7 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
               !attempts.contains(where: { $0.phase == .reconciliationRequired }) else {
             return false
         }
-        let externalGroups = Dictionary(
-            grouping: attempts.filter { $0.kind == .provider || $0.kind == .executor },
-            by: \.attemptID
-        )
-        guard externalGroups.values.allSatisfy({ records in
-            records.count == 2
-                && records.map(\.phase) == [.intentRecorded, .succeeded]
-                    || records.count == 2
-                        && records.map(\.phase) == [.intentRecorded, .failed]
-        }) else { return false }
+        guard !hasUnresolvedExternalAttempt(attempts) else { return false }
         let completionData = completionEvidenceData(completion)
         guard !completionData.isEmpty,
               let providerFinishIndex = attempts.lastIndex(where: {
@@ -738,7 +1198,11 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
                 category: .policyNotExecuted,
                 resultByteCount: nil,
                 resultSHA256: ProviderDigest.sha256Hex(rejection.reason.rawValue),
-                observation: nil
+                observation: nil,
+                policyRejection: StageBPolicyRejectionEvidence(
+                    reason: rejection.reason,
+                    callIndex: rejection.callIndex
+                )
             )
             guard await record(terminal) else { return false }
         }
@@ -800,7 +1264,9 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
         phase: StageBAttemptPhase,
         category: StageBAttemptCategory,
         result: Data? = nil,
-        observation: StageBObservationEvidence? = nil
+        observation: StageBObservationEvidence? = nil,
+        providerOutcome: StageBProviderOutcomeEvidence? = nil,
+        policyRejection: StageBPolicyRejectionEvidence? = nil
     ) -> StageBAttemptEvidence {
         StageBAttemptEvidence(
             sessionID: sessionID,
@@ -815,7 +1281,9 @@ final class StageBReadOnlyAgent: @unchecked Sendable {
             category: category,
             resultByteCount: result?.count,
             resultSHA256: result.map(ProviderDigest.sha256Hex),
-            observation: observation
+            observation: observation,
+            providerOutcome: providerOutcome,
+            policyRejection: policyRejection
         )
     }
 
@@ -842,7 +1310,7 @@ enum StageBCompletionVerifier {
     }
 
     static func verify(
-        observations: [StageBToolObservation],
+        observations: [StageBObservationEvidence],
         session: StageBSessionRecord,
         ruleSet: StageBRuleSet
     ) -> Verified? {
@@ -851,19 +1319,20 @@ enum StageBCompletionVerifier {
         for listIndex in observations.indices {
             let list = observations[listIndex]
             guard list.tool == .list,
-                  list.facts.completionBarrierSatisfied,
-                  list.facts.exitedSuccessfully,
-                  !list.facts.truncated,
-                  case let .list(entries) = list.payload else { continue }
+                  list.executorFacts.completionBarrierSatisfied,
+                  list.executorFacts.exitedSuccessfully,
+                  !list.executorFacts.truncated,
+                  let entries = list.listedEntries else { continue }
             for searchIndex in observations.indices where searchIndex > listIndex {
                 let search = observations[searchIndex]
                 guard search.tool == .search,
-                      search.query == query,
-                      search.facts.completionBarrierSatisfied,
-                      !search.facts.truncated,
-                      case let .search(matches) = search.payload,
+                      search.querySHA256 == ProviderDigest.sha256Hex(query),
+                      search.executorFacts.completionBarrierSatisfied,
+                      search.executorFacts.exitedSuccessfully,
+                      !search.executorFacts.truncated,
+                      let matches = search.matches,
                       matches.count == 1,
-                      matches[0].text.contains(query) else { continue }
+                      matches[0].exactQueryOccurrences > 0 else { continue }
                 let match = matches[0]
                 guard session.goal.expectedRelativePath.map({ $0 == match.path }) ?? true,
                       listCovers(path: match.path, listPath: list.relativePath, entries: entries) else {
@@ -873,13 +1342,13 @@ enum StageBCompletionVerifier {
                     let read = observations[readIndex]
                     guard read.tool == .read,
                           read.relativePath == match.path,
-                          read.facts.completionBarrierSatisfied,
-                          read.facts.exitedSuccessfully,
-                          !read.facts.truncated,
-                          case let .read(path, content) = read.payload,
-                          path == match.path,
-                          content.contains(query) else { continue }
-                    let chain = [list, search, read].map(\.evidenceSHA256).joined(separator: "\n")
+                          read.executorFacts.completionBarrierSatisfied,
+                          read.executorFacts.exitedSuccessfully,
+                          !read.executorFacts.truncated,
+                          (read.exactQueryOccurrences ?? 0) > 0 else { continue }
+                    let chain = [list, search, read]
+                        .map(\.observationSHA256)
+                        .joined(separator: "\n")
                     return Verified(
                         relativePath: match.path,
                         evidenceChainSHA256: ProviderDigest.sha256Hex(chain)

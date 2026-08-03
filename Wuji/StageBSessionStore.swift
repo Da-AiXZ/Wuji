@@ -56,6 +56,34 @@ enum StageBAttemptCategory: String, Codable, Equatable, Sendable {
     case completionRejected = "completion_rejected"
 }
 
+struct StageBProviderOutcomeEvidence: Codable, Equatable, Sendable {
+    let assistantContentByteCount: Int
+    let assistantContentSHA256: String?
+    let toolCalls: [ProviderTurnToolCall]
+
+    var decision: ProviderInferenceDecision {
+        let assistant = ProviderTurnMessage(
+            role: .assistant,
+            content: toolCalls.isEmpty
+                ? "Provider finish restored from bounded durable outcome."
+                : nil,
+            toolCalls: toolCalls
+        )
+        return toolCalls.isEmpty ? .finish(assistant) : .toolCalls(assistant, toolCalls)
+    }
+
+    var resultDescription: String {
+        toolCalls.isEmpty
+            ? "provider finished with \(assistantContentByteCount) content bytes"
+            : "provider selected \(toolCalls.count) typed tool calls"
+    }
+}
+
+struct StageBPolicyRejectionEvidence: Codable, Equatable, Sendable {
+    let reason: StageBError
+    let callIndex: Int?
+}
+
 struct StageBSearchEvidence: Codable, Equatable, Sendable {
     let path: String
     let line: Int
@@ -147,6 +175,42 @@ struct StageBAttemptEvidence: Codable, Equatable, Sendable {
     let resultByteCount: Int?
     let resultSHA256: String?
     let observation: StageBObservationEvidence?
+    let providerOutcome: StageBProviderOutcomeEvidence?
+    let policyRejection: StageBPolicyRejectionEvidence?
+
+    init(
+        sessionID: UUID,
+        operationID: UUID,
+        attemptID: UUID,
+        kind: StageBAttemptKind,
+        toolName: StageBToolName?,
+        toolCallIDHash: String?,
+        inputSHA256: String,
+        recordedAt: Date,
+        phase: StageBAttemptPhase,
+        category: StageBAttemptCategory,
+        resultByteCount: Int?,
+        resultSHA256: String?,
+        observation: StageBObservationEvidence?,
+        providerOutcome: StageBProviderOutcomeEvidence? = nil,
+        policyRejection: StageBPolicyRejectionEvidence? = nil
+    ) {
+        self.sessionID = sessionID
+        self.operationID = operationID
+        self.attemptID = attemptID
+        self.kind = kind
+        self.toolName = toolName
+        self.toolCallIDHash = toolCallIDHash
+        self.inputSHA256 = inputSHA256
+        self.recordedAt = recordedAt
+        self.phase = phase
+        self.category = category
+        self.resultByteCount = resultByteCount
+        self.resultSHA256 = resultSHA256
+        self.observation = observation
+        self.providerOutcome = providerOutcome
+        self.policyRejection = policyRejection
+    }
 }
 
 struct StageBDurableSnapshot: Sendable {
@@ -501,7 +565,70 @@ actor StageBSessionStore {
                 return false
             }
         }
+        if let outcome = evidence.providerOutcome {
+            let contentBytes = outcome.assistantContentByteCount
+            let callBytes = outcome.toolCalls.reduce(0) {
+                $0 + $1.id.utf8.count + $1.name.utf8.count + $1.arguments.utf8.count + 96
+            }
+            let decisionShapeValid: Bool
+            if evidence.category == .providerToolCalls {
+                decisionShapeValid = !outcome.toolCalls.isEmpty
+            } else {
+                decisionShapeValid = outcome.toolCalls.isEmpty
+                    && contentBytes > 0
+                    && outcome.assistantContentSHA256 != nil
+            }
+            guard evidence.kind == .provider,
+                  evidence.phase == .succeeded,
+                  evidence.category == .providerToolCalls || evidence.category == .providerFinish,
+                  contentBytes >= 0,
+                  contentBytes <= ProviderLimits.maximumTurnMessageBytes,
+                  contentBytes <= limits.maximumContextBytes,
+                  outcome.assistantContentSHA256.map(validHash) ?? true,
+                  callBytes <= limits.maximumContextBytes - contentBytes,
+                  Set(outcome.toolCalls.map(\.id)).count == outcome.toolCalls.count,
+                  outcome.toolCalls.allSatisfy({
+                      validOpaqueIdentifier(
+                          $0.id,
+                          maximumBytes: ProviderLimits.maximumToolCallIDBytes
+                      )
+                          && validToolName($0.name)
+                          && !$0.arguments.isEmpty
+                          && $0.arguments.utf8.count <= ProviderLimits.maximumToolArgumentsBytes
+                  }),
+                  decisionShapeValid else {
+                return false
+            }
+        }
+        if let rejection = evidence.policyRejection {
+            guard evidence.kind == .executor,
+                  evidence.phase == .failed,
+                  evidence.category == .policyNotExecuted,
+                  rejection.callIndex.map({
+                      $0 >= 0 && $0 < limits.maximumToolExecutions
+                  }) ?? true else {
+                return false
+            }
+        }
         return true
+    }
+
+    private static func validOpaqueIdentifier(_ value: String, maximumBytes: Int) -> Bool {
+        let bytes = value.utf8.count
+        return bytes > 0
+            && bytes <= maximumBytes
+            && value.unicodeScalars.allSatisfy {
+                !CharacterSet.controlCharacters.contains($0)
+            }
+    }
+
+    private static func validToolName(_ value: String) -> Bool {
+        validOpaqueIdentifier(value, maximumBytes: ProviderLimits.maximumToolNameBytes)
+            && value.unicodeScalars.allSatisfy {
+                CharacterSet.lowercaseLetters.contains($0)
+                    || CharacterSet.decimalDigits.contains($0)
+                    || $0 == "_"
+            }
     }
 
     private static func validHash(_ value: String) -> Bool {
