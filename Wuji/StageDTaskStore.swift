@@ -30,9 +30,33 @@ actor StageDTaskStore {
         recordsURL = rootURL.appendingPathComponent("Tasks", isDirectory: true)
         encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        encoder.dateEncodingStrategy = .millisecondsSince1970
+        encoder.dateEncodingStrategy = .custom { date, encoder in
+            var container = encoder.singleValueContainer()
+            let milliseconds = date.timeIntervalSince1970 * 1_000
+            guard milliseconds.isFinite,
+                  milliseconds >= Double(Int64.min),
+                  milliseconds <= Double(Int64.max) else {
+                throw EncodingError.invalidValue(
+                    date,
+                    .init(codingPath: encoder.codingPath, debugDescription: "Date is outside durable range")
+                )
+            }
+            try container.encode(Int64(milliseconds.rounded()))
+        }
         decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .millisecondsSince1970
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let milliseconds = try container.decode(Double.self)
+            guard milliseconds.isFinite,
+                  milliseconds >= Double(Int64.min),
+                  milliseconds <= Double(Int64.max) else {
+                throw DecodingError.dataCorruptedError(
+                    in: container,
+                    debugDescription: "Durable date is outside supported range"
+                )
+            }
+            return Date(timeIntervalSince1970: milliseconds.rounded() / 1_000)
+        }
         try fileManager.createDirectory(at: recordsURL, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: cloneRootURL, withIntermediateDirectories: true)
     }
@@ -376,6 +400,10 @@ actor StageDTaskStore {
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .millisecondsSince1970
         return (try? encoder.encode(value)).map(ProviderDigest.sha256Hex)
+    }
+
+    static func durableDate(_ date: Date) -> Date {
+        Date(timeIntervalSince1970: (date.timeIntervalSince1970 * 1_000).rounded() / 1_000)
     }
 
     private static func validHash(_ value: String) -> Bool {

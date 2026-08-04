@@ -287,17 +287,28 @@ final class StageDCommandAgent: @unchecked Sendable {
                 )
                 switch await approvalAuthorizer.requestApproval(request) {
                 case let .approved(grant):
-                    guard grant.requestID == request.requestID,
-                          grant.requestBindingSHA256 == request.bindingSHA256,
-                          grant.nonce == request.nonce,
-                          grant.approvedAt <= request.expiresAt else {
+                    let durableGrant = StageDApprovalGrant(
+                        requestID: grant.requestID,
+                        requestBindingSHA256: grant.requestBindingSHA256,
+                        nonce: grant.nonce,
+                        approvedAt: StageDTaskStore.durableDate(grant.approvedAt)
+                    )
+                    guard durableGrant.requestID == request.requestID,
+                          durableGrant.requestBindingSHA256 == request.bindingSHA256,
+                          durableGrant.nonce == request.nonce,
+                          durableGrant.approvedAt <= request.expiresAt else {
                         return .rejected(.approvalTampered)
                     }
-                    approvalGrant = grant
+                    approvalGrant = durableGrant
                     approvalBinding = request.bindingSHA256
                     _ = try await store.appendApproval(
                         taskID: taskID,
-                        evidence: .init(request: request, state: .approved, recordedAt: now(), grant: grant),
+                        evidence: .init(
+                            request: request,
+                            state: .approved,
+                            recordedAt: now(),
+                            grant: durableGrant
+                        ),
                         phase: .awaitingApproval
                     )
                 case .rejected:
@@ -366,8 +377,11 @@ final class StageDCommandAgent: @unchecked Sendable {
                     _ = try await store.setPhase(taskID: taskID, phase: .failed)
                     return .failed(.completionRejected)
                 }
-                _ = try await store.complete(taskID: taskID, completion: completion)
-                return .completed(completion)
+                let completed = try await store.complete(taskID: taskID, completion: completion)
+                guard let durableCompletion = completed.completion else {
+                    throw StageDCommandError.evidenceFailure
+                }
+                return .completed(durableCompletion)
             case let .failed(result):
                 let resultSHA = result.flatMap { StageDTaskStore.digest($0) }
                 let terminal = terminalAttempt(
@@ -415,8 +429,11 @@ final class StageDCommandAgent: @unchecked Sendable {
                 now: now()
             )
             if let completion {
-                _ = try await store.complete(taskID: taskID, completion: completion)
-                return .completed(completion)
+                let completed = try await store.complete(taskID: taskID, completion: completion)
+                guard let durableCompletion = completed.completion else {
+                    throw StageDCommandError.evidenceFailure
+                }
+                return .completed(durableCompletion)
             }
         }
         let providerPairs = paired(record.attempts.filter { $0.kind == .provider })
@@ -455,7 +472,7 @@ final class StageDCommandAgent: @unchecked Sendable {
         operationID: UUID,
         attemptID: UUID
     ) -> StageDApprovalRequest {
-        let created = now()
+        let created = StageDTaskStore.durableDate(now())
         return .init(
             requestID: makeUUID(),
             taskID: record.id,
@@ -470,7 +487,9 @@ final class StageDCommandAgent: @unchecked Sendable {
             executionRoot: command.executionRoot,
             nonce: makeUUID(),
             createdAt: created,
-            expiresAt: created.addingTimeInterval(limits.maximumApprovalSeconds)
+            expiresAt: StageDTaskStore.durableDate(
+                created.addingTimeInterval(limits.maximumApprovalSeconds)
+            )
         )
     }
 
