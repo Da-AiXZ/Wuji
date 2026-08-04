@@ -6,9 +6,10 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
     func testRealARM64ISHStageDCommandMatrixInstallVersionsCloneWriteAndProcessTruth() async throws {
         let prepared = try await StageDTestSupport.prepare()
         defer { prepared.cleanup() }
+        let cloneRootURL = await prepared.store.cloneRootURL
         let executor = try ISHStageDCommandExecutor.bundled(
             workspace: prepared.base.workspace,
-            cloneRootURL: prepared.store.cloneRootURL
+            cloneRootURL: cloneRootURL
         )
 
         let installTask = try await makeTask(
@@ -101,9 +102,8 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
             command: "git clone --depth 8 --no-tags --single-branch https://github.com/Da-AiXZ/Wuji.git Wuji-StageC",
             cwd: "."
         ) else { return XCTFail("exact public clone did not complete") }
-        let cloneResult = try XCTUnwrap(
-            (try await prepared.store.snapshot(taskID: cloneTask.id)).attempts.last?.result
-        )
+        let cloneSnapshot = try await prepared.store.snapshot(taskID: cloneTask.id)
+        let cloneResult = try XCTUnwrap(cloneSnapshot.attempts.last?.result)
         XCTAssertEqual(cloneResult.cloneRemote, StageDEnvironmentLock.cloneURL)
         XCTAssertEqual(cloneResult.cloneHEAD, StageDEnvironmentLock.acceptedStageCCommit)
         XCTAssertLessThanOrEqual(cloneResult.cloneEntryCount ?? Int.max, StageDLimits.production.maximumCloneEntries)

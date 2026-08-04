@@ -186,10 +186,8 @@ final class WujiStageDRecoveryTests: XCTestCase {
         XCTAssertEqual(coldOutcome, .completed(first))
         XCTAssertEqual(coldProviderCalls, 0)
         XCTAssertEqual(coldExecutorCalls, 0)
-        XCTAssertEqual(
-            try await prepared.store.snapshot(taskID: prepared.task.id).attempts.count,
-            before.attempts.count
-        )
+        let restored = try await prepared.store.snapshot(taskID: prepared.task.id)
+        XCTAssertEqual(restored.attempts.count, before.attempts.count)
     }
 
     func testModelFinishClaimCannotCompleteWithoutCommandEvidence() async throws {
