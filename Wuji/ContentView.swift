@@ -50,6 +50,14 @@ struct ContentView: View {
                     }
                 }
 
+                Section("开发环境") {
+                    NavigationLink {
+                        StageDCommandView()
+                    } label: {
+                        Label("命令与工具", systemImage: "terminal")
+                    }
+                }
+
                 Section {
                     DisclosureGroup("验证控件") {
                         ExecutorSelfTestView()
@@ -87,7 +95,7 @@ struct ContentView: View {
                 DeepSeekSettingsView(viewModel: viewModel)
             }
             .task {
-                if !StageBProbeRunner.isRequested {
+                if !StageBProbeRunner.isRequested && !StageDProbeRunner.isRequested {
                     await viewModel.load()
                 }
             }

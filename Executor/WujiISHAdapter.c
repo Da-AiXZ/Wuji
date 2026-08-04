@@ -41,6 +41,9 @@ struct WujiISHRunResult {
     WujiISHCancelDelivery cancel_delivery;
     WujiISHFinalKind final_kind;
     int32_t final_value;
+    uint64_t process_context;
+    WujiISHProcessTreeKind process_tree_kind;
+    int32_t active_descendant_count;
     char error[256];
 };
 
@@ -57,9 +60,14 @@ static bool g_stage_b_workspace_mounted = false;
 static char g_stage_b_workspace_source[4096];
 static bool g_stage_c_workspace_mounted = false;
 static char g_stage_c_workspace_source[4096];
+static bool g_stage_d_workspace_mounted = false;
+static char g_stage_d_workspace_source[4096];
+static bool g_stage_d_clone_root_mounted = false;
+static char g_stage_d_clone_root_source[4096];
 static struct task *g_init_task = NULL;
 static struct WujiISHRunResult *g_active_result = NULL;
 static int g_active_pid = -1;
+static uint64_t g_next_process_context = 1;
 
 static void set_error(char *buffer, size_t size, const char *message) {
     if (buffer == NULL || size == 0)
@@ -72,6 +80,20 @@ static void wuji_exit_hook(struct task *task, int code) {
     if (g_active_result != NULL && task->pid == g_active_pid) {
         g_active_result->root_exited = true;
         g_active_result->raw_status = code;
+        if (g_active_result->process_context != 0) {
+            int32_t active = 0;
+            for (dword_t pid = 1; pid <= MAX_PID; pid++) {
+                struct task *candidate = pid_get_task_zombie(pid);
+                if (candidate != NULL && candidate != task && candidate->group != NULL &&
+                    candidate->group->fs_context == g_active_result->process_context &&
+                    !candidate->zombie && !candidate->exiting)
+                    active++;
+            }
+            g_active_result->active_descendant_count = active;
+            g_active_result->process_tree_kind = active == 0
+                ? WUJI_ISH_PROCESS_TREE_QUIESCENT
+                : WUJI_ISH_PROCESS_TREE_DESCENDANTS_REMAIN;
+        }
         pthread_cond_broadcast(&g_exit_condition);
     }
     pthread_mutex_unlock(&g_state_lock);
@@ -309,6 +331,71 @@ int wuji_ish_mount_stage_c_workspace(const char *host_path,
     return 0;
 }
 
+static int mount_stage_d_root(const char *host_path,
+                              const char *guest_path,
+                              bool *mounted,
+                              char *mounted_source,
+                              size_t mounted_source_size,
+                              char *error_buffer,
+                              size_t error_buffer_size) {
+    if (host_path == NULL || host_path[0] == '\0') {
+        set_error(error_buffer, error_buffer_size, "invalid Stage D root path");
+        return -1;
+    }
+    char canonical_path[4096];
+    if (realpath(host_path, canonical_path) == NULL) {
+        set_error(error_buffer, error_buffer_size, "Stage D root canonicalization failed");
+        return -1;
+    }
+    struct stat info;
+    if (lstat(canonical_path, &info) != 0 || !S_ISDIR(info.st_mode)) {
+        set_error(error_buffer, error_buffer_size, "Stage D root is unavailable");
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_boot_lock);
+    if (!g_booted) {
+        set_error(error_buffer, error_buffer_size, "iSH is not prepared");
+        pthread_mutex_unlock(&g_boot_lock);
+        return -1;
+    }
+    if (*mounted) {
+        bool same_source = strcmp(mounted_source, canonical_path) == 0;
+        if (!same_source)
+            set_error(error_buffer, error_buffer_size, "different Stage D root already mounted");
+        pthread_mutex_unlock(&g_boot_lock);
+        return same_source ? 0 : -1;
+    }
+
+    int flags = MS_NOSUID_ | MS_NODEV_ | MS_NOEXEC_;
+    int error = do_mount(&realfs, canonical_path, guest_path, "", flags);
+    if (error < 0) {
+        set_error(error_buffer, error_buffer_size, "Stage D root mount failed");
+        pthread_mutex_unlock(&g_boot_lock);
+        return error;
+    }
+    snprintf(mounted_source, mounted_source_size, "%s", canonical_path);
+    *mounted = true;
+    pthread_mutex_unlock(&g_boot_lock);
+    return 0;
+}
+
+int wuji_ish_mount_stage_d_workspace(const char *host_path,
+                                     char *error_buffer,
+                                     size_t error_buffer_size) {
+    return mount_stage_d_root(host_path, "/wuji-stage-d", &g_stage_d_workspace_mounted,
+                              g_stage_d_workspace_source, sizeof(g_stage_d_workspace_source),
+                              error_buffer, error_buffer_size);
+}
+
+int wuji_ish_mount_stage_d_clone_root(const char *host_path,
+                                      char *error_buffer,
+                                      size_t error_buffer_size) {
+    return mount_stage_d_root(host_path, "/wuji-stage-d-clones", &g_stage_d_clone_root_mounted,
+                              g_stage_d_clone_root_source, sizeof(g_stage_d_clone_root_source),
+                              error_buffer, error_buffer_size);
+}
+
 static bool attach_host_fd(struct task *task, int guest_fd, int host_fd) {
     struct fd *fd = adhoc_fd_create(&realfs_fdops);
     if (fd == NULL)
@@ -480,10 +567,12 @@ static struct WujiISHRunResult *make_result(size_t output_limit) {
     return result;
 }
 
-static WujiISHRunResult *run_arguments(const char *executable,
-                                       int argument_count,
-                                       char *arguments,
-                                       size_t output_limit) {
+static WujiISHRunResult *run_arguments_in_directory(const char *executable,
+                                                    int argument_count,
+                                                    char *arguments,
+                                                    size_t output_limit,
+                                                    const char *guest_cwd,
+                                                    bool observe_process_tree) {
     struct WujiISHRunResult *result = make_result(output_limit);
     if (result == NULL)
         return NULL;
@@ -515,6 +604,26 @@ static WujiISHRunResult *run_arguments(const char *executable,
     }
     struct task *guest_task = current;
 
+    if (observe_process_tree) {
+        pthread_mutex_lock(&g_state_lock);
+        uint64_t context = g_next_process_context++;
+        if (context == 0)
+            context = g_next_process_context++;
+        result->process_context = context;
+        guest_task->group->fs_context = context;
+        pthread_mutex_unlock(&g_state_lock);
+    }
+
+    if (guest_cwd != NULL) {
+        struct fd *cwd = generic_open(guest_cwd, O_RDONLY_, 0);
+        if (IS_ERR(cwd)) {
+            current = saved_current;
+            set_error(result->error, sizeof(result->error), "guest cwd unavailable");
+            goto finish;
+        }
+        fs_chdir(guest_task->fs, cwd);
+    }
+
     int null_fd = open("/dev/null", O_RDONLY);
     int stdout_guest_fd = dup(stdout_pipe[1]);
     int stderr_guest_fd = dup(stderr_pipe[1]);
@@ -540,7 +649,10 @@ static WujiISHRunResult *run_arguments(const char *executable,
         "HOME=/root\0"
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0"
         "TERM=dumb\0"
-        "PYTHONMALLOC=malloc\0";
+        "PYTHONMALLOC=malloc\0"
+        "GIT_TERMINAL_PROMPT=0\0"
+        "GIT_ASKPASS=/bin/false\0"
+        "SSH_ASKPASS=/bin/false\0";
 
     error = do_execve(executable, argument_count, arguments, environment);
     if (error < 0) {
@@ -611,6 +723,15 @@ finish:
     if (stderr_pipe[1] >= 0) close(stderr_pipe[1]);
     pthread_mutex_unlock(&g_run_lock);
     return result;
+}
+
+static WujiISHRunResult *run_arguments(const char *executable,
+                                       int argument_count,
+                                       char *arguments,
+                                       size_t output_limit) {
+    return run_arguments_in_directory(
+        executable, argument_count, arguments, output_limit, NULL, false
+    );
 }
 
 WujiISHRunResult *wuji_ish_run_self_test(WujiISHSelfTestCase test_case,
@@ -831,6 +952,106 @@ WujiISHRunResult *wuji_ish_run_stage_c_edit(const char *relative_path,
     return run_arguments("/bin/sh", 9, arguments, output_limit);
 }
 
+static const char *stage_d_executable_path(const char *executable) {
+    if (executable == NULL)
+        return NULL;
+    if (strcmp(executable, "pwd") == 0) return "/bin/pwd";
+    if (strcmp(executable, "ls") == 0) return "/bin/ls";
+    if (strcmp(executable, "cat") == 0) return "/bin/cat";
+    if (strcmp(executable, "sed") == 0) return "/bin/sed";
+    if (strcmp(executable, "rm") == 0) return "/bin/rm";
+    if (strcmp(executable, "cp") == 0) return "/bin/cp";
+    if (strcmp(executable, "mv") == 0) return "/bin/mv";
+    if (strcmp(executable, "git") == 0) return "/usr/bin/git";
+    if (strcmp(executable, "python3") == 0) return "/usr/bin/python3";
+    if (strcmp(executable, "node") == 0) return "/usr/bin/node";
+    if (strcmp(executable, "npm") == 0) return "/usr/bin/npm";
+    if (strcmp(executable, "apk") == 0) return "/sbin/apk";
+    return NULL;
+}
+
+static bool valid_stage_d_argument(const char *argument, size_t length) {
+    if (argument == NULL || length == 0 || length > 1024)
+        return false;
+    for (size_t index = 0; index < length; index++) {
+        unsigned char byte = (unsigned char)argument[index];
+        if (byte < 0x20 || byte == 0x7f)
+            return false;
+    }
+    return true;
+}
+
+static bool build_stage_d_cwd(const char *relative_cwd,
+                              WujiISHStageDRoot root,
+                              char *output,
+                              size_t output_size) {
+    if (relative_cwd == NULL || !valid_relative_path_with_limit(relative_cwd, 1024))
+        return false;
+    const char *base = NULL;
+    switch (root) {
+        case WUJI_ISH_STAGE_D_WORKSPACE:
+            if (!g_stage_d_workspace_mounted) return false;
+            base = "/wuji-stage-d";
+            break;
+        case WUJI_ISH_STAGE_D_CLONE_ROOT:
+            if (!g_stage_d_clone_root_mounted) return false;
+            base = "/wuji-stage-d-clones";
+            break;
+        case WUJI_ISH_STAGE_D_ROOTFS:
+            if (relative_cwd[0] != '\0') return false;
+            base = "/root";
+            break;
+        default:
+            return false;
+    }
+    int count = relative_cwd[0] == '\0'
+        ? snprintf(output, output_size, "%s", base)
+        : snprintf(output, output_size, "%s/%s", base, relative_cwd);
+    return count > 0 && (size_t)count < output_size;
+}
+
+WujiISHRunResult *wuji_ish_run_stage_d_command(const char *executable,
+                                                const uint8_t *argument_blob,
+                                                size_t argument_blob_length,
+                                                int32_t argument_count,
+                                                const char *relative_cwd,
+                                                WujiISHStageDRoot root,
+                                                size_t output_limit) {
+    const char *path = stage_d_executable_path(executable);
+    if (path == NULL || argument_count < 0 || argument_count > 16 ||
+        argument_blob_length > 8192 || output_limit == 0 || output_limit > 65536 ||
+        (argument_count > 0 && argument_blob == NULL))
+        return NULL;
+
+    char cwd[2048];
+    if (!build_stage_d_cwd(relative_cwd, root, cwd, sizeof(cwd)))
+        return NULL;
+
+    char arguments[12288] = {0};
+    size_t output_offset = 0;
+    if (!append_argument(arguments, sizeof(arguments), &output_offset, path))
+        return NULL;
+    size_t input_offset = 0;
+    for (int32_t index = 0; index < argument_count; index++) {
+        if (input_offset >= argument_blob_length)
+            return NULL;
+        const uint8_t *start = argument_blob + input_offset;
+        const uint8_t *terminator = memchr(start, '\0', argument_blob_length - input_offset);
+        if (terminator == NULL)
+            return NULL;
+        size_t length = (size_t)(terminator - start);
+        if (!valid_stage_d_argument((const char *)start, length) ||
+            !append_argument(arguments, sizeof(arguments), &output_offset, (const char *)start))
+            return NULL;
+        input_offset += length + 1;
+    }
+    if (input_offset != argument_blob_length)
+        return NULL;
+    return run_arguments_in_directory(
+        path, argument_count + 1, arguments, output_limit, cwd, true
+    );
+}
+
 static bool valid_sha256(const char *value) {
     if (value == NULL || strlen(value) != 64)
         return false;
@@ -986,6 +1207,12 @@ bool wuji_ish_result_cancellation_requested(const WujiISHRunResult *result) { re
 WujiISHCancelDelivery wuji_ish_result_cancel_delivery(const WujiISHRunResult *result) { return result->cancel_delivery; }
 WujiISHFinalKind wuji_ish_result_final_kind(const WujiISHRunResult *result) { return result->final_kind; }
 int32_t wuji_ish_result_final_value(const WujiISHRunResult *result) { return result->final_value; }
+WujiISHProcessTreeKind wuji_ish_result_process_tree_kind(const WujiISHRunResult *result) {
+    return result->process_tree_kind;
+}
+int32_t wuji_ish_result_active_descendant_count(const WujiISHRunResult *result) {
+    return result->active_descendant_count;
+}
 const char *wuji_ish_result_error(const WujiISHRunResult *result) { return result->error; }
 
 void wuji_ish_result_free(WujiISHRunResult *result) {

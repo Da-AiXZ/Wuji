@@ -30,6 +30,18 @@ typedef enum {
     WUJI_ISH_READ_ONLY_READ = 2,
 } WujiISHReadOnlyOperation;
 
+typedef enum {
+    WUJI_ISH_STAGE_D_WORKSPACE = 0,
+    WUJI_ISH_STAGE_D_CLONE_ROOT = 1,
+    WUJI_ISH_STAGE_D_ROOTFS = 2,
+} WujiISHStageDRoot;
+
+typedef enum {
+    WUJI_ISH_PROCESS_TREE_NOT_OBSERVED = 0,
+    WUJI_ISH_PROCESS_TREE_QUIESCENT = 1,
+    WUJI_ISH_PROCESS_TREE_DESCENDANTS_REMAIN = 2,
+} WujiISHProcessTreeKind;
+
 typedef struct WujiISHRunResult WujiISHRunResult;
 
 int wuji_ish_prepare(const char *archive_path,
@@ -52,6 +64,14 @@ int wuji_ish_mount_stage_b_workspace(const char *host_path,
 int wuji_ish_mount_stage_c_workspace(const char *host_path,
                                      char *error_buffer,
                                      size_t error_buffer_size);
+
+int wuji_ish_mount_stage_d_workspace(const char *host_path,
+                                     char *error_buffer,
+                                     size_t error_buffer_size);
+
+int wuji_ish_mount_stage_d_clone_root(const char *host_path,
+                                      char *error_buffer,
+                                      size_t error_buffer_size);
 
 WujiISHRunResult *wuji_ish_run_self_test(WujiISHSelfTestCase test_case,
                                          size_t output_limit);
@@ -77,6 +97,14 @@ WujiISHRunResult *wuji_ish_run_stage_c_edit(const char *relative_path,
                                             const char *before_sha256,
                                             const char *after_sha256,
                                             size_t output_limit);
+
+WujiISHRunResult *wuji_ish_run_stage_d_command(const char *executable,
+                                                const uint8_t *argument_blob,
+                                                size_t argument_blob_length,
+                                                int32_t argument_count,
+                                                const char *relative_cwd,
+                                                WujiISHStageDRoot root,
+                                                size_t output_limit);
 
 WujiISHRunResult *wuji_ish_run_s4_edit(const char *relative_path,
                                        const char *expected_old,
@@ -104,6 +132,8 @@ bool wuji_ish_result_cancellation_requested(const WujiISHRunResult *result);
 WujiISHCancelDelivery wuji_ish_result_cancel_delivery(const WujiISHRunResult *result);
 WujiISHFinalKind wuji_ish_result_final_kind(const WujiISHRunResult *result);
 int32_t wuji_ish_result_final_value(const WujiISHRunResult *result);
+WujiISHProcessTreeKind wuji_ish_result_process_tree_kind(const WujiISHRunResult *result);
+int32_t wuji_ish_result_active_descendant_count(const WujiISHRunResult *result);
 const char *wuji_ish_result_error(const WujiISHRunResult *result);
 void wuji_ish_result_free(WujiISHRunResult *result);
 

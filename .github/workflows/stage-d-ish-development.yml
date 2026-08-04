@@ -1,0 +1,423 @@
+name: Stage D iSH Development Environment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  stage-d-validation:
+    name: Apple build, Stage D tests, real ARM64 iSH environment, and DeepSeek command
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out exact candidate without recursive submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0
+
+      - name: Fail closed unless existing DeepSeek secrets are configured
+        shell: bash
+        env:
+          DEEPSEEK_BASE_URL: ${{ secrets.DEEPSEEK_BASE_URL }}
+          DEEPSEEK_MODEL: ${{ secrets.DEEPSEEK_MODEL }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          set -euo pipefail
+          set +x
+          test -n "$DEEPSEEK_BASE_URL"
+          test -n "$DEEPSEEK_MODEL"
+          test -n "$DEEPSEEK_API_KEY"
+          echo 'STAGE_D_SECRET_PREFLIGHT=PASS'
+
+      - name: Verify exact head and protected fixed-source closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse d8544f431b25fb33c9541e7b2b2405ccb4d686ce^{tree})" = f1347ea122700204008aaa06f5b9bffd2e19c356
+          git merge-base --is-ancestor d8544f431b25fb33c9541e7b2b2405ccb4d686ce HEAD
+          git submodule update --init ThirdParty/ish
+          git -C ThirdParty/ish submodule update --init deps/libarchive
+          Scripts/verify-source-lock.sh
+          Scripts/verify-minizip-lock.sh
+          test "$(git ls-tree HEAD ThirdParty/ish | awk '{print $3}')" = de124dd66124a15239cea1465164f74980ada245
+
+      - name: Install fixed-source Apple build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake meson ninja llvm lld
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
+
+      - name: Verify rootfs repositories and build fixed ARM64 iSH closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          Scripts/fetch-rootfs.sh
+          rootfs="Wuji/Resources/rootfs.tar.gz"
+          tar -xOzf "$rootfs" etc/apk/repositories > "$RUNNER_TEMP/stage-d-repositories"
+          printf '%s\n' \
+            'https://dl-cdn.alpinelinux.org/alpine/v3.21/main' \
+            'https://dl-cdn.alpinelinux.org/alpine/v3.21/community' \
+            > "$RUNNER_TEMP/stage-d-expected-repositories"
+          cmp "$RUNNER_TEMP/stage-d-repositories" "$RUNNER_TEMP/stage-d-expected-repositories"
+          tar -xOzf "$rootfs" etc/apk/world | sort > "$RUNNER_TEMP/stage-d-world"
+          printf '%s\n' alpine-baselayout alpine-keys alpine-release apk-tools busybox libc-utils \
+            | sort > "$RUNNER_TEMP/stage-d-expected-world"
+          cmp "$RUNNER_TEMP/stage-d-world" "$RUNNER_TEMP/stage-d-expected-world"
+          Scripts/build-ish.sh "$RUNNER_TEMP/wuji-ish"
+          echo 'STAGE_D_ROOTFS_REPOSITORY_LOCK=PASS'
+
+      - name: Verify Xcode 16.4 project and build exact-head unsigned ARM64 app
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          xcodebuild -version | tee "$RUNNER_TEMP/stage-d-xcode-version.txt"
+          grep -q 'Xcode 16.4' "$RUNNER_TEMP/stage-d-xcode-version.txt"
+          xcodebuild -list -project Wuji.xcodeproj
+          WUJI_ISH_BUILD_DIR="$RUNNER_TEMP/wuji-ish" xcodebuild \
+            -project Wuji.xcodeproj \
+            -scheme Wuji \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "generic/platform=iOS Simulator" \
+            -derivedDataPath "$RUNNER_TEMP/wuji-stage-d-derived" \
+            clean build \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee "$RUNNER_TEMP/wuji-stage-d-build.log"
+
+      - name: Select and boot an ARM64 iPad simulator
+        id: simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          simulator_id="$({ xcrun simctl list devices available -j; } | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; a=[x for g in d.values() for x in g if x.get("isAvailable") and "iPad" in x.get("name","")]; print(a[0]["udid"] if a else "")')"
+          test -n "$simulator_id"
+          xcrun simctl bootstatus "$simulator_id" -b
+          echo "id=$simulator_id" >> "$GITHUB_OUTPUT"
+
+      - name: Run protected risk tests and real ARM64 iSH Stage D matrix
+        shell: bash
+        env:
+          WUJI_STAGE_D_REAL: "1"
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          WUJI_ISH_BUILD_DIR="$RUNNER_TEMP/wuji-ish" xcodebuild \
+            -project Wuji.xcodeproj \
+            -scheme Wuji \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.id }}" \
+            -derivedDataPath "$RUNNER_TEMP/wuji-stage-d-derived" \
+            -resultBundlePath "$RUNNER_TEMP/wuji-stage-d-tests.xcresult" \
+            -only-testing:"WujiTests/WujiProviderTests" \
+            -only-testing:"WujiTests/WujiStageASecureConfigurationTests" \
+            -only-testing:"WujiTests/WujiStageBTests" \
+            -only-testing:"WujiTests/WujiStageBISHIntegrationTests" \
+            -only-testing:"WujiTests/WujiStageCContractsTests" \
+            -only-testing:"WujiTests/WujiStageCStoreApprovalTests" \
+            -only-testing:"WujiTests/WujiStageCAgentTests" \
+            -only-testing:"WujiTests/WujiStageCApprovalViewTests" \
+            -only-testing:"WujiTests/WujiStageCISHIntegrationTests" \
+            -only-testing:"WujiTests/WujiStageDPolicyTests" \
+            -only-testing:"WujiTests/WujiStageDRecoveryTests" \
+            -only-testing:"WujiTests/WujiStageDISHIntegrationTests" \
+            test \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            2>&1 | tee "$RUNNER_TEMP/wuji-stage-d-tests.log"
+
+      - name: Audit required Stage D XCTest names and results
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun xcresulttool get test-results summary \
+            --path "$RUNNER_TEMP/wuji-stage-d-tests.xcresult" --format json \
+            > "$RUNNER_TEMP/wuji-stage-d-summary.json"
+          xcrun xcresulttool get test-results tests \
+            --path "$RUNNER_TEMP/wuji-stage-d-tests.xcresult" --format json \
+            > "$RUNNER_TEMP/wuji-stage-d-tests.json"
+          RUNNER_TEMP="$RUNNER_TEMP" /usr/bin/python3 <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          summary = json.loads((root / "wuji-stage-d-summary.json").read_text())
+          if summary.get("failedTests", 0) != 0 or summary.get("skippedTests", 0) != 0:
+              raise SystemExit("Stage D XCTest summary contains failure or skip")
+          text = (root / "wuji-stage-d-tests.json").read_text()
+          required = [
+              "testParserClassifiesStrictSingleCommandGrammar",
+              "testClassifierAllowsOnlyNamedSafeReadCommandsWithoutApproval",
+              "testWriteNetworkAndInstallationRequireExactBoundApprovalClass",
+              "testDeleteOverwriteBoundaryAndUnknownFailClosedBeforeExecutorIO",
+              "testCloneRequiresExactCredentialFreeURLFlagsTargetAndCWD",
+              "testInstallationAcceptsOnlyFixedPackageSetAndExistingRepositoryPolicy",
+              "testUnsupportedLanguagesReportUnavailableWithoutSilentInstall",
+              "testSecretEnvironmentAndCredentialSyntaxCannotBecomeCommandOrCloneEvidence",
+              "testProcessDrainTruncationAndProcessTreeRemainSeparateCompletionFacts",
+              "testUIProjectionCannotAuthorApprovalExecutionOrCompletionTruth",
+              "testProductionResourceDefaultsAreExactAndInjectable",
+              "testApprovalBindsTaskOperationAttemptCommandArgvCwdRiskAndExpiry",
+              "testRejectedAndTamperedApprovalPerformZeroExecutorIO",
+              "testDurableIntentPrecedesISHIOAndSameWorkspaceGateSerializes",
+              "testUnknownCommandColdRestoreNeverResendsWriteNetworkInstallOrProvider",
+              "testCancelledDrainedOrTruncatedUnknownRemainsReconciliationRequired",
+              "testReliableProviderDecisionResumesWithoutProviderResend",
+              "testCompletedColdRestoreCreatesZeroProviderCommandCloneInstallOrWriteAttempts",
+              "testModelFinishClaimCannotCompleteWithoutCommandEvidence",
+              "testCodeOwnedCompletionRejectsWrongCloneHeadAndIncompleteProcessFacts",
+              "testRealARM64ISHStageDCommandMatrixInstallVersionsCloneWriteAndProcessTruth",
+          ]
+          missing = [name for name in required if name not in text]
+          if missing:
+              raise SystemExit("missing Stage D required XCTest names: " + ", ".join(missing))
+          print(f"STAGE_D_REQUIRED_XCTEST_CASES={len(required)}")
+          print("STAGE_D_XCRESULT_AUDIT=PASS")
+          PY
+
+      - name: Install exact-head app and run production DeepSeek Stage D command flow
+        shell: bash
+        env:
+          DEEPSEEK_BASE_URL: ${{ secrets.DEEPSEEK_BASE_URL }}
+          DEEPSEEK_MODEL: ${{ secrets.DEEPSEEK_MODEL }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          STAGE_D_SIMULATOR_ID: ${{ steps.simulator.outputs.id }}
+        run: |
+          set -euo pipefail
+          set +x
+          app="$RUNNER_TEMP/wuji-stage-d-derived/Build/Products/Debug-iphonesimulator/Wuji.app"
+          test -d "$app/StageDRealImportedProject"
+          test -f "$app/StageDRealImportedProject/AGENTS.md"
+          test -f "$app/StageDRealImportedProject/Sources/Environment.txt"
+          test -f "$app/rootfs.tar.gz"
+          xcrun simctl uninstall "$STAGE_D_SIMULATOR_ID" com.daaixz.wuji >/dev/null 2>&1 || true
+          xcrun simctl install "$STAGE_D_SIMULATOR_ID" "$app"
+          data_container="$(xcrun simctl get_app_container "$STAGE_D_SIMULATOR_ID" com.daaixz.wuji data)"
+          summary_file="$data_container/Documents/wuji-stage-d-summary.json"
+          rm -f "$summary_file"
+          export SIMCTL_CHILD_WUJI_STAGE_D_PROBE_MODE=1
+          export SIMCTL_CHILD_WUJI_STAGE_D_SUMMARY_FILE="$summary_file"
+          export SIMCTL_CHILD_WUJI_STAGE_D_CANDIDATE="$GITHUB_SHA"
+          export SIMCTL_CHILD_WUJI_STAGE_D_RUN_ID="$GITHUB_RUN_ID"
+          export SIMCTL_CHILD_DEEPSEEK_BASE_URL="$DEEPSEEK_BASE_URL"
+          export SIMCTL_CHILD_DEEPSEEK_MODEL="$DEEPSEEK_MODEL"
+          export SIMCTL_CHILD_DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY"
+          xcrun simctl launch --terminate-running-process "$STAGE_D_SIMULATOR_ID" com.daaixz.wuji \
+            > "$RUNNER_TEMP/wuji-stage-d-launch.log" 2>&1
+          unset SIMCTL_CHILD_WUJI_STAGE_D_PROBE_MODE SIMCTL_CHILD_WUJI_STAGE_D_SUMMARY_FILE
+          unset SIMCTL_CHILD_WUJI_STAGE_D_CANDIDATE SIMCTL_CHILD_WUJI_STAGE_D_RUN_ID
+          unset SIMCTL_CHILD_DEEPSEEK_BASE_URL SIMCTL_CHILD_DEEPSEEK_MODEL SIMCTL_CHILD_DEEPSEEK_API_KEY
+          ps ax -o command= > "$RUNNER_TEMP/wuji-stage-d-process-args.txt"
+          for _ in $(seq 1 450); do
+            [[ -f "$summary_file" ]] && break
+            sleep 2
+          done
+          xcrun simctl terminate "$STAGE_D_SIMULATOR_ID" com.daaixz.wuji >/dev/null 2>&1 || true
+          test -f "$summary_file"
+          export STAGE_D_DATA_CONTAINER="$data_container"
+          export STAGE_D_SUMMARY_FILE="$summary_file"
+          /usr/bin/python3 <<'PY'
+          import json, os, pathlib, re
+          summary = json.loads(pathlib.Path(os.environ["STAGE_D_SUMMARY_FILE"]).read_text())
+          required = {
+              "result_category", "candidate", "run_id", "import_id", "session_id", "task_id",
+              "workspace_identity_sha256", "command", "command_binding_sha256", "risk",
+              "approval_state", "root_exit_observed", "stdout_eof_observed",
+              "stderr_eof_observed", "truncated", "process_tree_state",
+              "verification_sha256", "final_file_sha256",
+              "external_attempts_before_cold_restore", "external_attempts_after_cold_restore",
+              "cold_restore_category",
+          }
+          if set(summary) != required or summary["result_category"] != "completed":
+              print("STAGE_D_REAL_LOOP_FAILURE=" + json.dumps(summary, sort_keys=True, separators=(",", ":")))
+              raise SystemExit("real Stage D flow did not complete")
+          if summary["candidate"] != os.environ["GITHUB_SHA"] or summary["run_id"] != os.environ["GITHUB_RUN_ID"]:
+              raise SystemExit("Stage D candidate/run binding mismatch")
+          if summary["command"] != "sed -i s/channel=preview/channel=stable/ Sources/Environment.txt":
+              raise SystemExit("unexpected Stage D model command")
+          if summary["risk"] != "workspace_write" or summary["approval_state"] != "consumed":
+              raise SystemExit("Stage D approval binding mismatch")
+          if not summary["root_exit_observed"] or not summary["stdout_eof_observed"] or not summary["stderr_eof_observed"]:
+              raise SystemExit("Stage D process/drain barrier incomplete")
+          if summary["truncated"] or summary["process_tree_state"] != "quiescent":
+              raise SystemExit("Stage D output/process-tree verification incomplete")
+          if summary["external_attempts_before_cold_restore"] != summary["external_attempts_after_cold_restore"]:
+              raise SystemExit("Stage D cold restore repeated external I/O")
+          if summary["cold_restore_category"] != "durable_completed":
+              raise SystemExit("Stage D cold restore category mismatch")
+          for key in ["workspace_identity_sha256", "command_binding_sha256", "verification_sha256", "final_file_sha256"]:
+              if not re.fullmatch(r"[0-9a-f]{64}", summary[key]):
+                  raise SystemExit("invalid Stage D evidence hash")
+          data = pathlib.Path(os.environ["STAGE_D_DATA_CONTAINER"])
+          workspaces = [p for p in (data / "Library/Application Support/WujiStageA/Workspaces").iterdir() if p.is_dir()]
+          tasks = list((data / "Library/Application Support/WujiStageD/Tasks").glob("*.json"))
+          if len(workspaces) != 1 or len(tasks) != 1:
+              raise SystemExit("Stage D production truth identity is not unique")
+          target = workspaces[0] / "Sources/Environment.txt"
+          if target.read_text() != "channel=stable\ntoolset=base\n":
+              raise SystemExit("Stage D target after-state mismatch")
+          task = json.loads(tasks[0].read_text())
+          if task["phase"] != "completed" or task["id"].lower() != summary["task_id"]:
+              raise SystemExit("Stage D durable completion mismatch")
+          if not any(item["state"] == "consumed" for item in task["approvals"]):
+              raise SystemExit("Stage D consumed approval missing")
+          pairs = {}
+          for item in task["attempts"]:
+              pairs.setdefault(item["attemptID"], []).append(item["phase"])
+          if any(phases != ["intent_recorded", "succeeded"] for phases in pairs.values()):
+              raise SystemExit("Stage D durable attempt order invalid")
+          print("STAGE_D_REAL_LOOP_SUMMARY=" + json.dumps(summary, sort_keys=True, separators=(",", ":")))
+          print("STAGE_D_DURABLE_INTENT_AUDIT=PASS")
+          print("STAGE_D_APPROVAL_BINDING_AUDIT=PASS")
+          print("STAGE_D_COLD_RESTORE_NO_RESEND=PASS")
+          print("STAGE_D_CODE_OWNED_COMPLETION=PASS")
+          print("STAGE_D_REAL_ISH_DEEPSEEK_COMMAND=PASS")
+          PY
+
+      - name: Scan exact secret across source, logs, arguments, xcresult, app data, and diagnostics
+        if: always()
+        shell: bash
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          STAGE_D_SIMULATOR_ID: ${{ steps.simulator.outputs.id }}
+        run: |
+          set -euo pipefail
+          set +x
+          data_container="$(xcrun simctl get_app_container "$STAGE_D_SIMULATOR_ID" com.daaixz.wuji data 2>/dev/null || true)"
+          export STAGE_D_DATA_CONTAINER="$data_container"
+          /usr/bin/python3 <<'PY'
+          import os, pathlib
+          secret = os.environ["DEEPSEEK_API_KEY"].encode()
+          if not secret:
+              raise SystemExit("Stage D secret unavailable")
+          roots = [pathlib.Path("."), pathlib.Path(os.environ["RUNNER_TEMP"])]
+          if os.environ.get("STAGE_D_DATA_CONTAINER"):
+              roots.append(pathlib.Path(os.environ["STAGE_D_DATA_CONTAINER"]))
+          inspected = 0
+          for root in roots:
+              if not root.exists():
+                  continue
+              for path in root.rglob("*"):
+                  if path.is_file():
+                      inspected += 1
+                      try:
+                          if secret in path.read_bytes():
+                              raise SystemExit(f"exact secret found in retained Stage D surface: {path}")
+                      except OSError:
+                          pass
+          if inspected == 0:
+              raise SystemExit("Stage D secret scan inspected no files")
+          print(f"STAGE_D_SECRET_SCAN_FILES={inspected}")
+          print("STAGE_D_RETAINED_SECRET_SCAN=PASS")
+          PY
+
+      - name: Audit Stage D scope, forbidden expansion, and protected history
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 <<'PY'
+          import pathlib, re, subprocess
+          baseline = "d8544f431b25fb33c9541e7b2b2405ccb4d686ce"
+          changed = subprocess.check_output(["git", "diff", "--name-only", baseline + "..HEAD"], text=True).splitlines()
+          allowed = re.compile(r"^(?:Wuji\.xcodeproj/project\.pbxproj|Executor/WujiISHAdapter\.[ch]|Wuji/(?:WujiApp|ContentView|ISHStageDCommandExecutor|StageD[^/]*)\.swift|Wuji/StageDRealImportedProject/.*|WujiTests/WujiStageD.*Tests\.swift|\.github/workflows/stage-d-ish-development\.yml|docs/PROJECT_CONTROL_CENTER\.md)$")
+          unexpected = [path for path in changed if not allowed.fullmatch(path)]
+          if unexpected:
+              raise SystemExit("Stage D scope escaped: " + ", ".join(unexpected))
+          text = "\n".join(path.read_text() for path in pathlib.Path("Wuji").glob("StageD*.swift"))
+          for forbidden in ["DEEPSEEK_API_KEY=", "curl ", "wget ", "apt-get", "pod install", "swift package"]:
+              if forbidden in text:
+                  raise SystemExit("forbidden Stage D capability: " + forbidden)
+          adapter = pathlib.Path("Executor/WujiISHAdapter.c").read_text()
+          for required in ["wuji_ish_run_stage_d_command", "WUJI_ISH_PROCESS_TREE_QUIESCENT", "g_stage_d_clone_root_mounted"]:
+              if required not in adapter:
+                  raise SystemExit("required Stage D executor boundary missing: " + required)
+          print("STAGE_D_SCOPE_AUDIT=PASS")
+          print("STAGE_D_FORBIDDEN_CAPABILITY_SCAN=PASS")
+          PY
+          git diff --quiet d8544f431b25fb33c9541e7b2b2405ccb4d686ce..HEAD -- \
+            AGENTS.md docs/IMPLEMENTATION_PLAN.md ThirdParty Scripts \
+            Wuji/StageAImportContracts.swift Wuji/StageAWorkspaceStore.swift \
+            Wuji/StageAWorkspaceImporter.swift Wuji/StageBContracts.swift \
+            Wuji/StageBSessionStore.swift Wuji/StageBReadOnlyPolicy.swift \
+            Wuji/ISHStageBReadOnlyExecutor.swift Wuji/StageBReadOnlyAgent.swift \
+            Wuji/StageCContracts.swift Wuji/StageCTaskStore.swift \
+            Wuji/StageCEditPolicy.swift Wuji/ISHStageCEditExecutor.swift \
+            Wuji/StageCEditingAgent.swift Wuji/StageCApprovalView.swift \
+            Wuji/StageCProbeRunner.swift Wuji/StageCRealImportedProject \
+            WujiTests/WujiStageAImportTests.swift WujiTests/WujiStageBTests.swift \
+            WujiTests/WujiStageBISHIntegrationTests.swift WujiTests/WujiStageCContractsTests.swift \
+            WujiTests/WujiStageCStoreApprovalTests.swift WujiTests/WujiStageCAgentTests.swift \
+            WujiTests/WujiStageCApprovalViewTests.swift WujiTests/WujiStageCISHIntegrationTests.swift \
+            .github/workflows/s0-apple-build.yml .github/workflows/s1-ish-executor.yml \
+            .github/workflows/s2-provider.yml .github/workflows/s3-read-only-agent.yml \
+            .github/workflows/s4-modification-agent.yml \
+            .github/workflows/stage-a-production-entry.yml \
+            .github/workflows/stage-b-read-only-session.yml \
+            .github/workflows/stage-c-bounded-edit.yml
+          echo 'STAGE_D_PROTECTED_HISTORY_UNCHANGED=PASS'
+
+  raw-log-audit:
+    name: Exact Stage D raw-log and artifact audit
+    if: always()
+    needs: stage-d-validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download completed Stage D validation raw log
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          job_id="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" --jq '.jobs[] | select(.name | endswith("Apple build, Stage D tests, real ARM64 iSH environment, and DeepSeek command")) | .id')"
+          test -n "$job_id"
+          gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$job_id/logs" > "$RUNNER_TEMP/stage-d-validation.log"
+
+      - name: Scan raw log for exact secret and required markers
+        shell: bash
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          STAGE_D_MAIN_RESULT: ${{ needs.stage-d-validation.result }}
+        run: |
+          set -euo pipefail
+          set +x
+          export STAGE_D_RAW_LOG="$RUNNER_TEMP/stage-d-validation.log"
+          /usr/bin/python3 <<'PY'
+          import os, pathlib
+          log = pathlib.Path(os.environ["STAGE_D_RAW_LOG"]).read_bytes()
+          if os.environ["DEEPSEEK_API_KEY"].encode() in log:
+              raise SystemExit("exact secret found in Stage D raw log")
+          if os.environ["STAGE_D_MAIN_RESULT"] == "success":
+              for marker in [
+                  b"STAGE_D_ROOTFS_REPOSITORY_LOCK=PASS",
+                  b"STAGE_D_XCRESULT_AUDIT=PASS",
+                  b"STAGE_D_REAL_ISH_DEEPSEEK_COMMAND=PASS",
+                  b"STAGE_D_DURABLE_INTENT_AUDIT=PASS",
+                  b"STAGE_D_COLD_RESTORE_NO_RESEND=PASS",
+                  b"STAGE_D_RETAINED_SECRET_SCAN=PASS",
+                  b"STAGE_D_PROTECTED_HISTORY_UNCHANGED=PASS",
+              ]:
+                  if marker not in log:
+                      raise SystemExit("required Stage D raw-log marker missing")
+          print("STAGE_D_RAW_LOG_SECRET_SCAN=PASS")
+          PY
+
+      - name: Confirm this run published no artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --jq '.total_count')" = 0
+          echo 'STAGE_D_ARTIFACT_COUNT=0'
