@@ -81,7 +81,9 @@ jobs:
           set +x
           test -n "$DEEPSEEK_API_KEY"
           raw_log="$RUNNER_TEMP/stage-d-validation.log"
-          gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$MAIN_JOB_ID/logs" > "$raw_log"
+          gh api --allow-escape-sequences \
+            "repos/$GITHUB_REPOSITORY/actions/jobs/$MAIN_JOB_ID/logs" \
+            > "$raw_log"
           export STAGE_D_AUDIT_RAW_LOG="$raw_log"
           /usr/bin/python3 <<'PY'
           import hashlib, os, pathlib

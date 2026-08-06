@@ -482,7 +482,9 @@ jobs:
           set -euo pipefail
           job_id="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" --jq '.jobs[] | select(.name | endswith("Apple build, Stage D tests, real ARM64 iSH environment, and DeepSeek command")) | .id')"
           test -n "$job_id"
-          gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$job_id/logs" > "$RUNNER_TEMP/stage-d-validation.log"
+          gh api --allow-escape-sequences \
+            "repos/$GITHUB_REPOSITORY/actions/jobs/$job_id/logs" \
+            > "$RUNNER_TEMP/stage-d-validation.log"
 
       - name: Scan raw log for exact secret and required markers
         shell: bash

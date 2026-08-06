@@ -226,6 +226,7 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
         let command = StageDTestSupport.cloneCommand(identity: String(repeating: "a", count: 64))
         let failures: [(StageDCloneStage, StageDCloneStageCategory, StageDRuntimeFailureCategory)] = [
             (.cloneProcess, .processNonzero, .cloneProcessNonzero),
+            (.cloneProcess, .resolverNetworkFailure, .resolverNetworkFailure),
             (.cloneProcess, .timeoutUnknown, .cloneTimeoutUnknown),
             (.cloneProcess, .adapterError, .adapterFixedError),
             (.checkoutExactCommit, .targetUnavailable, .checkoutTargetUnavailable),
@@ -295,7 +296,7 @@ private actor StageDClonePipelineScript {
         let facts: StageDProcessFacts
         if stage == failureStage {
             switch category {
-            case .processNonzero, .targetUnavailable:
+            case .processNonzero, .resolverNetworkFailure, .targetUnavailable:
                 facts = StageDTestSupport.facts()
                     .replacingFinalState(kind: "exited", value: 1)
             case .timeoutUnknown:
@@ -311,8 +312,16 @@ private actor StageDClonePipelineScript {
         }
         if stage == failureStage {
             switch category {
-            case .processNonzero, .targetUnavailable:
+            case .processNonzero:
+                return .succeeded(.init(facts: facts, stdout: "", stderr: ""))
+            case .targetUnavailable:
                 return .failed(.init(facts: facts, stdout: "", stderr: ""), fixedError: .none)
+            case .resolverNetworkFailure:
+                return .succeeded(.init(
+                    facts: facts,
+                    stdout: "",
+                    stderr: "fixed diagnostic: could not resolve host"
+                ))
             case .timeoutUnknown:
                 return .unknown(.init(facts: facts, stdout: "", stderr: ""), fixedError: .none)
             case .adapterError:

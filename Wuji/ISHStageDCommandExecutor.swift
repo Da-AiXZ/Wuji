@@ -139,10 +139,7 @@ enum StageDClonePipeline {
                     return completed(failure: .eofTruncationProcessTreeFailure)
                 }
                 guard raw.facts.finalStateKind == "exited", raw.facts.finalStateValue == 0 else {
-                    let category: StageDCloneStageCategory = stage == .checkoutExactCommit
-                        ? .targetUnavailable : .processNonzero
-                    let failure: StageDRuntimeFailureCategory = stage == .checkoutExactCommit
-                        ? .checkoutTargetUnavailable : .cloneProcessNonzero
+                    let (category, failure) = nonzeroClassification(stage: stage, raw: raw)
                     outcomes.append(stageOutcome(stage: stage, category: category, raw: raw))
                     return completed(failure: failure)
                 }
@@ -171,7 +168,7 @@ enum StageDClonePipeline {
                 outcomes.append(stageOutcome(stage: stage, category: .succeeded, raw: raw))
             case let .failed(raw, fixedError):
                 if let raw { steps.append(raw) }
-                let adapterError = fixedError != .none || raw?.fixedError != .none
+                let adapterError = fixedError != .none || (raw.map { $0.fixedError != .none } ?? false)
                 if adapterError {
                     outcomes.append(stageOutcome(
                         stage: stage, category: .adapterError, raw: raw,
@@ -179,10 +176,7 @@ enum StageDClonePipeline {
                     ))
                     return completed(failure: .adapterFixedError)
                 }
-                let category: StageDCloneStageCategory = stage == .checkoutExactCommit
-                    ? .targetUnavailable : .processNonzero
-                let failure: StageDRuntimeFailureCategory = stage == .checkoutExactCommit
-                    ? .checkoutTargetUnavailable : .cloneProcessNonzero
+                let (category, failure) = nonzeroClassification(stage: stage, raw: raw)
                 outcomes.append(stageOutcome(stage: stage, category: category, raw: raw))
                 return completed(failure: failure)
             case let .unknown(raw, fixedError):
@@ -232,6 +226,29 @@ enum StageDClonePipeline {
             entryCount: nil,
             byteCount: nil
         )
+    }
+
+    private static func nonzeroClassification(
+        stage: StageDCloneStage,
+        raw: StageDRawStep?
+    ) -> (StageDCloneStageCategory, StageDRuntimeFailureCategory) {
+        if stage == .checkoutExactCommit {
+            return (.targetUnavailable, .checkoutTargetUnavailable)
+        }
+        if stage == .cloneProcess, raw.map({ resolverOrNetworkFailure($0.stderr) }) == true {
+            return (.resolverNetworkFailure, .resolverNetworkFailure)
+        }
+        return (.processNonzero, .cloneProcessNonzero)
+    }
+
+    private static func resolverOrNetworkFailure(_ stderr: String) -> Bool {
+        let value = stderr.lowercased()
+        return [
+            "could not resolve host", "could not resolve hostname",
+            "failed to connect", "connection timed out", "connection refused",
+            "network is unreachable", "ssl certificate problem", "tls connection",
+            "gnutls_handshake() failed", "http/2 stream", "rpc failed; curl",
+        ].contains { value.contains($0) }
     }
 
     private static func treeOutcome(
