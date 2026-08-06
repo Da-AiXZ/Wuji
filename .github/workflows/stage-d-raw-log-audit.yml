@@ -81,10 +81,62 @@ jobs:
           set +x
           test -n "$DEEPSEEK_API_KEY"
           raw_log="$RUNNER_TEMP/stage-d-validation.log"
-          gh api --allow-escape-sequences \
-            "repos/$GITHUB_REPOSITORY/actions/jobs/$MAIN_JOB_ID/logs" \
-            > "$raw_log"
           export STAGE_D_AUDIT_RAW_LOG="$raw_log"
+          /usr/bin/python3 <<'PY'
+          import hashlib, os, pathlib, urllib.error, urllib.parse, urllib.request
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          token = os.environ.get("GH_TOKEN", "")
+          job_id = os.environ.get("MAIN_JOB_ID", "")
+          target = pathlib.Path(os.environ["STAGE_D_AUDIT_RAW_LOG"])
+          if not token or not job_id.isdecimal():
+              raise SystemExit("bound Stage D raw-log request unavailable")
+          request = urllib.request.Request(
+              f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/actions/jobs/{job_id}/logs",
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {token}",
+                  "User-Agent": "wuji-stage-d-audit-only",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          try:
+              try:
+                  response = urllib.request.build_opener(NoRedirect()).open(request, timeout=30)
+              except urllib.error.HTTPError as error:
+                  if error.code not in (301, 302, 303, 307, 308):
+                      raise
+                  location = error.headers.get("Location", "")
+                  parsed = urllib.parse.urlsplit(location)
+                  if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+                      raise ValueError("unsafe redirect")
+                  response = urllib.request.urlopen(
+                      urllib.request.Request(
+                          location,
+                          headers={"User-Agent": "wuji-stage-d-audit-only"},
+                      ),
+                      timeout=30,
+                  )
+              digest = hashlib.sha256()
+              count = 0
+              with response, target.open("wb") as output:
+                  while True:
+                      chunk = response.read(64 * 1_024)
+                      if not chunk:
+                          break
+                      count += len(chunk)
+                      if count > 64 * 1_024 * 1_024:
+                          raise ValueError("raw log exceeds bound")
+                      digest.update(chunk)
+                      output.write(chunk)
+          except Exception:
+              raise SystemExit("bound Stage D raw-log download failed")
+          print(f"STAGE_D_AUDIT_ONLY_DOWNLOAD_BYTES={count}")
+          print(f"STAGE_D_AUDIT_ONLY_DOWNLOAD_SHA256={digest.hexdigest()}")
+          PY
           /usr/bin/python3 <<'PY'
           import hashlib, os, pathlib
           path = pathlib.Path(os.environ["STAGE_D_AUDIT_RAW_LOG"])

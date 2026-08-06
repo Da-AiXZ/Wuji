@@ -227,6 +227,11 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
         let failures: [(StageDCloneStage, StageDCloneStageCategory, StageDRuntimeFailureCategory)] = [
             (.cloneProcess, .processNonzero, .cloneProcessNonzero),
             (.cloneProcess, .resolverNetworkFailure, .resolverNetworkFailure),
+            (.cloneProcess, .remoteAccessFailure, .cloneProcessNonzero),
+            (.cloneProcess, .filesystemFailure, .cloneProcessNonzero),
+            (.cloneProcess, .checkoutWorktreeFailure, .cloneProcessNonzero),
+            (.cloneProcess, .protocolFailure, .cloneProcessNonzero),
+            (.cloneProcess, .capabilityUnavailable, .cloneProcessNonzero),
             (.cloneProcess, .timeoutUnknown, .cloneTimeoutUnknown),
             (.cloneProcess, .adapterError, .adapterFixedError),
             (.checkoutExactCommit, .targetUnavailable, .checkoutTargetUnavailable),
@@ -296,7 +301,9 @@ private actor StageDClonePipelineScript {
         let facts: StageDProcessFacts
         if stage == failureStage {
             switch category {
-            case .processNonzero, .resolverNetworkFailure, .targetUnavailable:
+            case .processNonzero, .resolverNetworkFailure, .remoteAccessFailure,
+                    .filesystemFailure, .checkoutWorktreeFailure, .protocolFailure,
+                    .capabilityUnavailable, .targetUnavailable:
                 facts = StageDTestSupport.facts()
                     .replacingFinalState(kind: "exited", value: 1)
             case .timeoutUnknown:
@@ -312,16 +319,23 @@ private actor StageDClonePipelineScript {
         }
         if stage == failureStage {
             switch category {
-            case .processNonzero:
-                return .succeeded(.init(facts: facts, stdout: "", stderr: ""))
+            case .processNonzero, .resolverNetworkFailure, .remoteAccessFailure,
+                    .filesystemFailure, .checkoutWorktreeFailure, .protocolFailure,
+                    .capabilityUnavailable:
+                let stderr: String
+                switch category {
+                case .processNonzero: stderr = "fixed generic clone failure"
+                case .resolverNetworkFailure: stderr = "fixed getaddrinfo failure"
+                case .remoteAccessFailure: stderr = "fixed repository not found"
+                case .filesystemFailure: stderr = "fixed operation not permitted"
+                case .checkoutWorktreeFailure: stderr = "fixed unable to checkout working tree"
+                case .protocolFailure: stderr = "fixed invalid index-pack"
+                case .capabilityUnavailable: stderr = "fixed unable to find remote helper"
+                default: stderr = ""
+                }
+                return .succeeded(.init(facts: facts, stdout: "", stderr: stderr))
             case .targetUnavailable:
                 return .failed(.init(facts: facts, stdout: "", stderr: ""), fixedError: .none)
-            case .resolverNetworkFailure:
-                return .succeeded(.init(
-                    facts: facts,
-                    stdout: "",
-                    stderr: "fixed diagnostic: could not resolve host"
-                ))
             case .timeoutUnknown:
                 return .unknown(.init(facts: facts, stdout: "", stderr: ""), fixedError: .none)
             case .adapterError:

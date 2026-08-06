@@ -235,20 +235,51 @@ enum StageDClonePipeline {
         if stage == .checkoutExactCommit {
             return (.targetUnavailable, .checkoutTargetUnavailable)
         }
-        if stage == .cloneProcess, raw.map({ resolverOrNetworkFailure($0.stderr) }) == true {
-            return (.resolverNetworkFailure, .resolverNetworkFailure)
+        if stage == .cloneProcess, let raw {
+            let category = safeCloneProcessCategory(raw.stderr)
+            if category == .resolverNetworkFailure {
+                return (category, .resolverNetworkFailure)
+            }
+            return (category, .cloneProcessNonzero)
         }
         return (.processNonzero, .cloneProcessNonzero)
     }
 
-    private static func resolverOrNetworkFailure(_ stderr: String) -> Bool {
+    private static func safeCloneProcessCategory(_ stderr: String) -> StageDCloneStageCategory {
         let value = stderr.lowercased()
-        return [
-            "could not resolve host", "could not resolve hostname",
-            "failed to connect", "connection timed out", "connection refused",
-            "network is unreachable", "ssl certificate problem", "tls connection",
-            "gnutls_handshake() failed", "http/2 stream", "rpc failed; curl",
-        ].contains { value.contains($0) }
+        let categories: [(StageDCloneStageCategory, [String])] = [
+            (.resolverNetworkFailure, [
+                "could not resolve", "couldn't resolve", "getaddrinfo",
+                "failed to connect", "connection timed out", "connection refused",
+                "connection reset", "network is unreachable", "ssl", "tls",
+                "gnutls", "curl 6", "curl 7", "curl 28", "curl 35", "curl 56",
+                "curl 92", "http/2 stream", "remote end hung up",
+            ]),
+            (.capabilityUnavailable, [
+                "unable to find remote helper", "remote-https is not a git command",
+                "not a git command",
+            ]),
+            (.remoteAccessFailure, [
+                "repository not found", "authentication failed", "could not read username",
+                "requested url returned error",
+            ]),
+            (.checkoutWorktreeFailure, [
+                "unable to checkout working tree", "checkout failed", "invalid path",
+            ]),
+            (.filesystemFailure, [
+                "operation not permitted", "permission denied", "read-only file system",
+                "file name too long", "could not set 'core.filemode'", "chmod on",
+                "unable to create", "could not create", "cannot create",
+                "destination path",
+            ]),
+            (.protocolFailure, [
+                "rpc failed", "early eof", "invalid index-pack", "unexpected disconnect",
+                "protocol error", "bad pack header",
+            ]),
+        ]
+        return categories.first(where: { category in
+            category.1.contains { value.contains($0) }
+        })?.0 ?? .processNonzero
     }
 
     private static func treeOutcome(

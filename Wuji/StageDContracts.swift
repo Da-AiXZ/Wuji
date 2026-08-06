@@ -266,6 +266,11 @@ enum StageDCloneStageCategory: String, Codable, Equatable, Sendable {
     case succeeded
     case processNonzero = "process_nonzero"
     case resolverNetworkFailure = "resolver_network_failure"
+    case remoteAccessFailure = "remote_access_failure"
+    case filesystemFailure = "filesystem_failure"
+    case checkoutWorktreeFailure = "checkout_worktree_failure"
+    case protocolFailure = "protocol_failure"
+    case capabilityUnavailable = "capability_unavailable"
     case timeoutUnknown = "timeout_unknown"
     case adapterError = "adapter_error"
     case targetUnavailable = "target_unavailable"
