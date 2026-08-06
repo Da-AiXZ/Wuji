@@ -320,7 +320,7 @@ final class StageDCommandAgent: @unchecked Sendable {
 
     func run(command: String, cwd: String) async -> StageDLoopOutcome {
         guard !requireProvider else { return .failed(.providerBindingMismatch) }
-        await run(command: command, cwd: cwd, providerDecisionSHA256: nil)
+        return await run(command: command, cwd: cwd, providerDecisionSHA256: nil)
     }
 
     private func runAuthorizedProviderDecision(
