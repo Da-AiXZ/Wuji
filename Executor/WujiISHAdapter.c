@@ -47,6 +47,8 @@ struct WujiISHRunResult {
     uint64_t process_context;
     WujiISHProcessTreeKind process_tree_kind;
     int32_t active_descendant_count;
+    bool process_tree_observed_after_terminal_barrier;
+    WujiISHFixedErrorKind fixed_error_kind;
     char error[256];
 };
 
@@ -80,27 +82,43 @@ static void set_error(char *buffer, size_t size, const char *message) {
     snprintf(buffer, size, "%s", message == NULL ? "unknown error" : message);
 }
 
+static void set_run_error(struct WujiISHRunResult *result,
+                          WujiISHFixedErrorKind kind,
+                          const char *message) {
+    if (result == NULL)
+        return;
+    result->fixed_error_kind = kind;
+    set_error(result->error, sizeof(result->error), message);
+}
+
 static void wuji_exit_hook(struct task *task, int code) {
     pthread_mutex_lock(&g_state_lock);
     if (g_active_result != NULL && task->pid == g_active_pid) {
         g_active_result->root_exited = true;
         g_active_result->raw_status = code;
-        if (g_active_result->process_context != 0) {
-            int32_t active = 0;
-            for (dword_t pid = 1; pid <= MAX_PID; pid++) {
-                struct task *candidate = pid_get_task_zombie(pid);
-                if (candidate != NULL && candidate != task && candidate->group != NULL &&
-                    candidate->group->fs_context == g_active_result->process_context &&
-                    !candidate->zombie && !candidate->exiting)
-                    active++;
-            }
-            g_active_result->active_descendant_count = active;
-            g_active_result->process_tree_kind = active == 0
-                ? WUJI_ISH_PROCESS_TREE_QUIESCENT
-                : WUJI_ISH_PROCESS_TREE_DESCENDANTS_REMAIN;
-        }
         pthread_cond_broadcast(&g_exit_condition);
     }
+    pthread_mutex_unlock(&g_state_lock);
+}
+
+static void observe_process_tree_after_terminal_barrier(struct WujiISHRunResult *result) {
+    if (result == NULL || result->process_context == 0)
+        return;
+    int32_t active = 0;
+    pthread_mutex_lock(&g_state_lock);
+    for (dword_t pid = 1; pid <= MAX_PID; pid++) {
+        struct task *candidate = pid_get_task_zombie(pid);
+        if (candidate != NULL && candidate->group != NULL &&
+            candidate->group->fs_context == result->process_context &&
+            !candidate->zombie && !candidate->exiting)
+            active++;
+    }
+    result->active_descendant_count = active;
+    result->process_tree_kind = active == 0
+        ? WUJI_ISH_PROCESS_TREE_QUIESCENT
+        : WUJI_ISH_PROCESS_TREE_DESCENDANTS_REMAIN;
+    result->process_tree_observed_after_terminal_barrier =
+        result->root_exited && result->stdout_stream.eof && result->stderr_stream.eof;
     pthread_mutex_unlock(&g_state_lock);
 }
 
@@ -705,6 +723,7 @@ static struct WujiISHRunResult *make_result(size_t output_limit) {
     result->stdout_stream.bytes = calloc(output_limit + 1, 1);
     result->stderr_stream.bytes = calloc(output_limit + 1, 1);
     result->final_kind = WUJI_ISH_FINAL_UNKNOWN;
+    result->fixed_error_kind = WUJI_ISH_FIXED_ERROR_NONE;
     if (result->stdout_stream.bytes == NULL || result->stderr_stream.bytes == NULL) {
         wuji_ish_result_free(result);
         return NULL;
@@ -723,7 +742,7 @@ static WujiISHRunResult *run_arguments_in_directory(const char *executable,
         return NULL;
     if (executable == NULL || arguments == NULL || argument_count <= 0 ||
         !g_booted || g_init_task == NULL) {
-        set_error(result->error, sizeof(result->error), "executor is not prepared");
+        set_run_error(result, WUJI_ISH_FIXED_ERROR_NOT_PREPARED, "executor is not prepared");
         return result;
     }
 
@@ -735,7 +754,7 @@ static WujiISHRunResult *run_arguments_in_directory(const char *executable,
     bool stdout_reader_started = false;
     bool stderr_reader_started = false;
     if (pipe(stdout_pipe) != 0 || pipe(stderr_pipe) != 0) {
-        set_error(result->error, sizeof(result->error), "host pipe creation failed");
+        set_run_error(result, WUJI_ISH_FIXED_ERROR_HOST_PIPE, "host pipe creation failed");
         goto finish;
     }
 
@@ -744,7 +763,7 @@ static WujiISHRunResult *run_arguments_in_directory(const char *executable,
     int error = become_new_init_child();
     if (error < 0) {
         current = saved_current;
-        set_error(result->error, sizeof(result->error), "guest task creation failed");
+        set_run_error(result, WUJI_ISH_FIXED_ERROR_GUEST_TASK, "guest task creation failed");
         goto finish;
     }
     struct task *guest_task = current;
@@ -763,7 +782,7 @@ static WujiISHRunResult *run_arguments_in_directory(const char *executable,
         struct fd *cwd = generic_open(guest_cwd, O_RDONLY_, 0);
         if (IS_ERR(cwd)) {
             current = saved_current;
-            set_error(result->error, sizeof(result->error), "guest cwd unavailable");
+            set_run_error(result, WUJI_ISH_FIXED_ERROR_GUEST_CWD, "guest cwd unavailable");
             goto finish;
         }
         fs_chdir(guest_task->fs, cwd);
@@ -777,7 +796,7 @@ static WujiISHRunResult *run_arguments_in_directory(const char *executable,
         !attach_host_fd(guest_task, 1, stdout_guest_fd) ||
         !attach_host_fd(guest_task, 2, stderr_guest_fd)) {
         current = saved_current;
-        set_error(result->error, sizeof(result->error), "guest stdio setup failed");
+        set_run_error(result, WUJI_ISH_FIXED_ERROR_GUEST_STDIO, "guest stdio setup failed");
         goto finish;
     }
 
@@ -802,19 +821,19 @@ static WujiISHRunResult *run_arguments_in_directory(const char *executable,
     error = do_execve(executable, argument_count, arguments, environment);
     if (error < 0) {
         current = saved_current;
-        set_error(result->error, sizeof(result->error), "guest exec failed");
+        set_run_error(result, WUJI_ISH_FIXED_ERROR_GUEST_EXEC, "guest exec failed");
         goto finish;
     }
 
     if (pthread_create(&stdout_thread, NULL, drain_stream, &result->stdout_stream) != 0) {
         current = saved_current;
-        set_error(result->error, sizeof(result->error), "stdout reader creation failed");
+        set_run_error(result, WUJI_ISH_FIXED_ERROR_STDOUT_READER, "stdout reader creation failed");
         goto finish;
     }
     stdout_reader_started = true;
     if (pthread_create(&stderr_thread, NULL, drain_stream, &result->stderr_stream) != 0) {
         current = saved_current;
-        set_error(result->error, sizeof(result->error), "stderr reader creation failed");
+        set_run_error(result, WUJI_ISH_FIXED_ERROR_STDERR_READER, "stderr reader creation failed");
         goto finish;
     }
     stderr_reader_started = true;
@@ -837,6 +856,8 @@ static WujiISHRunResult *run_arguments_in_directory(const char *executable,
     stdout_reader_started = false;
     pthread_join(stderr_thread, NULL);
     stderr_reader_started = false;
+
+    observe_process_tree_after_terminal_barrier(result);
 
     pthread_mutex_lock(&g_state_lock);
     g_active_result = NULL;
@@ -1361,6 +1382,12 @@ WujiISHProcessTreeKind wuji_ish_result_process_tree_kind(const WujiISHRunResult 
 }
 int32_t wuji_ish_result_active_descendant_count(const WujiISHRunResult *result) {
     return result->active_descendant_count;
+}
+bool wuji_ish_result_process_tree_observed_after_terminal_barrier(const WujiISHRunResult *result) {
+    return result->process_tree_observed_after_terminal_barrier;
+}
+WujiISHFixedErrorKind wuji_ish_result_fixed_error_kind(const WujiISHRunResult *result) {
+    return result->fixed_error_kind;
 }
 const char *wuji_ish_result_error(const WujiISHRunResult *result) { return result->error; }
 

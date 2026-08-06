@@ -1,0 +1,110 @@
+name: Stage D Raw Log Audit Only
+
+on:
+  workflow_dispatch:
+    inputs:
+      validation_run_id:
+        description: Exact Stage D validation run ID
+        required: true
+        type: string
+      main_job_id:
+        description: Exact Stage D main validation job ID
+        required: true
+        type: string
+      workflow_id:
+        description: Fixed product workflow ID
+        required: true
+        type: string
+      attempt:
+        description: Exact validation run attempt
+        required: true
+        type: string
+      event:
+        description: Exact validation event
+        required: true
+        type: string
+      head_sha:
+        description: Exact validation head SHA
+        required: true
+        type: string
+
+permissions:
+  actions: read
+
+jobs:
+  audit-only:
+    name: Bound Stage D validation raw-log audit only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Bind exact validation run and main job
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VALIDATION_RUN_ID: ${{ inputs.validation_run_id }}
+          MAIN_JOB_ID: ${{ inputs.main_job_id }}
+          PRODUCT_WORKFLOW_ID: ${{ inputs.workflow_id }}
+          VALIDATION_ATTEMPT: ${{ inputs.attempt }}
+          VALIDATION_EVENT: ${{ inputs.event }}
+          VALIDATION_HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          set +x
+          [[ "$VALIDATION_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$MAIN_JOB_ID" =~ ^[0-9]+$ ]]
+          test "$PRODUCT_WORKFLOW_ID" = 327177536
+          test "$VALIDATION_ATTEMPT" = 1
+          test "$VALIDATION_EVENT" = workflow_dispatch
+          [[ "$VALIDATION_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          run_prefix="repos/$GITHUB_REPOSITORY/actions/runs/$VALIDATION_RUN_ID"
+          test "$(gh api "$run_prefix" --jq .workflow_id)" = "$PRODUCT_WORKFLOW_ID"
+          test "$(gh api "$run_prefix" --jq .run_attempt)" = "$VALIDATION_ATTEMPT"
+          test "$(gh api "$run_prefix" --jq .event)" = "$VALIDATION_EVENT"
+          test "$(gh api "$run_prefix" --jq .head_sha)" = "$VALIDATION_HEAD_SHA"
+          test "$(gh api "$run_prefix" --jq .status)" = completed
+          job_prefix="repos/$GITHUB_REPOSITORY/actions/jobs/$MAIN_JOB_ID"
+          test "$(gh api "$job_prefix" --jq .run_id)" = "$VALIDATION_RUN_ID"
+          test "$(gh api "$job_prefix" --jq .head_sha)" = "$VALIDATION_HEAD_SHA"
+          test "$(gh api "$job_prefix" --jq .name)" = \
+            "Apple build, Stage D tests, real ARM64 iSH environment, and DeepSeek command"
+          test "$(gh api "$job_prefix" --jq .status)" = completed
+          echo 'STAGE_D_AUDIT_ONLY_BINDING=PASS'
+
+      - name: Scan exact validation raw log without displaying matches
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          MAIN_JOB_ID: ${{ inputs.main_job_id }}
+        run: |
+          set -euo pipefail
+          set +x
+          test -n "$DEEPSEEK_API_KEY"
+          raw_log="$RUNNER_TEMP/stage-d-validation.log"
+          gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$MAIN_JOB_ID/logs" > "$raw_log"
+          export STAGE_D_AUDIT_RAW_LOG="$raw_log"
+          /usr/bin/python3 <<'PY'
+          import hashlib, os, pathlib
+          path = pathlib.Path(os.environ["STAGE_D_AUDIT_RAW_LOG"])
+          data = path.read_bytes()
+          secret = os.environ["DEEPSEEK_API_KEY"].encode()
+          if not data or not secret:
+              raise SystemExit("Stage D audit input unavailable")
+          if secret in data:
+              raise SystemExit("exact secret found in bound Stage D validation raw log")
+          print(f"STAGE_D_AUDIT_ONLY_LOG_BYTES={len(data)}")
+          print(f"STAGE_D_AUDIT_ONLY_LOG_SHA256={hashlib.sha256(data).hexdigest()}")
+          print("STAGE_D_AUDIT_ONLY_RAW_LOG_SECRET_SCAN=PASS")
+          PY
+
+      - name: Confirm bound validation run published no artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VALIDATION_RUN_ID: ${{ inputs.validation_run_id }}
+        run: |
+          set -euo pipefail
+          set +x
+          count="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$VALIDATION_RUN_ID/artifacts" --jq .total_count)"
+          test "$count" = 0
+          echo 'STAGE_D_AUDIT_ONLY_ARTIFACT_COUNT=0'

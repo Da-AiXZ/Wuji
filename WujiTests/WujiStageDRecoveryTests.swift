@@ -144,7 +144,7 @@ final class WujiStageDRecoveryTests: XCTestCase {
         defer { prepared.cleanup() }
         let task = try await prepared.store.snapshot(taskID: prepared.task.id)
         let operationID = UUID(), attemptID = UUID()
-        let input = StageDProviderContract.inputSHA256(task: task)
+        let input = StageDProviderContract.inputSHA256(task: task, providerID: "stage-d-scripted")
         let intent = StageDAttemptEvidence(
             taskID: task.id, operationID: operationID, attemptID: attemptID,
             kind: .provider, phase: .intentRecorded, inputSHA256: input,
@@ -156,7 +156,8 @@ final class WujiStageDRecoveryTests: XCTestCase {
             toolCallID: "durable-stage-d",
             command: prepared.writeCommand,
             cwd: ".",
-            assistantSHA256: ProviderDigest.sha256Hex("assistant")
+            assistantSHA256: ProviderDigest.sha256Hex("assistant"),
+            expectedInputSHA256: input
         )
         let terminal = StageDAttemptEvidence(
             taskID: task.id, operationID: operationID, attemptID: attemptID,
@@ -184,6 +185,121 @@ final class WujiStageDRecoveryTests: XCTestCase {
         let executorCalls = await executor.callCount()
         XCTAssertEqual(providerCalls, 0)
         XCTAssertEqual(executorCalls, 1)
+    }
+
+    func testInternallyConsistentWrongProviderPairFailsClosedWithZeroProviderAndExecutorIO() async throws {
+        let prepared = try await StageDTestSupport.prepare()
+        defer { prepared.cleanup() }
+        let task = try await prepared.store.snapshot(taskID: prepared.task.id)
+        let operationID = UUID(), attemptID = UUID()
+        let wrongInput = ProviderDigest.sha256Hex("another-goal-rules-history-and-provider-position")
+        let decision = StageDProviderDecision(
+            toolCallID: "wrong-pair",
+            command: prepared.writeCommand,
+            cwd: ".",
+            assistantSHA256: ProviderDigest.sha256Hex("assistant"),
+            expectedInputSHA256: wrongInput
+        )
+        let intent = StageDAttemptEvidence(
+            taskID: task.id, operationID: operationID, attemptID: attemptID,
+            kind: .provider, phase: .intentRecorded, inputSHA256: wrongInput,
+            recordedAt: Date(), command: nil, approvalBindingSHA256: nil,
+            providerDecisionSHA256: nil, providerDecision: nil, result: nil, resultSHA256: nil
+        )
+        let terminal = StageDAttemptEvidence(
+            taskID: task.id, operationID: operationID, attemptID: attemptID,
+            kind: .provider, phase: .succeeded, inputSHA256: wrongInput,
+            recordedAt: Date().addingTimeInterval(1), command: nil,
+            approvalBindingSHA256: nil, providerDecisionSHA256: nil,
+            providerDecision: decision, result: nil,
+            resultSHA256: try XCTUnwrap(StageDTaskStore.digest(decision))
+        )
+        _ = try await prepared.store.appendAttempt(taskID: task.id, evidence: intent, phase: .ready)
+        _ = try await prepared.store.appendAttempt(taskID: task.id, evidence: terminal, phase: .ready)
+
+        let provider = StageDScriptedProvider([])
+        let executor = StageDMockExecutor(store: prepared.store, taskID: task.id, mode: .success)
+        let agent = StageDCommandAgent(
+            provider: provider, executor: executor,
+            approvalAuthorizer: StageDImmediateApproval(.approve),
+            store: prepared.store, task: try await prepared.store.snapshot(taskID: task.id),
+            policy: prepared.policy, requireProvider: true
+        )
+        let outcome = await agent.runModelCommand()
+        let providerCalls = await provider.callCount()
+        let executorCalls = await executor.callCount()
+        XCTAssertEqual(outcome, .failed(.providerBindingMismatch))
+        XCTAssertEqual(providerCalls, 0)
+        XCTAssertEqual(executorCalls, 0)
+    }
+
+    func testProviderRequiredDirectEntryFailsClosedBeforeExecutorIO() async throws {
+        let prepared = try await StageDTestSupport.prepare()
+        defer { prepared.cleanup() }
+        let provider = StageDScriptedProvider([])
+        let executor = StageDMockExecutor(
+            store: prepared.store,
+            taskID: prepared.task.id,
+            mode: .success
+        )
+        let agent = StageDCommandAgent(
+            provider: provider,
+            executor: executor,
+            approvalAuthorizer: StageDImmediateApproval(.approve),
+            store: prepared.store,
+            task: prepared.task,
+            policy: prepared.policy,
+            requireProvider: true
+        )
+
+        let outcome = await agent.run(command: prepared.writeCommand, cwd: ".")
+        let providerCalls = await provider.callCount()
+        let executorCalls = await executor.callCount()
+        XCTAssertEqual(outcome, .failed(.providerBindingMismatch))
+        XCTAssertEqual(providerCalls, 0)
+        XCTAssertEqual(executorCalls, 0)
+    }
+
+    func testReliableCommandTerminalCompletesDirectAndModelRecoveryWithoutReexecution() async throws {
+        for useModelEntry in [false, true] {
+            let prepared = try await StageDTestSupport.prepareSuccessfulCommandTask()
+            defer { prepared.cleanup() }
+            let record = try await prepared.store.snapshot(taskID: prepared.task.id)
+            guard case let .authorized(command) = prepared.policy.decide(command: "pwd", cwd: ".") else {
+                return XCTFail("pwd not authorized")
+            }
+            let operationID = UUID(), attemptID = UUID()
+            let result = StageDTestSupport.result(command: command)
+            let intent = StageDTestSupport.attempt(
+                record: record, command: command, op: operationID, attempt: attemptID,
+                phase: .intentRecorded
+            )
+            let terminal = StageDTestSupport.attempt(
+                record: record, command: command, op: operationID, attempt: attemptID,
+                phase: .succeeded, result: result
+            )
+            _ = try await prepared.store.appendAttempt(taskID: record.id, evidence: intent, phase: .executing)
+            _ = try await prepared.store.appendAttempt(taskID: record.id, evidence: terminal, phase: .verifying)
+
+            let executor = StageDMockExecutor(store: prepared.store, taskID: record.id, mode: .success)
+            let provider = StageDScriptedProvider([])
+            let agent = StageDCommandAgent(
+                provider: provider, executor: executor,
+                approvalAuthorizer: StageDImmediateApproval(.approve),
+                store: prepared.store, task: try await prepared.store.snapshot(taskID: record.id),
+                policy: prepared.policy, requireProvider: false
+            )
+            let outcome = useModelEntry
+                ? await agent.runModelCommand()
+                : await agent.run(command: "pwd", cwd: ".")
+            guard case .completed = outcome else {
+                return XCTFail("reliable command terminal did not complete recovery")
+            }
+            let executorCalls = await executor.callCount()
+            let providerCalls = await provider.callCount()
+            XCTAssertEqual(executorCalls, 0)
+            XCTAssertEqual(providerCalls, 0)
+        }
     }
 
     func testCompletedColdRestoreCreatesZeroProviderCommandCloneInstallOrWriteAttempts() async throws {
@@ -257,6 +373,7 @@ final class WujiStageDRecoveryTests: XCTestCase {
         XCTAssertNil(StageDCompletionVerifier.verify(
             record: record, result: result, command: command,
             operationID: op, attemptID: attempt, approvalBindingSHA256: nil,
+            providerDecisionSHA256: nil,
             requireProvider: false, now: Date()
         ))
     }
@@ -329,11 +446,32 @@ enum StageDTestSupport {
         return .init(base: base, store: store, task: task, write: write)
     }
 
+    static func prepareSuccessfulCommandTask() async throws -> StageDTestPrepared {
+        let prepared = try await prepare()
+        let task = try await prepared.store.create(
+            session: prepared.base.session,
+            workspace: prepared.base.workspace,
+            ruleSet: prepared.base.ruleSet,
+            write: prepared.write,
+            expectation: .init(
+                kind: .successfulCommand, relativePath: nil, expectedSHA256: nil,
+                cloneTarget: nil, cloneRemote: nil, cloneHEAD: nil
+            )
+        )
+        return .init(
+            base: prepared.base,
+            store: prepared.store,
+            task: task,
+            write: prepared.write
+        )
+    }
+
     static func facts(
         stdoutEOF: Bool = true,
         truncated: Bool = false,
         cancelled: Bool = false,
-        tree: StageDProcessTreeState = .quiescent
+        tree: StageDProcessTreeState = .quiescent,
+        observedAfterBarrier: Bool = true
     ) -> StageDProcessFacts {
         .init(
             rootExitObserved: true, finalStateKind: "exited", finalStateValue: 0,
@@ -342,28 +480,35 @@ enum StageDTestSupport {
             stdoutSHA256: ProviderDigest.sha256Hex(Data()),
             stderrSHA256: ProviderDigest.sha256Hex(Data()),
             truncated: truncated, cancellationRequested: cancelled,
+            cancelDelivery: cancelled ? .signalSent : .notRequested,
             processTreeState: tree,
-            activeDescendantCount: tree == .descendantsRemain ? 1 : 0
+            activeDescendantCount: tree == .descendantsRemain ? 1 : 0,
+            processTreeObservedAfterTerminalBarrier: observedAfterBarrier
         )
     }
 
     static func result(
         command: StageDAuthorizedCommand,
         facts: StageDProcessFacts = StageDTestSupport.facts(),
+        stdout: String = "",
+        stderr: String = "",
         cloneRemote: String? = nil,
-        cloneHEAD: String? = nil
+        cloneHEAD: String? = nil,
+        cloneStages: [StageDCloneStageOutcome] = [],
+        failureCategory: StageDRuntimeFailureCategory? = nil
     ) -> StageDCommandResult {
         let verification = "stage-d-test-verification"
         return .init(
             commandBindingSHA256: command.bindingSHA256,
-            facts: [facts], stdout: "", stderr: "",
+            facts: [facts], stdout: stdout, stderr: stderr,
             outputProjectionTruncated: false,
             verification: verification,
             verificationSHA256: ProviderDigest.sha256Hex(verification),
             cloneRemote: cloneRemote, cloneHEAD: cloneHEAD,
             cloneEntryCount: cloneRemote == nil ? nil : 1,
             cloneByteCount: cloneRemote == nil ? nil : 1,
-            toolVersions: [:]
+            toolVersions: [:], cloneStages: cloneStages,
+            failureCategory: failureCategory
         )
     }
 
@@ -408,7 +553,7 @@ enum StageDTestSupport {
             taskID: record.id, operationID: op, attemptID: attempt,
             kind: .command, phase: phase, inputSHA256: command.bindingSHA256,
             recordedAt: Date(), command: command, approvalBindingSHA256: nil,
-            providerDecision: nil, result: result,
+            providerDecisionSHA256: nil, providerDecision: nil, result: result,
             resultSHA256: result.flatMap { StageDTaskStore.digest($0) }
         )
     }
@@ -428,7 +573,10 @@ actor StageDMockExecutor: StageDCommandExecuting {
         self.mode = mode
     }
 
-    func execute(_ command: StageDAuthorizedCommand) async -> StageDExecutorOutcome {
+    func execute(
+        _ command: StageDAuthorizedCommand,
+        policy: StageDCommandPolicy
+    ) async -> StageDExecutorOutcome {
         calls += 1
         if let snapshot = try? await store.snapshot(taskID: taskID) {
             sawIntent = snapshot.attempts.contains {
@@ -469,7 +617,10 @@ actor StageDBlockingExecutor: StageDCommandExecuting {
         self.taskID = taskID
     }
 
-    func execute(_ command: StageDAuthorizedCommand) async -> StageDExecutorOutcome {
+    func execute(
+        _ command: StageDAuthorizedCommand,
+        policy: StageDCommandPolicy
+    ) async -> StageDExecutorOutcome {
         calls += 1
         if let snapshot = try? await store.snapshot(taskID: taskID) {
             sawIntent = snapshot.attempts.contains {

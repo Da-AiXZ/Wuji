@@ -20,7 +20,7 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
             return XCTFail("pwd policy setup failed")
         }
         let attemptsBeforeResolverFailure = wuji_ish_stage_d_command_attempt_count()
-        guard case .failed = await failedResolverExecutor.execute(pwd) else {
+        guard case .failed = await failedResolverExecutor.execute(pwd, policy: readPolicy) else {
             return XCTFail("resolver failure did not fail closed")
         }
         XCTAssertEqual(wuji_ish_stage_d_command_attempt_count(), attemptsBeforeResolverFailure)
@@ -29,6 +29,20 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
             workspace: prepared.base.workspace,
             cloneRootURL: cloneRootURL
         )
+        let forged = StageDAuthorizedCommand(
+            parsed: pwd.parsed,
+            risk: .installation,
+            executionRoot: .rootfs,
+            workspaceIdentitySHA256: pwd.workspaceIdentitySHA256,
+            write: nil,
+            cloneTarget: nil
+        )
+        let attemptsBeforeForgedCommand = wuji_ish_stage_d_command_attempt_count()
+        guard case let .failed(forgedResult) = await executor.execute(forged, policy: readPolicy) else {
+            return XCTFail("forged authorized command was not rejected")
+        }
+        XCTAssertEqual(forgedResult?.failureCategory, .authorizationRejected)
+        XCTAssertEqual(wuji_ish_stage_d_command_attempt_count(), attemptsBeforeForgedCommand)
 
         let installTask = try await makeTask(
             prepared,
@@ -149,12 +163,20 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
                 workspaceIdentitySHA256: cloneTask.workspaceIdentitySHA256, write: nil
             ), requireProvider: false
         )
-        guard case .completed = await cloneAgent.run(
+        let cloneOutcome = await cloneAgent.run(
             command: "git clone --depth 8 --no-tags --single-branch https://github.com/Da-AiXZ/Wuji.git Wuji-StageC",
             cwd: "."
-        ) else { return XCTFail("exact public clone did not complete") }
+        )
+        guard case .completed = cloneOutcome else {
+            let failedSnapshot = try await prepared.store.snapshot(taskID: cloneTask.id)
+            let summary = try failedSnapshot.attempts.last?.result?.safeDiagnosticSummaryString()
+                ?? StageDSafeDiagnosticSummary.forLoopOutcome(cloneOutcome).encodedString()
+            return XCTFail(summary)
+        }
         let cloneSnapshot = try await prepared.store.snapshot(taskID: cloneTask.id)
         let cloneResult = try XCTUnwrap(cloneSnapshot.attempts.last?.result)
+        XCTAssertEqual(cloneResult.cloneStages.map(\.stage), StageDCloneStage.allCases)
+        XCTAssertTrue(cloneResult.cloneStages.allSatisfy { $0.category == .succeeded })
         XCTAssertEqual(cloneResult.cloneRemote, StageDEnvironmentLock.cloneURL)
         XCTAssertEqual(cloneResult.cloneHEAD, StageDEnvironmentLock.acceptedStageCCommit)
         XCTAssertLessThanOrEqual(cloneResult.cloneEntryCount ?? Int.max, StageDLimits.production.maximumCloneEntries)
@@ -183,6 +205,7 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
         XCTAssertTrue(writeFacts.stderrEOFObserved)
         XCTAssertFalse(writeFacts.truncated)
         XCTAssertEqual(writeFacts.processTreeState, .quiescent)
+        XCTAssertTrue(writeFacts.processTreeObservedAfterTerminalBarrier)
     }
 
     private func makeTask(
@@ -196,6 +219,158 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
             ruleSet: prepared.base.ruleSet,
             write: write,
             expectation: expectation
+        )
+    }
+
+    func testClonePipelineShortCircuitsEveryFailureAndUnknownStageWithSafeStructuredOutcome() async throws {
+        let command = StageDTestSupport.cloneCommand(identity: String(repeating: "a", count: 64))
+        let failures: [(StageDCloneStage, StageDCloneStageCategory, StageDRuntimeFailureCategory)] = [
+            (.cloneProcess, .processNonzero, .cloneProcessNonzero),
+            (.cloneProcess, .timeoutUnknown, .cloneTimeoutUnknown),
+            (.cloneProcess, .adapterError, .adapterFixedError),
+            (.checkoutExactCommit, .targetUnavailable, .checkoutTargetUnavailable),
+            (.remoteVerify, .valueMismatch, .remoteMismatch),
+            (.headVerify, .valueMismatch, .headMismatch),
+            (.boundedTreeVerify, .treeOverflow, .treeOverflow),
+            (.boundedTreeVerify, .treeEscape, .treeEscape),
+        ]
+        for (failedStage, category, failureCategory) in failures {
+            let script = StageDClonePipelineScript(failureStage: failedStage, category: category)
+            let outcome = await StageDClonePipeline.run(
+                command: command,
+                limits: .production,
+                step: { await script.run($0) },
+                inspectTree: { await script.inspectTree() }
+            )
+            XCTAssertEqual(outcome.failureCategory, failureCategory)
+            XCTAssertEqual(outcome.stages.map(\.stage), StageDCloneStage.allCases)
+            XCTAssertEqual(outcome.stages.first { $0.stage == failedStage }?.category, category)
+            let failedIndex = try XCTUnwrap(StageDCloneStage.allCases.firstIndex(of: failedStage))
+            for later in StageDCloneStage.allCases.dropFirst(failedIndex + 1) {
+                XCTAssertEqual(outcome.stages.first { $0.stage == later }?.category, .notRun)
+            }
+            let calls = await script.calls()
+            XCTAssertEqual(calls, Array(StageDCloneStage.allCases.prefix(failedIndex + 1)))
+        }
+    }
+
+    func testCrossWorkspaceWaiterCannotStartWatchdogOrCancelActiveExecution() async throws {
+        let gate = StageDGlobalExecutionGate()
+        let first = UUID(), second = UUID()
+        await gate.acquire(first)
+        let secondAcquired = StageDAsyncFlag()
+        let waiter = Task {
+            await gate.acquire(second)
+            await secondAcquired.mark()
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let beforeAcquired = await secondAcquired.value()
+        let firstWasActive = await gate.isActive(first)
+        let secondWasActive = await gate.isActive(second)
+        XCTAssertFalse(beforeAcquired)
+        XCTAssertTrue(firstWasActive)
+        XCTAssertFalse(secondWasActive)
+        await gate.release(first)
+        _ = await waiter.value
+        let afterAcquired = await secondAcquired.value()
+        let secondIsActive = await gate.isActive(second)
+        XCTAssertTrue(afterAcquired)
+        XCTAssertTrue(secondIsActive)
+        await gate.release(second)
+    }
+}
+
+private actor StageDClonePipelineScript {
+    private let failureStage: StageDCloneStage
+    private let category: StageDCloneStageCategory
+    private var invoked: [StageDCloneStage] = []
+
+    init(failureStage: StageDCloneStage, category: StageDCloneStageCategory) {
+        self.failureStage = failureStage
+        self.category = category
+    }
+
+    func run(_ stage: StageDCloneStage) -> StageDCloneStepResult {
+        invoked.append(stage)
+        let facts: StageDProcessFacts
+        if stage == failureStage {
+            switch category {
+            case .processNonzero, .targetUnavailable:
+                facts = StageDTestSupport.facts()
+                    .replacingFinalState(kind: "exited", value: 1)
+            case .timeoutUnknown:
+                facts = StageDTestSupport.facts(cancelled: true)
+                    .replacingFinalState(kind: "unknown", value: 0)
+            case .adapterError:
+                return .failed(nil, fixedError: .guestExec)
+            default:
+                facts = StageDTestSupport.facts()
+            }
+        } else {
+            facts = StageDTestSupport.facts()
+        }
+        if stage == failureStage {
+            switch category {
+            case .processNonzero, .targetUnavailable:
+                return .failed(.init(facts: facts, stdout: "", stderr: ""), fixedError: .none)
+            case .timeoutUnknown:
+                return .unknown(.init(facts: facts, stdout: "", stderr: ""), fixedError: .none)
+            case .adapterError:
+                return .failed(nil, fixedError: .guestExec)
+            case .valueMismatch:
+                return .succeeded(.init(facts: facts, stdout: "wrong\n", stderr: ""))
+            case .treeOverflow, .treeEscape, .notRun, .succeeded, .terminalBarrierFailure:
+                break
+            }
+        }
+        let output: String
+        switch stage {
+        case .remoteVerify: output = StageDEnvironmentLock.cloneURL + "\n"
+        case .headVerify: output = StageDEnvironmentLock.acceptedStageCCommit + "\n"
+        default: output = ""
+        }
+        return .succeeded(.init(facts: facts, stdout: output, stderr: ""))
+    }
+
+    func inspectTree() -> StageDCloneTreeResult {
+        invoked.append(.boundedTreeVerify)
+        guard failureStage == .boundedTreeVerify else {
+            return .succeeded(entries: 1, bytes: 1)
+        }
+        switch category {
+        case .treeOverflow: return .overflow(entries: StageDLimits.production.maximumCloneEntries + 1)
+        case .treeEscape: return .escape
+        default: return .succeeded(entries: 1, bytes: 1)
+        }
+    }
+
+    func calls() -> [StageDCloneStage] { invoked }
+}
+
+private actor StageDAsyncFlag {
+    private var marked = false
+    func mark() { marked = true }
+    func value() -> Bool { marked }
+}
+
+private extension StageDProcessFacts {
+    func replacingFinalState(kind: String, value: Int32) -> StageDProcessFacts {
+        .init(
+            rootExitObserved: rootExitObserved,
+            finalStateKind: kind,
+            finalStateValue: value,
+            stdoutEOFObserved: stdoutEOFObserved,
+            stderrEOFObserved: stderrEOFObserved,
+            stdoutByteCount: stdoutByteCount,
+            stderrByteCount: stderrByteCount,
+            stdoutSHA256: stdoutSHA256,
+            stderrSHA256: stderrSHA256,
+            truncated: truncated,
+            cancellationRequested: cancellationRequested,
+            cancelDelivery: cancelDelivery,
+            processTreeState: processTreeState,
+            activeDescendantCount: activeDescendantCount,
+            processTreeObservedAfterTerminalBarrier: processTreeObservedAfterTerminalBarrier
         )
     }
 }

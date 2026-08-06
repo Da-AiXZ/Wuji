@@ -131,6 +131,20 @@ enum StageDCommandError: String, Error, Codable, Equatable, Sendable {
     case reconciliationRequired = "reconciliation_required"
     case providerFailure = "provider_failure"
     case providerPolicy = "provider_policy"
+    case providerBindingMismatch = "provider_binding_mismatch"
+    case authorizationRejected = "authorization_rejected"
+    case intentStoreFailure = "intent_store_failure"
+    case resolverNetworkFailure = "resolver_network_failure"
+    case cloneProcessNonzero = "clone_process_nonzero"
+    case cloneTimeoutUnknown = "clone_timeout_unknown"
+    case checkoutTargetUnavailable = "checkout_target_unavailable"
+    case remoteMismatch = "remote_mismatch"
+    case headMismatch = "head_mismatch"
+    case treeOverflow = "tree_overflow"
+    case treeEscape = "tree_escape"
+    case terminalBarrierFailure = "terminal_barrier_failure"
+    case durableTerminalFailure = "durable_terminal_failure"
+    case durableCompletionFailure = "durable_completion_failure"
     case completionRejected = "completion_rejected"
 }
 
@@ -184,6 +198,13 @@ enum StageDProcessTreeState: String, Codable, Equatable, Sendable {
     case descendantsRemain = "descendants_remain"
 }
 
+enum StageDCancelDelivery: String, Codable, Equatable, Sendable {
+    case notRequested = "not_requested"
+    case signalSent = "signal_sent"
+    case noActiveTask = "no_active_task"
+    case unknown
+}
+
 struct StageDProcessFacts: Codable, Equatable, Sendable {
     let rootExitObserved: Bool
     let finalStateKind: String
@@ -196,8 +217,10 @@ struct StageDProcessFacts: Codable, Equatable, Sendable {
     let stderrSHA256: String
     let truncated: Bool
     let cancellationRequested: Bool
+    let cancelDelivery: StageDCancelDelivery
     let processTreeState: StageDProcessTreeState
     let activeDescendantCount: Int
+    let processTreeObservedAfterTerminalBarrier: Bool
 
     var terminalBarrierSatisfied: Bool {
         rootExitObserved && stdoutEOFObserved && stderrEOFObserved
@@ -209,9 +232,107 @@ struct StageDProcessFacts: Codable, Equatable, Sendable {
             && finalStateValue == 0
             && !truncated
             && !cancellationRequested
+            && cancelDelivery == .notRequested
             && processTreeState == .quiescent
             && activeDescendantCount == 0
+            && processTreeObservedAfterTerminalBarrier
     }
+}
+
+enum StageDCloneStage: String, Codable, CaseIterable, Equatable, Sendable {
+    case cloneProcess = "clone_process"
+    case checkoutExactCommit = "checkout_exact_commit"
+    case remoteVerify = "remote_verify"
+    case headVerify = "head_verify"
+    case boundedTreeVerify = "bounded_tree_verify"
+}
+
+enum StageDAdapterErrorCategory: String, Codable, Equatable, Sendable {
+    case none
+    case invalidInput = "invalid_input"
+    case notPrepared = "not_prepared"
+    case hostPipe = "host_pipe"
+    case guestTask = "guest_task"
+    case guestCWD = "guest_cwd"
+    case guestStdio = "guest_stdio"
+    case guestExec = "guest_exec"
+    case stdoutReader = "stdout_reader"
+    case stderrReader = "stderr_reader"
+    case internalFailure = "internal_failure"
+}
+
+enum StageDCloneStageCategory: String, Codable, Equatable, Sendable {
+    case notRun = "not_run"
+    case succeeded
+    case processNonzero = "process_nonzero"
+    case timeoutUnknown = "timeout_unknown"
+    case adapterError = "adapter_error"
+    case targetUnavailable = "target_unavailable"
+    case valueMismatch = "value_mismatch"
+    case treeOverflow = "tree_overflow"
+    case treeEscape = "tree_escape"
+    case terminalBarrierFailure = "terminal_barrier_failure"
+}
+
+enum StageDRuntimeFailureCategory: String, Codable, Equatable, Sendable {
+    case authorizationRejected = "authorization_rejected"
+    case intentStoreFailure = "intent_store_failure"
+    case resolverNetworkFailure = "resolver_network_failure"
+    case cloneProcessNonzero = "clone_process_nonzero"
+    case cloneTimeoutUnknown = "clone_timeout_unknown"
+    case adapterFixedError = "adapter_fixed_error"
+    case checkoutTargetUnavailable = "checkout_target_unavailable"
+    case remoteMismatch = "remote_mismatch"
+    case headMismatch = "head_mismatch"
+    case treeOverflow = "tree_overflow"
+    case treeEscape = "tree_escape"
+    case eofTruncationProcessTreeFailure = "eof_truncation_process_tree_failure"
+    case durableTerminalFailure = "durable_terminal_failure"
+    case durableCompletionFailure = "durable_completion_failure"
+}
+
+struct StageDCloneStageOutcome: Codable, Equatable, Sendable {
+    let stage: StageDCloneStage
+    let category: StageDCloneStageCategory
+    let processStarted: Bool
+    let facts: StageDProcessFacts
+    let adapterError: StageDAdapterErrorCategory
+    let observedValueSHA256: String?
+    let entryCount: Int?
+    let byteCount: UInt64?
+
+    static func notRun(stage: StageDCloneStage) -> StageDCloneStageOutcome {
+        .init(
+            stage: stage,
+            category: .notRun,
+            processStarted: false,
+            facts: .notRun,
+            adapterError: .none,
+            observedValueSHA256: nil,
+            entryCount: nil,
+            byteCount: nil
+        )
+    }
+}
+
+extension StageDProcessFacts {
+    static let notRun = StageDProcessFacts(
+        rootExitObserved: false,
+        finalStateKind: "not_run",
+        finalStateValue: 0,
+        stdoutEOFObserved: false,
+        stderrEOFObserved: false,
+        stdoutByteCount: 0,
+        stderrByteCount: 0,
+        stdoutSHA256: ProviderDigest.sha256Hex(Data()),
+        stderrSHA256: ProviderDigest.sha256Hex(Data()),
+        truncated: false,
+        cancellationRequested: false,
+        cancelDelivery: .notRequested,
+        processTreeState: .notObserved,
+        activeDescendantCount: 0,
+        processTreeObservedAfterTerminalBarrier: false
+    )
 }
 
 struct StageDCommandResult: Codable, Equatable, Sendable {
@@ -227,12 +348,152 @@ struct StageDCommandResult: Codable, Equatable, Sendable {
     let cloneEntryCount: Int?
     let cloneByteCount: UInt64?
     let toolVersions: [String: String]
+    let cloneStages: [StageDCloneStageOutcome]
+    let failureCategory: StageDRuntimeFailureCategory?
 
     var verified: Bool {
         !facts.isEmpty
             && facts.allSatisfy(\.verifiedSuccessBarrier)
             && !outputProjectionTruncated
             && ProviderDigest.sha256Hex(verification) == verificationSHA256
+            && (cloneStages.isEmpty || cloneStages.allSatisfy { $0.category == .succeeded })
+            && failureCategory == nil
+    }
+
+
+    func safeDiagnosticSummaryData() throws -> Data {
+        let summary = StageDSafeDiagnosticSummary(result: self)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let data = try encoder.encode(summary)
+        guard data.count <= 8 * 1_024 else { throw StageDCommandError.evidenceFailure }
+        return data
+    }
+
+    func safeDiagnosticSummaryString() throws -> String {
+        String(decoding: try safeDiagnosticSummaryData(), as: UTF8.self)
+    }
+}
+
+enum StageDSafeFinalKind: String, Codable, Equatable, Sendable {
+    case notRun = "not_run"
+    case exited
+    case signaled
+    case unknown
+}
+
+struct StageDSafeProcessSummary: Codable, Equatable, Sendable {
+    let rootExitObserved: Bool
+    let finalKind: StageDSafeFinalKind
+    let finalValue: Int32
+    let stdoutEOFObserved: Bool
+    let stderrEOFObserved: Bool
+    let stdoutByteCount: Int
+    let stderrByteCount: Int
+    let stdoutSHA256: String
+    let stderrSHA256: String
+    let truncated: Bool
+    let cancellationRequested: Bool
+    let cancelDelivery: StageDCancelDelivery
+    let processTreeState: StageDProcessTreeState
+    let activeDescendantCount: Int
+    let processTreeObservedAfterTerminalBarrier: Bool
+
+    init(_ facts: StageDProcessFacts) {
+        rootExitObserved = facts.rootExitObserved
+        finalKind = StageDSafeFinalKind(rawValue: facts.finalStateKind) ?? .unknown
+        finalValue = facts.finalStateValue
+        stdoutEOFObserved = facts.stdoutEOFObserved
+        stderrEOFObserved = facts.stderrEOFObserved
+        stdoutByteCount = facts.stdoutByteCount
+        stderrByteCount = facts.stderrByteCount
+        stdoutSHA256 = facts.stdoutSHA256
+        stderrSHA256 = facts.stderrSHA256
+        truncated = facts.truncated
+        cancellationRequested = facts.cancellationRequested
+        cancelDelivery = facts.cancelDelivery
+        processTreeState = facts.processTreeState
+        activeDescendantCount = facts.activeDescendantCount
+        processTreeObservedAfterTerminalBarrier = facts.processTreeObservedAfterTerminalBarrier
+    }
+}
+
+struct StageDSafeCloneStageSummary: Codable, Equatable, Sendable {
+    let stage: StageDCloneStage
+    let category: StageDCloneStageCategory
+    let processStarted: Bool
+    let facts: StageDSafeProcessSummary
+    let adapterError: StageDAdapterErrorCategory
+    let observedValueSHA256: String?
+    let entryCount: Int?
+    let byteCount: UInt64?
+
+    init(_ outcome: StageDCloneStageOutcome) {
+        stage = outcome.stage
+        category = outcome.category
+        processStarted = outcome.processStarted
+        facts = StageDSafeProcessSummary(outcome.facts)
+        adapterError = outcome.adapterError
+        observedValueSHA256 = outcome.observedValueSHA256
+        entryCount = outcome.entryCount
+        byteCount = outcome.byteCount
+    }
+}
+
+enum StageDSafeLoopCategory: String, Codable, Equatable, Sendable {
+    case succeeded
+    case failed
+    case completed
+    case pendingApproval = "pending_approval"
+    case rejected
+    case reconciliationRequired = "reconciliation_required"
+}
+
+struct StageDSafeDiagnosticSummary: Codable, Equatable, Sendable {
+    let loopCategory: StageDSafeLoopCategory
+    let commandError: StageDCommandError?
+    let failureCategory: StageDRuntimeFailureCategory?
+    let commandBindingSHA256: String?
+    let verificationSHA256: String?
+    let processFacts: [StageDSafeProcessSummary]
+    let cloneStages: [StageDSafeCloneStageSummary]
+
+    init(result: StageDCommandResult) {
+        loopCategory = result.verified ? .succeeded : .failed
+        commandError = nil
+        failureCategory = result.failureCategory
+        commandBindingSHA256 = result.commandBindingSHA256
+        verificationSHA256 = result.verificationSHA256
+        processFacts = result.facts.map(StageDSafeProcessSummary.init)
+        cloneStages = result.cloneStages.map(StageDSafeCloneStageSummary.init)
+    }
+
+    private init(loopCategory: StageDSafeLoopCategory, commandError: StageDCommandError? = nil) {
+        self.loopCategory = loopCategory
+        self.commandError = commandError
+        failureCategory = nil
+        commandBindingSHA256 = nil
+        verificationSHA256 = nil
+        processFacts = []
+        cloneStages = []
+    }
+
+    static func forLoopOutcome(_ outcome: StageDLoopOutcome) -> StageDSafeDiagnosticSummary {
+        switch outcome {
+        case .completed: return .init(loopCategory: .completed)
+        case .pendingApproval: return .init(loopCategory: .pendingApproval)
+        case let .rejected(error): return .init(loopCategory: .rejected, commandError: error)
+        case let .failed(error): return .init(loopCategory: .failed, commandError: error)
+        case .reconciliationRequired: return .init(loopCategory: .reconciliationRequired)
+        }
+    }
+
+    func encodedString() throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let data = try encoder.encode(self)
+        guard data.count <= 8 * 1_024 else { throw StageDCommandError.evidenceFailure }
+        return String(decoding: data, as: UTF8.self)
     }
 }
 
@@ -243,7 +504,10 @@ enum StageDExecutorOutcome: Equatable, Sendable {
 }
 
 protocol StageDCommandExecuting: Sendable {
-    func execute(_ command: StageDAuthorizedCommand) async -> StageDExecutorOutcome
+    func execute(
+        _ command: StageDAuthorizedCommand,
+        policy: StageDCommandPolicy
+    ) async -> StageDExecutorOutcome
 }
 
 struct StageDApprovalRequest: Codable, Equatable, Sendable {
@@ -258,9 +522,44 @@ struct StageDApprovalRequest: Codable, Equatable, Sendable {
     let cwd: String
     let risk: StageDCommandRisk
     let executionRoot: StageDExecutionRoot
+    let providerDecisionSHA256: String?
     let nonce: UUID
     let createdAt: Date
     let expiresAt: Date
+
+    init(
+        requestID: UUID,
+        taskID: UUID,
+        operationID: UUID,
+        attemptID: UUID,
+        workspaceIdentitySHA256: String,
+        commandBindingSHA256: String,
+        command: String,
+        argumentsSHA256: String,
+        cwd: String,
+        risk: StageDCommandRisk,
+        executionRoot: StageDExecutionRoot,
+        providerDecisionSHA256: String? = nil,
+        nonce: UUID,
+        createdAt: Date,
+        expiresAt: Date
+    ) {
+        self.requestID = requestID
+        self.taskID = taskID
+        self.operationID = operationID
+        self.attemptID = attemptID
+        self.workspaceIdentitySHA256 = workspaceIdentitySHA256
+        self.commandBindingSHA256 = commandBindingSHA256
+        self.command = command
+        self.argumentsSHA256 = argumentsSHA256
+        self.cwd = cwd
+        self.risk = risk
+        self.executionRoot = executionRoot
+        self.providerDecisionSHA256 = providerDecisionSHA256
+        self.nonce = nonce
+        self.createdAt = createdAt
+        self.expiresAt = expiresAt
+    }
 
     var bindingSHA256: String {
         ProviderDigest.sha256Hex([
@@ -268,6 +567,7 @@ struct StageDApprovalRequest: Codable, Equatable, Sendable {
             operationID.uuidString.lowercased(), attemptID.uuidString.lowercased(),
             workspaceIdentitySHA256, commandBindingSHA256, ProviderDigest.sha256Hex(command),
             argumentsSHA256, cwd, risk.rawValue, executionRoot.rawValue,
+            providerDecisionSHA256 ?? "",
             nonce.uuidString.lowercased(),
             String(Int64((createdAt.timeIntervalSince1970 * 1_000).rounded())),
             String(Int64((expiresAt.timeIntervalSince1970 * 1_000).rounded()))
@@ -398,6 +698,7 @@ struct StageDProviderDecision: Codable, Equatable, Sendable {
     let command: String
     let cwd: String
     let assistantSHA256: String
+    let expectedInputSHA256: String
 }
 
 struct StageDAttemptEvidence: Codable, Equatable, Sendable {
@@ -410,9 +711,40 @@ struct StageDAttemptEvidence: Codable, Equatable, Sendable {
     let recordedAt: Date
     let command: StageDAuthorizedCommand?
     let approvalBindingSHA256: String?
+    let providerDecisionSHA256: String?
     let providerDecision: StageDProviderDecision?
     let result: StageDCommandResult?
     let resultSHA256: String?
+
+    init(
+        taskID: UUID,
+        operationID: UUID,
+        attemptID: UUID,
+        kind: StageDExternalIOKind,
+        phase: StageDAttemptPhase,
+        inputSHA256: String,
+        recordedAt: Date,
+        command: StageDAuthorizedCommand?,
+        approvalBindingSHA256: String?,
+        providerDecisionSHA256: String? = nil,
+        providerDecision: StageDProviderDecision?,
+        result: StageDCommandResult?,
+        resultSHA256: String?
+    ) {
+        self.taskID = taskID
+        self.operationID = operationID
+        self.attemptID = attemptID
+        self.kind = kind
+        self.phase = phase
+        self.inputSHA256 = inputSHA256
+        self.recordedAt = recordedAt
+        self.command = command
+        self.approvalBindingSHA256 = approvalBindingSHA256
+        self.providerDecisionSHA256 = providerDecisionSHA256
+        self.providerDecision = providerDecision
+        self.result = result
+        self.resultSHA256 = resultSHA256
+    }
 }
 
 enum StageDTaskPhase: String, Codable, Equatable, Sendable {
@@ -451,7 +783,34 @@ struct StageDCompletion: Codable, Equatable, Sendable {
     let attemptID: UUID
     let resultSHA256: String
     let verificationSHA256: String
+    let providerDecisionSHA256: String?
     let completedAt: Date
+
+    init(
+        taskID: UUID,
+        sessionID: UUID,
+        workspaceIdentitySHA256: String,
+        commandBindingSHA256: String,
+        approvalBindingSHA256: String?,
+        operationID: UUID,
+        attemptID: UUID,
+        resultSHA256: String,
+        verificationSHA256: String,
+        providerDecisionSHA256: String? = nil,
+        completedAt: Date
+    ) {
+        self.taskID = taskID
+        self.sessionID = sessionID
+        self.workspaceIdentitySHA256 = workspaceIdentitySHA256
+        self.commandBindingSHA256 = commandBindingSHA256
+        self.approvalBindingSHA256 = approvalBindingSHA256
+        self.operationID = operationID
+        self.attemptID = attemptID
+        self.resultSHA256 = resultSHA256
+        self.verificationSHA256 = verificationSHA256
+        self.providerDecisionSHA256 = providerDecisionSHA256
+        self.completedAt = completedAt
+    }
 }
 
 struct StageDTaskRecord: Codable, Equatable, Identifiable, Sendable {

@@ -165,6 +165,8 @@ jobs:
               "testUnsupportedLanguagesReportUnavailableWithoutSilentInstall",
               "testSecretEnvironmentAndCredentialSyntaxCannotBecomeCommandOrCloneEvidence",
               "testProcessDrainTruncationAndProcessTreeRemainSeparateCompletionFacts",
+              "testCloneDiagnosticUsesFixedStageLabelsAndOmitsRawSensitiveValuesWithinEightKiB",
+              "testExecutorRevalidatesCompleteAuthorizedCommandAgainstCurrentPolicy",
               "testUIProjectionCannotAuthorApprovalExecutionOrCompletionTruth",
               "testProductionResourceDefaultsAreExactAndInjectable",
               "testApprovalBindsTaskOperationAttemptCommandArgvCwdRiskAndExpiry",
@@ -173,10 +175,15 @@ jobs:
               "testUnknownCommandColdRestoreNeverResendsWriteNetworkInstallOrProvider",
               "testCancelledDrainedOrTruncatedUnknownRemainsReconciliationRequired",
               "testReliableProviderDecisionResumesWithoutProviderResend",
+              "testInternallyConsistentWrongProviderPairFailsClosedWithZeroProviderAndExecutorIO",
+              "testProviderRequiredDirectEntryFailsClosedBeforeExecutorIO",
+              "testReliableCommandTerminalCompletesDirectAndModelRecoveryWithoutReexecution",
               "testCompletedColdRestoreCreatesZeroProviderCommandCloneInstallOrWriteAttempts",
               "testModelFinishClaimCannotCompleteWithoutCommandEvidence",
               "testCodeOwnedCompletionRejectsWrongCloneHeadAndIncompleteProcessFacts",
               "testRealARM64ISHStageDSystemResolverCommandMatrixInstallVersionsCloneWriteAndProcessTruth",
+              "testClonePipelineShortCircuitsEveryFailureAndUnknownStageWithSafeStructuredOutcome",
+              "testCrossWorkspaceWaiterCannotStartWatchdogOrCancelActiveExecution",
           ]
           missing = [name for name in required if name not in text]
           if missing:
@@ -330,10 +337,27 @@ jobs:
           import pathlib, re, subprocess
           baseline = "d8544f431b25fb33c9541e7b2b2405ccb4d686ce"
           changed = subprocess.check_output(["git", "diff", "--name-only", baseline + "..HEAD"], text=True).splitlines()
-          allowed = re.compile(r"^(?:Wuji\.xcodeproj/project\.pbxproj|Executor/WujiISHAdapter\.[ch]|Wuji/(?:WujiApp|ContentView|ISHStageDCommandExecutor|StageD[^/]*)\.swift|Wuji/StageDRealImportedProject/.*|WujiTests/WujiStageD.*Tests\.swift|\.github/workflows/stage-d-ish-development\.yml|docs/PROJECT_CONTROL_CENTER\.md)$")
+          allowed = re.compile(r"^(?:Wuji\.xcodeproj/project\.pbxproj|Executor/WujiISHAdapter\.[ch]|Wuji/(?:WujiApp|ContentView|ISHStageDCommandExecutor|StageD[^/]*)\.swift|Wuji/StageDRealImportedProject/.*|WujiTests/WujiStageD.*Tests\.swift|\.github/workflows/stage-d-(?:ish-development|raw-log-audit)\.yml|docs/PROJECT_CONTROL_CENTER\.md)$")
           unexpected = [path for path in changed if not allowed.fullmatch(path)]
           if unexpected:
               raise SystemExit("Stage D scope escaped: " + ", ".join(unexpected))
+          repair_parent = "e59b25fd7023b71e862f61e34c275d48a1178fd8"
+          repair_changed = subprocess.check_output(
+              ["git", "diff", "--name-only", repair_parent + "..HEAD"], text=True
+          ).splitlines()
+          repair_allowed = {
+              "Executor/WujiISHAdapter.c", "Executor/WujiISHAdapter.h",
+              "Wuji/StageDContracts.swift", "Wuji/StageDTaskStore.swift",
+              "Wuji/ISHStageDCommandExecutor.swift", "Wuji/StageDCommandAgent.swift",
+              "WujiTests/WujiStageDPolicyTests.swift",
+              "WujiTests/WujiStageDRecoveryTests.swift",
+              "WujiTests/WujiStageDISHIntegrationTests.swift",
+              ".github/workflows/stage-d-ish-development.yml",
+              ".github/workflows/stage-d-raw-log-audit.yml",
+          }
+          unexpected_repair = sorted(set(repair_changed) - repair_allowed)
+          if unexpected_repair:
+              raise SystemExit("Stage D post-03 repair scope escaped: " + ", ".join(unexpected_repair))
           text = "\n".join(path.read_text() for path in pathlib.Path("Wuji").glob("StageD*.swift"))
           for forbidden in ["DEEPSEEK_API_KEY=", "curl ", "wget ", "apt-get", "pod install", "swift package"]:
               if forbidden in text:
@@ -341,6 +365,8 @@ jobs:
           adapter = pathlib.Path("Executor/WujiISHAdapter.c").read_text()
           for required in [
               "wuji_ish_run_stage_d_command", "WUJI_ISH_PROCESS_TREE_QUIESCENT",
+              "wuji_ish_result_process_tree_observed_after_terminal_barrier",
+              "WUJI_ISH_FIXED_ERROR_GUEST_EXEC",
               "g_stage_d_clone_root_mounted", "wuji_ish_configure_stage_d_system_resolver",
               "res_ninit", "res_getservers", "getnameinfo", "NI_NUMERICHOST",
               'generic_open("/etc/resolv.conf"',
@@ -363,6 +389,17 @@ jobs:
           ]:
               if required not in tests:
                   raise SystemExit("Stage D resolver test boundary missing: " + required)
+          contracts = pathlib.Path("Wuji/StageDContracts.swift").read_text()
+          executor = pathlib.Path("Wuji/ISHStageDCommandExecutor.swift").read_text()
+          agent = pathlib.Path("Wuji/StageDCommandAgent.swift").read_text()
+          for required in [
+              "clone_process", "checkout_exact_commit", "remote_verify", "head_verify",
+              "bounded_tree_verify", "safeDiagnosticSummaryData", "StageDGlobalExecutionGate",
+              "processTreeObservedAfterTerminalBarrier", "providerDecisionSHA256",
+              "expectedInputSHA256", "revalidates(command, using: policy)",
+          ]:
+              if required not in contracts + executor + agent:
+                  raise SystemExit("Stage D post-03 contract missing: " + required)
           project = pathlib.Path("Wuji.xcodeproj/project.pbxproj").read_text()
           file_refs = re.findall(
               r'/\* libresolv\.tbd \*/ = \{isa = PBXFileReference; '
@@ -383,6 +420,10 @@ jobs:
           print("STAGE_D_SYSTEM_RESOLVER_STATIC_AUDIT=PASS")
           print("STAGE_D_SYNC_WORKSPACE_GATE_AUDIT=PASS")
           print("STAGE_D_LIBRESOLV_LINK_AUDIT=PASS")
+          print("STAGE_D_CLONE_STAGE_AUDIT=PASS")
+          print("STAGE_D_CANONICAL_PROVIDER_AUDIT=PASS")
+          print("STAGE_D_AUTHORIZATION_REVALIDATION_AUDIT=PASS")
+          print("STAGE_D_PROCESS_ISOLATION_AUDIT=PASS")
           print("STAGE_D_SCOPE_AUDIT=PASS")
           print("STAGE_D_FORBIDDEN_CAPABILITY_SCAN=PASS")
           PY
@@ -407,6 +448,24 @@ jobs:
             .github/workflows/stage-b-read-only-session.yml \
             .github/workflows/stage-c-bounded-edit.yml
           echo 'STAGE_D_PROTECTED_HISTORY_UNCHANGED=PASS'
+
+      - name: Record audit-only fallback handoff parameters
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          set +x
+          main_job_id="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" --jq '.jobs[] | select(.name == "Apple build, Stage D tests, real ARM64 iSH environment, and DeepSeek command") | .id')"
+          test -n "$main_job_id"
+          printf '%s\n' \
+            "STAGE_D_AUDIT_HANDOFF_VALIDATION_RUN_ID=$GITHUB_RUN_ID" \
+            "STAGE_D_AUDIT_HANDOFF_MAIN_JOB_ID=$main_job_id" \
+            "STAGE_D_AUDIT_HANDOFF_WORKFLOW_ID=327177536" \
+            "STAGE_D_AUDIT_HANDOFF_ATTEMPT=$GITHUB_RUN_ATTEMPT" \
+            "STAGE_D_AUDIT_HANDOFF_EVENT=$GITHUB_EVENT_NAME" \
+            "STAGE_D_AUDIT_HANDOFF_HEAD_SHA=$GITHUB_SHA"
 
   raw-log-audit:
     name: Exact Stage D raw-log and artifact audit
@@ -446,6 +505,10 @@ jobs:
                   b"STAGE_D_SYSTEM_RESOLVER_STATIC_AUDIT=PASS",
                   b"STAGE_D_SYNC_WORKSPACE_GATE_AUDIT=PASS",
                   b"STAGE_D_LIBRESOLV_LINK_AUDIT=PASS",
+                  b"STAGE_D_CLONE_STAGE_AUDIT=PASS",
+                  b"STAGE_D_CANONICAL_PROVIDER_AUDIT=PASS",
+                  b"STAGE_D_AUTHORIZATION_REVALIDATION_AUDIT=PASS",
+                  b"STAGE_D_PROCESS_ISOLATION_AUDIT=PASS",
                   b"STAGE_D_XCRESULT_AUDIT=PASS",
                   b"STAGE_D_REAL_ISH_DEEPSEEK_COMMAND=PASS",
                   b"STAGE_D_DURABLE_INTENT_AUDIT=PASS",

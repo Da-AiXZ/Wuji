@@ -18,10 +18,265 @@ private final class StageDTimeoutFlag: @unchecked Sendable {
     }
 }
 
-private struct StageDRawStep: Sendable {
+struct StageDRawStep: Sendable {
     let facts: StageDProcessFacts
     let stdout: String
     let stderr: String
+    let fixedError: StageDAdapterErrorCategory
+
+    init(
+        facts: StageDProcessFacts,
+        stdout: String,
+        stderr: String,
+        fixedError: StageDAdapterErrorCategory = .none
+    ) {
+        self.facts = facts
+        self.stdout = stdout
+        self.stderr = stderr
+        self.fixedError = fixedError
+    }
+}
+
+enum StageDCloneStepResult: Sendable {
+    case succeeded(StageDRawStep)
+    case failed(StageDRawStep?, fixedError: StageDAdapterErrorCategory)
+    case unknown(StageDRawStep?, fixedError: StageDAdapterErrorCategory)
+}
+
+enum StageDCloneTreeResult: Equatable, Sendable {
+    case succeeded(entries: Int, bytes: UInt64)
+    case overflow(entries: Int)
+    case escape
+}
+
+struct StageDClonePipelineResult: Sendable {
+    let stages: [StageDCloneStageOutcome]
+    let steps: [StageDRawStep]
+    let remote: String?
+    let head: String?
+    let entryCount: Int?
+    let byteCount: UInt64?
+    let failureCategory: StageDRuntimeFailureCategory?
+    let unknown: Bool
+
+    var succeeded: Bool {
+        failureCategory == nil && stages.allSatisfy { $0.category == .succeeded }
+    }
+}
+
+enum StageDClonePipeline {
+    static func run(
+        command: StageDAuthorizedCommand,
+        limits: StageDLimits,
+        step: @escaping @Sendable (StageDCloneStage) async -> StageDCloneStepResult,
+        inspectTree: @escaping @Sendable () async -> StageDCloneTreeResult
+    ) async -> StageDClonePipelineResult {
+        let exactArguments = [
+            "clone", "--depth", "8", "--no-tags", "--single-branch",
+            StageDEnvironmentLock.cloneURL, StageDEnvironmentLock.cloneTarget,
+        ]
+        guard command.risk == .network,
+              command.executionRoot == .cloneRoot,
+              command.parsed.executable == "git",
+              command.parsed.arguments == exactArguments,
+              command.parsed.cwd.isEmpty,
+              command.cloneTarget == StageDEnvironmentLock.cloneTarget,
+              limits.maximumCloneEntries > 0,
+              limits.maximumCloneBytes > 0 else {
+            return .init(
+                stages: StageDCloneStage.allCases.map { .notRun(stage: $0) },
+                steps: [], remote: nil, head: nil, entryCount: nil, byteCount: nil,
+                failureCategory: .authorizationRejected, unknown: false
+            )
+        }
+        var outcomes: [StageDCloneStageOutcome] = []
+        var steps: [StageDRawStep] = []
+        var remote: String?
+        var head: String?
+        var entryCount: Int?
+        var byteCount: UInt64?
+
+        func completed(
+            failure: StageDRuntimeFailureCategory?,
+            unknown: Bool = false
+        ) -> StageDClonePipelineResult {
+            let recorded = Set(outcomes.map(\.stage))
+            outcomes.append(contentsOf: StageDCloneStage.allCases.compactMap {
+                recorded.contains($0) ? nil : .notRun(stage: $0)
+            })
+            return .init(
+                stages: outcomes,
+                steps: steps,
+                remote: remote,
+                head: head,
+                entryCount: entryCount,
+                byteCount: byteCount,
+                failureCategory: failure,
+                unknown: unknown
+            )
+        }
+
+        for stage in StageDCloneStage.allCases.dropLast() {
+            let result = await step(stage)
+            switch result {
+            case let .succeeded(raw):
+                steps.append(raw)
+                if raw.fixedError != .none {
+                    outcomes.append(stageOutcome(
+                        stage: stage, category: .adapterError, raw: raw,
+                        fixedError: raw.fixedError
+                    ))
+                    return completed(failure: .adapterFixedError)
+                }
+                guard raw.facts.terminalBarrierSatisfied,
+                      raw.facts.processTreeObservedAfterTerminalBarrier,
+                      !raw.facts.truncated,
+                      raw.facts.processTreeState == .quiescent,
+                      raw.facts.activeDescendantCount == 0 else {
+                    outcomes.append(stageOutcome(
+                        stage: stage, category: .terminalBarrierFailure, raw: raw
+                    ))
+                    return completed(failure: .eofTruncationProcessTreeFailure)
+                }
+                guard raw.facts.finalStateKind == "exited", raw.facts.finalStateValue == 0 else {
+                    let category: StageDCloneStageCategory = stage == .checkoutExactCommit
+                        ? .targetUnavailable : .processNonzero
+                    let failure: StageDRuntimeFailureCategory = stage == .checkoutExactCommit
+                        ? .checkoutTargetUnavailable : .cloneProcessNonzero
+                    outcomes.append(stageOutcome(stage: stage, category: category, raw: raw))
+                    return completed(failure: failure)
+                }
+                if stage == .remoteVerify {
+                    let value = raw.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard value == StageDEnvironmentLock.cloneURL else {
+                        outcomes.append(stageOutcome(
+                            stage: stage, category: .valueMismatch, raw: raw,
+                            observedValueSHA256: ProviderDigest.sha256Hex(value)
+                        ))
+                        return completed(failure: .remoteMismatch)
+                    }
+                    remote = StageDEnvironmentLock.cloneURL
+                }
+                if stage == .headVerify {
+                    let value = raw.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard value == StageDEnvironmentLock.acceptedStageCCommit else {
+                        outcomes.append(stageOutcome(
+                            stage: stage, category: .valueMismatch, raw: raw,
+                            observedValueSHA256: ProviderDigest.sha256Hex(value)
+                        ))
+                        return completed(failure: .headMismatch)
+                    }
+                    head = StageDEnvironmentLock.acceptedStageCCommit
+                }
+                outcomes.append(stageOutcome(stage: stage, category: .succeeded, raw: raw))
+            case let .failed(raw, fixedError):
+                if let raw { steps.append(raw) }
+                let adapterError = fixedError != .none || raw?.fixedError != .none
+                if adapterError {
+                    outcomes.append(stageOutcome(
+                        stage: stage, category: .adapterError, raw: raw,
+                        fixedError: fixedError == .none ? raw?.fixedError ?? .internalFailure : fixedError
+                    ))
+                    return completed(failure: .adapterFixedError)
+                }
+                let category: StageDCloneStageCategory = stage == .checkoutExactCommit
+                    ? .targetUnavailable : .processNonzero
+                let failure: StageDRuntimeFailureCategory = stage == .checkoutExactCommit
+                    ? .checkoutTargetUnavailable : .cloneProcessNonzero
+                outcomes.append(stageOutcome(stage: stage, category: category, raw: raw))
+                return completed(failure: failure)
+            case let .unknown(raw, fixedError):
+                if let raw { steps.append(raw) }
+                outcomes.append(stageOutcome(
+                    stage: stage,
+                    category: fixedError == .none ? .timeoutUnknown : .adapterError,
+                    raw: raw,
+                    fixedError: fixedError
+                ))
+                return completed(
+                    failure: fixedError == .none ? .cloneTimeoutUnknown : .adapterFixedError,
+                    unknown: true
+                )
+            }
+        }
+
+        switch await inspectTree() {
+        case let .succeeded(entries, bytes):
+            entryCount = entries
+            byteCount = bytes
+            outcomes.append(treeOutcome(category: .succeeded, entries: entries, bytes: bytes))
+            return completed(failure: nil)
+        case let .overflow(entries):
+            outcomes.append(treeOutcome(category: .treeOverflow, entries: entries, bytes: nil))
+            return completed(failure: .treeOverflow)
+        case .escape:
+            outcomes.append(treeOutcome(category: .treeEscape, entries: nil, bytes: nil))
+            return completed(failure: .treeEscape)
+        }
+    }
+
+    private static func stageOutcome(
+        stage: StageDCloneStage,
+        category: StageDCloneStageCategory,
+        raw: StageDRawStep?,
+        fixedError: StageDAdapterErrorCategory = .none,
+        observedValueSHA256: String? = nil
+    ) -> StageDCloneStageOutcome {
+        .init(
+            stage: stage,
+            category: category,
+            processStarted: raw != nil,
+            facts: raw?.facts ?? .notRun,
+            adapterError: fixedError == .none ? raw?.fixedError ?? .none : fixedError,
+            observedValueSHA256: observedValueSHA256,
+            entryCount: nil,
+            byteCount: nil
+        )
+    }
+
+    private static func treeOutcome(
+        category: StageDCloneStageCategory,
+        entries: Int?,
+        bytes: UInt64?
+    ) -> StageDCloneStageOutcome {
+        .init(
+            stage: .boundedTreeVerify,
+            category: category,
+            processStarted: false,
+            facts: .notRun,
+            adapterError: .none,
+            observedValueSHA256: nil,
+            entryCount: entries,
+            byteCount: bytes
+        )
+    }
+}
+
+actor StageDGlobalExecutionGate {
+    static let shared = StageDGlobalExecutionGate()
+    private var active: UUID?
+    private var waiters: [(UUID, CheckedContinuation<Void, Never>)] = []
+
+    func acquire(_ operationID: UUID) async {
+        if active == nil {
+            active = operationID
+            return
+        }
+        await withCheckedContinuation { waiters.append((operationID, $0)) }
+    }
+
+    func release(_ operationID: UUID) {
+        guard active == operationID else { return }
+        if waiters.isEmpty {
+            active = nil
+            return
+        }
+        let next = waiters.removeFirst()
+        active = next.0
+        next.1.resume()
+    }
+
+    func isActive(_ operationID: UUID) -> Bool { active == operationID }
 }
 
 struct StageDSystemResolverEvidence: Equatable, Sendable {
@@ -102,10 +357,13 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
         return resolverEvidence
     }
 
-    func execute(_ command: StageDAuthorizedCommand) async -> StageDExecutorOutcome {
+    func execute(
+        _ command: StageDAuthorizedCommand,
+        policy: StageDCommandPolicy
+    ) async -> StageDExecutorOutcome {
         guard command.workspaceIdentitySHA256 == workspace.identitySHA256,
-              command.parsed.bindingSHA256 == command.bindingSHA256 || !command.bindingSHA256.isEmpty else {
-            return .failed(nil)
+              Self.revalidates(command, using: policy) else {
+            return .failed(failureResult(command: command, category: .authorizationRejected))
         }
         do {
             try prepareIfNeeded()
@@ -124,9 +382,27 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
             }
         } catch StageDCommandError.reconciliationRequired {
             return .unknown(nil)
+        } catch StageDCommandError.resolverNetworkFailure {
+            return .failed(failureResult(command: command, category: .resolverNetworkFailure))
+        } catch StageDCommandError.boundaryCrossing,
+                StageDCommandError.invalidCWD,
+                StageDCommandError.invalidClone {
+            return .failed(failureResult(command: command, category: .authorizationRejected))
         } catch {
             return .failed(nil)
         }
+    }
+
+    static func revalidates(
+        _ command: StageDAuthorizedCommand,
+        using policy: StageDCommandPolicy
+    ) -> Bool {
+        guard command.workspaceIdentitySHA256 == policy.workspaceIdentitySHA256 else { return false }
+        guard case let .authorized(expected) = policy.decide(
+            command: command.parsed.original,
+            cwd: command.parsed.cwd.isEmpty ? "." : command.parsed.cwd
+        ) else { return false }
+        return expected == command
     }
 
     private func prepareIfNeeded() throws {
@@ -159,7 +435,7 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
               resolverEvidence.configurationBytes > 0,
               resolverEvidence.configurationBytes < 4096,
               resolverEvidence.configurationCount > 0 else {
-            throw StageDCommandError.executorFailure
+            throw StageDCommandError.resolverNetworkFailure
         }
         self.resolverEvidence = resolverEvidence
         error = [CChar](repeating: 0, count: 512)
@@ -303,54 +579,108 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
             "clone", "--depth", "8", "--no-tags", "--single-branch",
             StageDEnvironmentLock.cloneURL, StageDEnvironmentLock.cloneTarget
         ], command.cloneTarget == StageDEnvironmentLock.cloneTarget else { return .failed(nil) }
-        let clone = try await run(
-            executable: "git", arguments: command.parsed.arguments,
-            cwd: "", root: .cloneRoot, timeout: limits.maximumCloneSeconds
-        )
-        let checkout = try await run(
-            executable: "git",
-            arguments: ["checkout", "--detach", StageDEnvironmentLock.acceptedStageCCommit],
-            cwd: StageDEnvironmentLock.cloneTarget,
-            root: .cloneRoot,
-            timeout: limits.commandTimeoutSeconds
-        )
-        let remote = try await run(
-            executable: "git", arguments: ["remote", "get-url", "origin"],
-            cwd: StageDEnvironmentLock.cloneTarget, root: .cloneRoot,
-            timeout: limits.commandTimeoutSeconds
-        )
-        let head = try await run(
-            executable: "git", arguments: ["rev-parse", "HEAD"],
-            cwd: StageDEnvironmentLock.cloneTarget, root: .cloneRoot,
-            timeout: limits.commandTimeoutSeconds
-        )
-        let remoteValue = remote.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        let headValue = head.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         let target = cloneRootURL.appendingPathComponent(StageDEnvironmentLock.cloneTarget, isDirectory: true)
-        let tree = try boundedTree(at: target, entryLimit: limits.maximumCloneEntries)
-        let noSubmoduleCheckout = !FileManager.default.fileExists(
-            atPath: target.appendingPathComponent(".git/modules").path
-        ) && !FileManager.default.fileExists(
-            atPath: target.appendingPathComponent("ThirdParty/ish/.git").path
+        let pipeline = await StageDClonePipeline.run(
+            command: command,
+            limits: limits,
+            step: { [self] stage in await cloneStep(stage, command: command) },
+            inspectTree: { [self] in inspectCloneTree(at: target) }
         )
-        let verification = "remote=\(remoteValue) head=\(headValue) entries=\(tree.entries) bytes=\(tree.bytes)"
+        let categories = pipeline.stages.map { $0.stage.rawValue + "=" + $0.category.rawValue }
+            .joined(separator: ",")
+        let verification = "clone_stages=\(ProviderDigest.sha256Hex(categories))"
         let result = makeResult(
             command: command,
-            steps: [clone, checkout, remote, head],
-            stdout: clone.stdout + checkout.stdout + remote.stdout + head.stdout,
-            stderr: clone.stderr + checkout.stderr + remote.stderr + head.stderr,
+            steps: pipeline.steps,
+            stdout: "",
+            stderr: "",
             verification: verification,
-            cloneRemote: remoteValue,
-            cloneHEAD: headValue,
-            cloneEntryCount: tree.entries,
-            cloneByteCount: tree.bytes
+            cloneRemote: pipeline.remote,
+            cloneHEAD: pipeline.head,
+            cloneEntryCount: pipeline.entryCount,
+            cloneByteCount: pipeline.byteCount,
+            cloneStages: pipeline.stages,
+            failureCategory: pipeline.failureCategory
         )
-        let verified = remoteValue == StageDEnvironmentLock.cloneURL
-            && headValue == StageDEnvironmentLock.acceptedStageCCommit
-            && tree.entries <= limits.maximumCloneEntries
-            && tree.bytes <= limits.maximumCloneBytes
-            && noSubmoduleCheckout
-        return verified && result.verified ? .succeeded(result) : outcomeForUnverified(result)
+        if pipeline.succeeded && result.verified { return .succeeded(result) }
+        return pipeline.unknown ? .unknown(result) : .failed(result)
+    }
+
+    private func cloneStep(
+        _ stage: StageDCloneStage,
+        command: StageDAuthorizedCommand
+    ) async -> StageDCloneStepResult {
+        let executable = "git"
+        let arguments: [String]
+        let cwd: String
+        let timeout: TimeInterval
+        switch stage {
+        case .cloneProcess:
+            arguments = command.parsed.arguments
+            cwd = ""
+            timeout = limits.maximumCloneSeconds
+        case .checkoutExactCommit:
+            arguments = ["checkout", "--detach", StageDEnvironmentLock.acceptedStageCCommit]
+            cwd = StageDEnvironmentLock.cloneTarget
+            timeout = limits.commandTimeoutSeconds
+        case .remoteVerify:
+            arguments = ["remote", "get-url", "origin"]
+            cwd = StageDEnvironmentLock.cloneTarget
+            timeout = limits.commandTimeoutSeconds
+        case .headVerify:
+            arguments = ["rev-parse", "HEAD"]
+            cwd = StageDEnvironmentLock.cloneTarget
+            timeout = limits.commandTimeoutSeconds
+        case .boundedTreeVerify:
+            return .failed(nil, fixedError: .invalidInput)
+        }
+        do {
+            let raw = try await run(
+                executable: executable,
+                arguments: arguments,
+                cwd: cwd,
+                root: .cloneRoot,
+                timeout: timeout
+            )
+            if raw.fixedError != .none { return .failed(raw, fixedError: raw.fixedError) }
+            if raw.facts.cancellationRequested || raw.facts.finalStateKind == "unknown" {
+                return .unknown(raw, fixedError: .none)
+            }
+            return .succeeded(raw)
+        } catch {
+            return .failed(nil, fixedError: .internalFailure)
+        }
+    }
+
+    private func inspectCloneTree(at root: URL) -> StageDCloneTreeResult {
+        let keys: Set<URLResourceKey> = [
+            .isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey,
+        ]
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: Array(keys),
+            options: [],
+            errorHandler: { _, _ in false }
+        ) else { return .escape }
+        let canonicalRoot = root.standardizedFileURL.resolvingSymlinksInPath()
+        var entries = 0
+        var bytes: UInt64 = 0
+        while let url = enumerator.nextObject() as? URL {
+            entries += 1
+            guard entries <= limits.maximumCloneEntries else { return .overflow(entries: entries) }
+            guard contained(url.standardizedFileURL.resolvingSymlinksInPath(), in: canonicalRoot),
+                  let values = try? url.resourceValues(forKeys: keys),
+                  values.isSymbolicLink != true else { return .escape }
+            if values.isRegularFile == true {
+                bytes += UInt64(values.fileSize ?? 0)
+                guard bytes <= limits.maximumCloneBytes else { return .overflow(entries: entries) }
+            }
+        }
+        guard !FileManager.default.fileExists(atPath: root.appendingPathComponent(".git/modules").path),
+              !FileManager.default.fileExists(atPath: root.appendingPathComponent("ThirdParty/ish/.git").path) else {
+            return .escape
+        }
+        return .succeeded(entries: entries, bytes: bytes)
     }
 
     private func run(
@@ -360,6 +690,12 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
         root: StageDExecutionRoot,
         timeout: TimeInterval
     ) async throws -> StageDRawStep {
+        let leaseID = UUID()
+        await StageDGlobalExecutionGate.shared.acquire(leaseID)
+        if Task.isCancelled {
+            await StageDGlobalExecutionGate.shared.release(leaseID)
+            throw StageDCommandError.reconciliationRequired
+        }
         var blob = Data()
         for argument in arguments {
             blob.append(contentsOf: argument.utf8)
@@ -389,16 +725,18 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
         let watchdog = Task.detached {
             try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
             guard !Task.isCancelled else { return }
+            guard await StageDGlobalExecutionGate.shared.isActive(leaseID) else { return }
             timeoutFlag.mark()
             _ = wuji_ish_request_cancel()
         }
         do {
             let value = try await execution.value
             watchdog.cancel()
-            if timeoutFlag.snapshot() { throw StageDCommandError.reconciliationRequired }
+            await StageDGlobalExecutionGate.shared.release(leaseID)
             return value
         } catch {
             watchdog.cancel()
+            await StageDGlobalExecutionGate.shared.release(leaseID)
             throw error
         }
     }
@@ -453,10 +791,43 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
             stderrSHA256: ProviderDigest.sha256Hex(stderrData),
             truncated: wuji_ish_result_truncated(raw),
             cancellationRequested: timeoutRequested || wuji_ish_result_cancellation_requested(raw),
+            cancelDelivery: cancelDelivery(raw),
             processTreeState: treeState,
-            activeDescendantCount: Int(wuji_ish_result_active_descendant_count(raw))
+            activeDescendantCount: Int(wuji_ish_result_active_descendant_count(raw)),
+            processTreeObservedAfterTerminalBarrier:
+                wuji_ish_result_process_tree_observed_after_terminal_barrier(raw)
         )
-        return .init(facts: facts, stdout: stdout, stderr: stderr)
+        return .init(
+            facts: facts,
+            stdout: stdout,
+            stderr: stderr,
+            fixedError: fixedError(raw)
+        )
+    }
+
+    private static func cancelDelivery(_ raw: OpaquePointer) -> StageDCancelDelivery {
+        switch wuji_ish_result_cancel_delivery(raw) {
+        case WUJI_ISH_CANCEL_NOT_REQUESTED: return .notRequested
+        case WUJI_ISH_CANCEL_SIGNAL_SENT: return .signalSent
+        case WUJI_ISH_CANCEL_NO_ACTIVE_TASK: return .noActiveTask
+        default: return .unknown
+        }
+    }
+
+    private static func fixedError(_ raw: OpaquePointer) -> StageDAdapterErrorCategory {
+        switch wuji_ish_result_fixed_error_kind(raw) {
+        case WUJI_ISH_FIXED_ERROR_NONE: return .none
+        case WUJI_ISH_FIXED_ERROR_INVALID_INPUT: return .invalidInput
+        case WUJI_ISH_FIXED_ERROR_NOT_PREPARED: return .notPrepared
+        case WUJI_ISH_FIXED_ERROR_HOST_PIPE: return .hostPipe
+        case WUJI_ISH_FIXED_ERROR_GUEST_TASK: return .guestTask
+        case WUJI_ISH_FIXED_ERROR_GUEST_CWD: return .guestCWD
+        case WUJI_ISH_FIXED_ERROR_GUEST_STDIO: return .guestStdio
+        case WUJI_ISH_FIXED_ERROR_GUEST_EXEC: return .guestExec
+        case WUJI_ISH_FIXED_ERROR_STDOUT_READER: return .stdoutReader
+        case WUJI_ISH_FIXED_ERROR_STDERR_READER: return .stderrReader
+        default: return .internalFailure
+        }
     }
 
     private func makeResult(
@@ -469,7 +840,9 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
         cloneHEAD: String? = nil,
         cloneEntryCount: Int? = nil,
         cloneByteCount: UInt64? = nil,
-        toolVersions: [String: String] = [:]
+        toolVersions: [String: String] = [:],
+        cloneStages: [StageDCloneStageOutcome] = [],
+        failureCategory: StageDRuntimeFailureCategory? = nil
     ) -> StageDCommandResult {
         let stdoutData = Data(stdout.utf8)
         let stderrData = Data(stderr.utf8)
@@ -487,7 +860,23 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
             cloneHEAD: cloneHEAD,
             cloneEntryCount: cloneEntryCount,
             cloneByteCount: cloneByteCount,
-            toolVersions: toolVersions
+            toolVersions: toolVersions,
+            cloneStages: cloneStages,
+            failureCategory: failureCategory
+        )
+    }
+
+    private func failureResult(
+        command: StageDAuthorizedCommand,
+        category: StageDRuntimeFailureCategory
+    ) -> StageDCommandResult {
+        makeResult(
+            command: command,
+            steps: [],
+            stdout: "",
+            stderr: "",
+            verification: "failure_category=\(category.rawValue)",
+            failureCategory: category
         )
     }
 
@@ -495,6 +884,7 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
         result.facts.contains(where: {
             !$0.rootExitObserved || $0.finalStateKind == "unknown" || $0.cancellationRequested
                 || $0.processTreeState != .quiescent
+                || !$0.processTreeObservedAfterTerminalBarrier
         }) ? .unknown(result) : .failed(result)
     }
 

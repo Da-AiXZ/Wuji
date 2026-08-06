@@ -42,6 +42,20 @@ typedef enum {
     WUJI_ISH_PROCESS_TREE_DESCENDANTS_REMAIN = 2,
 } WujiISHProcessTreeKind;
 
+typedef enum {
+    WUJI_ISH_FIXED_ERROR_NONE = 0,
+    WUJI_ISH_FIXED_ERROR_INVALID_INPUT = 1,
+    WUJI_ISH_FIXED_ERROR_NOT_PREPARED = 2,
+    WUJI_ISH_FIXED_ERROR_HOST_PIPE = 3,
+    WUJI_ISH_FIXED_ERROR_GUEST_TASK = 4,
+    WUJI_ISH_FIXED_ERROR_GUEST_CWD = 5,
+    WUJI_ISH_FIXED_ERROR_GUEST_STDIO = 6,
+    WUJI_ISH_FIXED_ERROR_GUEST_EXEC = 7,
+    WUJI_ISH_FIXED_ERROR_STDOUT_READER = 8,
+    WUJI_ISH_FIXED_ERROR_STDERR_READER = 9,
+    WUJI_ISH_FIXED_ERROR_INTERNAL = 10,
+} WujiISHFixedErrorKind;
+
 typedef struct WujiISHRunResult WujiISHRunResult;
 
 int wuji_ish_prepare(const char *archive_path,
@@ -143,6 +157,8 @@ WujiISHFinalKind wuji_ish_result_final_kind(const WujiISHRunResult *result);
 int32_t wuji_ish_result_final_value(const WujiISHRunResult *result);
 WujiISHProcessTreeKind wuji_ish_result_process_tree_kind(const WujiISHRunResult *result);
 int32_t wuji_ish_result_active_descendant_count(const WujiISHRunResult *result);
+bool wuji_ish_result_process_tree_observed_after_terminal_barrier(const WujiISHRunResult *result);
+WujiISHFixedErrorKind wuji_ish_result_fixed_error_kind(const WujiISHRunResult *result);
 const char *wuji_ish_result_error(const WujiISHRunResult *result);
 void wuji_ish_result_free(WujiISHRunResult *result);
 

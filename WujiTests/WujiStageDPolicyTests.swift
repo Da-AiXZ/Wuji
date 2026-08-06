@@ -137,6 +137,69 @@ final class WujiStageDPolicyTests: XCTestCase {
         XCTAssertFalse(facts(truncated: true).verifiedSuccessBarrier)
         XCTAssertFalse(facts(tree: .descendantsRemain, descendants: 1).verifiedSuccessBarrier)
         XCTAssertFalse(facts(cancelled: true).verifiedSuccessBarrier)
+        XCTAssertFalse(facts(observedAfterBarrier: false).verifiedSuccessBarrier)
+    }
+
+    func testCloneDiagnosticUsesFixedStageLabelsAndOmitsRawSensitiveValuesWithinEightKiB() throws {
+        let secret = "stage-d-raw-secret-sentinel"
+        let command = StageDTestSupport.cloneCommand(identity: String(repeating: "a", count: 64))
+        let result = StageDTestSupport.result(
+            command: command,
+            facts: facts(),
+            stdout: secret,
+            stderr: "unexpected remote https://credential@example.invalid/repository",
+            cloneStages: StageDCloneStage.allCases.map {
+                StageDCloneStageOutcome.notRun(stage: $0)
+            },
+            failureCategory: .cloneProcessNonzero
+        )
+        let summary = try result.safeDiagnosticSummaryData()
+        let text = try XCTUnwrap(String(data: summary, encoding: .utf8))
+
+        XCTAssertLessThanOrEqual(summary.count, 8 * 1_024)
+        XCTAssertFalse(text.contains(secret))
+        XCTAssertFalse(text.contains("credential"))
+        XCTAssertFalse(text.contains(command.parsed.original))
+        XCTAssertEqual(Set(StageDCloneStage.allCases.map(\.rawValue)), [
+            "clone_process", "checkout_exact_commit", "remote_verify", "head_verify",
+            "bounded_tree_verify",
+        ])
+        for stage in StageDCloneStage.allCases {
+            XCTAssertTrue(text.contains(stage.rawValue))
+        }
+    }
+
+    func testExecutorRevalidatesCompleteAuthorizedCommandAgainstCurrentPolicy() {
+        let policy = makePolicy()
+        guard case let .authorized(valid) = policy.decide(command: "git --version", cwd: ".") else {
+            return XCTFail("valid command not authorized")
+        }
+        XCTAssertTrue(ISHStageDCommandExecutor.revalidates(valid, using: policy))
+
+        let forged = StageDAuthorizedCommand(
+            parsed: valid.parsed,
+            risk: .installation,
+            executionRoot: .rootfs,
+            workspaceIdentitySHA256: valid.workspaceIdentitySHA256,
+            write: valid.write,
+            cloneTarget: valid.cloneTarget
+        )
+        XCTAssertFalse(ISHStageDCommandExecutor.revalidates(forged, using: policy))
+
+        let forgedArguments = StageDAuthorizedCommand(
+            parsed: .init(
+                original: valid.parsed.original,
+                executable: valid.parsed.executable,
+                arguments: ["clone"],
+                cwd: valid.parsed.cwd
+            ),
+            risk: valid.risk,
+            executionRoot: valid.executionRoot,
+            workspaceIdentitySHA256: valid.workspaceIdentitySHA256,
+            write: valid.write,
+            cloneTarget: valid.cloneTarget
+        )
+        XCTAssertFalse(ISHStageDCommandExecutor.revalidates(forgedArguments, using: policy))
     }
 
     func testUIProjectionCannotAuthorApprovalExecutionOrCompletionTruth() {
@@ -195,7 +258,8 @@ final class WujiStageDPolicyTests: XCTestCase {
         truncated: Bool = false,
         tree: StageDProcessTreeState = .quiescent,
         descendants: Int = 0,
-        cancelled: Bool = false
+        cancelled: Bool = false,
+        observedAfterBarrier: Bool = true
     ) -> StageDProcessFacts {
         .init(
             rootExitObserved: true, finalStateKind: "exited", finalStateValue: 0,
@@ -204,7 +268,9 @@ final class WujiStageDPolicyTests: XCTestCase {
             stdoutSHA256: ProviderDigest.sha256Hex(Data()),
             stderrSHA256: ProviderDigest.sha256Hex(Data()),
             truncated: truncated, cancellationRequested: cancelled,
-            processTreeState: tree, activeDescendantCount: descendants
+            cancelDelivery: cancelled ? .signalSent : .notRequested,
+            processTreeState: tree, activeDescendantCount: descendants,
+            processTreeObservedAfterTerminalBarrier: observedAfterBarrier
         )
     }
 
