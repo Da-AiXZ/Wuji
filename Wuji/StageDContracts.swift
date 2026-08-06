@@ -497,4 +497,19 @@ actor StageDWorkspaceGate {
         guard holders[identity] == token else { return }
         holders.removeValue(forKey: identity)
     }
+
+    func withLease<Value: Sendable>(
+        _ identity: String,
+        operation: @Sendable () async throws -> Value
+    ) async rethrows -> Value? {
+        guard let token = acquire(identity) else { return nil }
+        do {
+            let value = try await operation()
+            release(identity, token: token)
+            return value
+        } catch {
+            release(identity, token: token)
+            throw error
+        }
+    }
 }

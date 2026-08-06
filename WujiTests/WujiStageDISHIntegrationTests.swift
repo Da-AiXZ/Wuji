@@ -3,10 +3,28 @@ import XCTest
 @testable import Wuji
 
 final class WujiStageDISHIntegrationTests: XCTestCase {
-    func testRealARM64ISHStageDCommandMatrixInstallVersionsCloneWriteAndProcessTruth() async throws {
+    func testRealARM64ISHStageDSystemResolverCommandMatrixInstallVersionsCloneWriteAndProcessTruth() async throws {
         let prepared = try await StageDTestSupport.prepare()
         defer { prepared.cleanup() }
         let cloneRootURL = await prepared.store.cloneRootURL
+        let failedResolverExecutor = try ISHStageDCommandExecutor.bundled(
+            workspace: prepared.base.workspace,
+            cloneRootURL: cloneRootURL,
+            resolverConfigurator: { nil }
+        )
+        let readPolicy = StageDCommandPolicy(
+            workspaceIdentitySHA256: prepared.task.workspaceIdentitySHA256,
+            write: nil
+        )
+        guard case let .authorized(pwd) = readPolicy.decide(command: "pwd", cwd: ".") else {
+            return XCTFail("pwd policy setup failed")
+        }
+        let attemptsBeforeResolverFailure = wuji_ish_stage_d_command_attempt_count()
+        guard case .failed = await failedResolverExecutor.execute(pwd) else {
+            return XCTFail("resolver failure did not fail closed")
+        }
+        XCTAssertEqual(wuji_ish_stage_d_command_attempt_count(), attemptsBeforeResolverFailure)
+
         let executor = try ISHStageDCommandExecutor.bundled(
             workspace: prepared.base.workspace,
             cloneRootURL: cloneRootURL
@@ -34,6 +52,39 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
         }
         let installSnapshot = try await prepared.store.snapshot(taskID: installTask.id)
         let installResult = try XCTUnwrap(installSnapshot.attempts.last?.result)
+        let resolver = try XCTUnwrap(executor.systemResolverEvidence())
+        XCTAssertGreaterThan(resolver.nameserverCount, 0)
+        XCTAssertLessThanOrEqual(resolver.nameserverCount, 32)
+        XCTAssertLessThanOrEqual(resolver.searchDomainCount, 7)
+        XCTAssertGreaterThan(resolver.configurationBytes, 0)
+        XCTAssertLessThan(resolver.configurationBytes, 4_096)
+        XCTAssertGreaterThan(resolver.configurationCount, 0)
+
+        var repeatedNameservers: UInt32 = 0
+        var repeatedSearchDomains: UInt32 = 0
+        var repeatedBytes = 0
+        var repeatedCount: UInt32 = 0
+        var resolverError = [CChar](repeating: 0, count: 256)
+        XCTAssertEqual(
+            wuji_ish_configure_stage_d_system_resolver(
+                &repeatedNameservers,
+                &repeatedSearchDomains,
+                &repeatedBytes,
+                &repeatedCount,
+                &resolverError,
+                resolverError.count
+            ),
+            0
+        )
+        XCTAssertEqual(repeatedNameservers, resolver.nameserverCount)
+        XCTAssertEqual(repeatedSearchDomains, resolver.searchDomainCount)
+        XCTAssertEqual(repeatedBytes, resolver.configurationBytes)
+        XCTAssertEqual(repeatedCount, resolver.configurationCount + 1)
+        print(
+            "STAGE_D_SYSTEM_RESOLVER=system,nameservers=\(resolver.nameserverCount)," +
+            "search=\(resolver.searchDomainCount),bytes=\(resolver.configurationBytes)," +
+            "configurations=\(repeatedCount)"
+        )
         XCTAssertEqual(Set(installResult.toolVersions.keys), Set(StageDEnvironmentLock.packages))
         XCTAssertTrue(installResult.facts.allSatisfy(\.verifiedSuccessBarrier))
         print("STAGE_D_ROOTFS_ARCHITECTURE=aarch64")

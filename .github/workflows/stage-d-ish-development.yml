@@ -176,7 +176,7 @@ jobs:
               "testCompletedColdRestoreCreatesZeroProviderCommandCloneInstallOrWriteAttempts",
               "testModelFinishClaimCannotCompleteWithoutCommandEvidence",
               "testCodeOwnedCompletionRejectsWrongCloneHeadAndIncompleteProcessFacts",
-              "testRealARM64ISHStageDCommandMatrixInstallVersionsCloneWriteAndProcessTruth",
+              "testRealARM64ISHStageDSystemResolverCommandMatrixInstallVersionsCloneWriteAndProcessTruth",
           ]
           missing = [name for name in required if name not in text]
           if missing:
@@ -339,9 +339,50 @@ jobs:
               if forbidden in text:
                   raise SystemExit("forbidden Stage D capability: " + forbidden)
           adapter = pathlib.Path("Executor/WujiISHAdapter.c").read_text()
-          for required in ["wuji_ish_run_stage_d_command", "WUJI_ISH_PROCESS_TREE_QUIESCENT", "g_stage_d_clone_root_mounted"]:
+          for required in [
+              "wuji_ish_run_stage_d_command", "WUJI_ISH_PROCESS_TREE_QUIESCENT",
+              "g_stage_d_clone_root_mounted", "wuji_ish_configure_stage_d_system_resolver",
+              "res_ninit", "res_getservers", "getnameinfo", "NI_NUMERICHOST",
+              'generic_open("/etc/resolv.conf"',
+          ]:
               if required not in adapter:
                   raise SystemExit("required Stage D executor boundary missing: " + required)
+          if re.search(r'"(?:[0-9]{1,3}\.){3}[0-9]{1,3}"', adapter):
+              raise SystemExit("hardcoded IPv4 resolver address found")
+          scoped = [pathlib.Path(path).read_text(errors="replace") for path in changed if pathlib.Path(path).is_file()]
+          if any("http" + "://" in value for value in scoped):
+              raise SystemExit("Stage D HTTP downgrade found")
+          agent = pathlib.Path("Wuji/StageDCommandAgent.swift").read_text()
+          contracts = pathlib.Path("Wuji/StageDContracts.swift").read_text()
+          if "Task { await StageDWorkspaceGate.shared.release" in agent or "withLease" not in contracts:
+              raise SystemExit("Stage D workspace gate release is not synchronous actor-owned")
+          tests = pathlib.Path("WujiTests/WujiStageDISHIntegrationTests.swift").read_text()
+          for required in [
+              "resolverConfigurator: { nil }", "wuji_ish_stage_d_command_attempt_count",
+              "repeatedCount", "STAGE_D_SYSTEM_RESOLVER=system",
+          ]:
+              if required not in tests:
+                  raise SystemExit("Stage D resolver test boundary missing: " + required)
+          project = pathlib.Path("Wuji.xcodeproj/project.pbxproj").read_text()
+          file_refs = re.findall(
+              r'/\* libresolv\.tbd \*/ = \{isa = PBXFileReference; '
+              r'lastKnownFileType = sourcecode\.text-based-dylib-definition; '
+              r'path = usr/lib/libresolv\.tbd; sourceTree = SDKROOT; \};', project
+          )
+          build_refs = re.findall(
+              r'/\* libresolv\.tbd in Frameworks \*/ = \{isa = PBXBuildFile; '
+              r'fileRef = [A-Fa-f0-9]+ /\* libresolv\.tbd \*/; \};', project
+          )
+          app_frameworks = re.search(
+              r'060000000000000000000001 /\* Frameworks \*/ = \{.*?files = \((.*?)\);',
+              project, re.S
+          )
+          if len(file_refs) != 1 or len(build_refs) != 1 or app_frameworks is None or \
+             app_frameworks.group(1).count("libresolv.tbd in Frameworks") != 1:
+              raise SystemExit("libresolv.tbd reference/link is not exact and unique")
+          print("STAGE_D_SYSTEM_RESOLVER_STATIC_AUDIT=PASS")
+          print("STAGE_D_SYNC_WORKSPACE_GATE_AUDIT=PASS")
+          print("STAGE_D_LIBRESOLV_LINK_AUDIT=PASS")
           print("STAGE_D_SCOPE_AUDIT=PASS")
           print("STAGE_D_FORBIDDEN_CAPABILITY_SCAN=PASS")
           PY
@@ -401,6 +442,10 @@ jobs:
           if os.environ["STAGE_D_MAIN_RESULT"] == "success":
               for marker in [
                   b"STAGE_D_ROOTFS_REPOSITORY_LOCK=PASS",
+                  b"STAGE_D_SYSTEM_RESOLVER=system",
+                  b"STAGE_D_SYSTEM_RESOLVER_STATIC_AUDIT=PASS",
+                  b"STAGE_D_SYNC_WORKSPACE_GATE_AUDIT=PASS",
+                  b"STAGE_D_LIBRESOLV_LINK_AUDIT=PASS",
                   b"STAGE_D_XCRESULT_AUDIT=PASS",
                   b"STAGE_D_REAL_ISH_DEEPSEEK_COMMAND=PASS",
                   b"STAGE_D_DURABLE_INTENT_AUDIT=PASS",

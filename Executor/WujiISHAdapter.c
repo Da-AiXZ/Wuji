@@ -1,8 +1,11 @@
 #include "WujiISHAdapter.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <pthread.h>
+#include <resolv.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,6 +71,8 @@ static struct task *g_init_task = NULL;
 static struct WujiISHRunResult *g_active_result = NULL;
 static int g_active_pid = -1;
 static uint64_t g_next_process_context = 1;
+static uint64_t g_stage_d_command_attempt_count = 0;
+static uint32_t g_stage_d_resolver_configuration_count = 0;
 
 static void set_error(char *buffer, size_t size, const char *message) {
     if (buffer == NULL || size == 0)
@@ -149,6 +154,146 @@ int wuji_ish_prepare(const char *archive_path,
     g_booted = true;
     pthread_mutex_unlock(&g_boot_lock);
     return 0;
+}
+
+// Ported at the Wuji-owned adapter boundary from fixed ish-arm64-master AppDelegate.m.
+// Only counts and byte length leave this function; resolver addresses and domains do not.
+int wuji_ish_configure_stage_d_system_resolver(uint32_t *nameserver_count,
+                                                uint32_t *search_domain_count,
+                                                size_t *configuration_bytes,
+                                                uint32_t *configuration_count,
+                                                char *error_buffer,
+                                                size_t error_buffer_size) {
+    if (nameserver_count == NULL || search_domain_count == NULL ||
+        configuration_bytes == NULL || configuration_count == NULL) {
+        set_error(error_buffer, error_buffer_size, "resolver evidence missing");
+        return -1;
+    }
+    *nameserver_count = 0;
+    *search_domain_count = 0;
+    *configuration_bytes = 0;
+    *configuration_count = 0;
+
+    pthread_mutex_lock(&g_boot_lock);
+    if (!g_booted || g_init_task == NULL) {
+        set_error(error_buffer, error_buffer_size, "executor is not prepared");
+        pthread_mutex_unlock(&g_boot_lock);
+        return -1;
+    }
+
+    struct __res_state resolver = {0};
+    if (res_ninit(&resolver) != 0) {
+        set_error(error_buffer, error_buffer_size, "system resolver initialization failed");
+        pthread_mutex_unlock(&g_boot_lock);
+        return -1;
+    }
+
+    char content[4096] = {0};
+    size_t offset = 0;
+    uint32_t searches = 0;
+    if (resolver.dnsrch[0] != NULL) {
+        int written = snprintf(content, sizeof(content), "search");
+        if (written < 0 || (size_t)written >= sizeof(content))
+            goto resolver_failed;
+        offset = (size_t)written;
+        for (int index = 0; index <= MAXDNSRCH && resolver.dnsrch[index] != NULL; index++) {
+            const char *domain = resolver.dnsrch[index];
+            size_t length = strlen(domain);
+            if (length == 0 || length > 253)
+                goto resolver_failed;
+            for (size_t byte = 0; byte < length; byte++) {
+                unsigned char value = (unsigned char)domain[byte];
+                if (!((value >= 'a' && value <= 'z') ||
+                      (value >= 'A' && value <= 'Z') ||
+                      (value >= '0' && value <= '9') || value == '-' || value == '.'))
+                    goto resolver_failed;
+            }
+            written = snprintf(content + offset, sizeof(content) - offset, " %s", domain);
+            if (written < 0 || (size_t)written >= sizeof(content) - offset)
+                goto resolver_failed;
+            offset += (size_t)written;
+            searches++;
+        }
+        if (offset + 1 >= sizeof(content))
+            goto resolver_failed;
+        content[offset++] = '\n';
+        content[offset] = '\0';
+    }
+
+    union res_sockaddr_union servers[NI_MAXSERV] = {0};
+    int found = res_getservers(&resolver, servers, NI_MAXSERV);
+    if (found <= 0 || found > NI_MAXSERV)
+        goto resolver_failed;
+    uint32_t nameservers = 0;
+    for (int index = 0; index < found; index++) {
+        union res_sockaddr_union server = servers[index];
+        if (server.sin.sin_len == 0)
+            continue;
+        char address[NI_MAXHOST] = {0};
+        if (getnameinfo((struct sockaddr *)&server.sin, server.sin.sin_len,
+                        address, sizeof(address), NULL, 0, NI_NUMERICHOST) != 0)
+            goto resolver_failed;
+        int written = snprintf(content + offset, sizeof(content) - offset,
+                               "nameserver %s\n", address);
+        if (written < 0 || (size_t)written >= sizeof(content) - offset)
+            goto resolver_failed;
+        offset += (size_t)written;
+        nameservers++;
+    }
+    if (nameservers == 0)
+        goto resolver_failed;
+
+    pthread_mutex_lock(&g_run_lock);
+    current = g_init_task;
+    struct fd *fd = generic_open("/etc/resolv.conf", O_WRONLY_ | O_CREAT_ | O_TRUNC_, 0666);
+    if (IS_ERR(fd)) {
+        current = NULL;
+        set_error(error_buffer, error_buffer_size, "guest resolver open failed");
+        res_nclose(&resolver);
+        pthread_mutex_unlock(&g_run_lock);
+        pthread_mutex_unlock(&g_boot_lock);
+        return -1;
+    }
+    size_t persisted = 0;
+    while (persisted < offset) {
+        ssize_t count = fd->ops->write(fd, content + persisted, offset - persisted);
+        if (count <= 0) {
+            fd_close(fd);
+            current = NULL;
+            set_error(error_buffer, error_buffer_size, "guest resolver write failed");
+            res_nclose(&resolver);
+            pthread_mutex_unlock(&g_run_lock);
+            pthread_mutex_unlock(&g_boot_lock);
+            return -1;
+        }
+        persisted += (size_t)count;
+    }
+    fd_close(fd);
+    current = NULL;
+    res_nclose(&resolver);
+    pthread_mutex_unlock(&g_run_lock);
+
+    if (g_stage_d_resolver_configuration_count != UINT32_MAX)
+        g_stage_d_resolver_configuration_count++;
+    *nameserver_count = nameservers;
+    *search_domain_count = searches;
+    *configuration_bytes = offset;
+    *configuration_count = g_stage_d_resolver_configuration_count;
+    pthread_mutex_unlock(&g_boot_lock);
+    return 0;
+
+resolver_failed:
+    set_error(error_buffer, error_buffer_size, "system resolver state is invalid or exceeds bounds");
+    res_nclose(&resolver);
+    pthread_mutex_unlock(&g_boot_lock);
+    return -1;
+}
+
+uint64_t wuji_ish_stage_d_command_attempt_count(void) {
+    pthread_mutex_lock(&g_state_lock);
+    uint64_t count = g_stage_d_command_attempt_count;
+    pthread_mutex_unlock(&g_state_lock);
+    return count;
 }
 
 int wuji_ish_mount_read_only_workspace(const char *host_path,
@@ -1047,6 +1192,10 @@ WujiISHRunResult *wuji_ish_run_stage_d_command(const char *executable,
     }
     if (input_offset != argument_blob_length)
         return NULL;
+    pthread_mutex_lock(&g_state_lock);
+    if (g_stage_d_command_attempt_count != UINT64_MAX)
+        g_stage_d_command_attempt_count++;
+    pthread_mutex_unlock(&g_state_lock);
     return run_arguments_in_directory(
         path, argument_count + 1, arguments, output_limit, cwd, true
     );

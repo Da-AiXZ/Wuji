@@ -49,6 +49,15 @@ int wuji_ish_prepare(const char *archive_path,
                      char *error_buffer,
                      size_t error_buffer_size);
 
+int wuji_ish_configure_stage_d_system_resolver(uint32_t *nameserver_count,
+                                                uint32_t *search_domain_count,
+                                                size_t *configuration_bytes,
+                                                uint32_t *configuration_count,
+                                                char *error_buffer,
+                                                size_t error_buffer_size);
+
+uint64_t wuji_ish_stage_d_command_attempt_count(void);
+
 int wuji_ish_mount_read_only_workspace(const char *host_path,
                                        char *error_buffer,
                                        size_t error_buffer_size);

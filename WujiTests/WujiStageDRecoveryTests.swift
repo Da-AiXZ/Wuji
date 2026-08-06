@@ -45,27 +45,50 @@ final class WujiStageDRecoveryTests: XCTestCase {
     func testDurableIntentPrecedesISHIOAndSameWorkspaceGateSerializes() async throws {
         let prepared = try await StageDTestSupport.prepare()
         defer { prepared.cleanup() }
-        let executor = StageDMockExecutor(store: prepared.store, taskID: prepared.task.id, mode: .success)
-        guard case .completed = await prepared.agent(
-            executor: executor,
+        let blocker = StageDBlockingExecutor(store: prepared.store, taskID: prepared.task.id)
+        let firstRun = Task {
+            await prepared.agent(
+                executor: blocker,
+                approval: StageDImmediateApproval(.approve)
+            ).run(command: prepared.writeCommand, cwd: ".")
+        }
+        await blocker.waitUntilEntered()
+        let blockerCalls = await blocker.callCount()
+        let intentWasVisible = await blocker.intentWasVisible()
+        XCTAssertEqual(blockerCalls, 1)
+        XCTAssertTrue(intentWasVisible)
+
+        let secondTask = try await prepared.store.create(
+            session: prepared.base.session,
+            workspace: prepared.base.workspace,
+            ruleSet: prepared.base.ruleSet,
+            write: prepared.write,
+            expectation: prepared.task.expectation
+        )
+        let secondExecutor = StageDMockExecutor(
+            store: prepared.store,
+            taskID: secondTask.id,
+            mode: .success
+        )
+        let secondAgent = prepared.agent(
+            task: secondTask,
+            executor: secondExecutor,
             approval: StageDImmediateApproval(.approve)
-        ).run(command: prepared.writeCommand, cwd: ".") else {
-            return XCTFail("command did not complete")
+        )
+        let busyOutcome = await secondAgent.run(command: prepared.writeCommand, cwd: ".")
+        let callsWhileHeld = await secondExecutor.callCount()
+        XCTAssertEqual(busyOutcome, .failed(.workspaceBusy))
+        XCTAssertEqual(callsWhileHeld, 0)
+
+        await blocker.allowCompletion()
+        guard case .completed = await firstRun.value else {
+            return XCTFail("first operation did not complete")
         }
-        let intentVisible = await executor.intentWasVisible()
-        XCTAssertTrue(intentVisible)
-        let first = await StageDWorkspaceGate.shared.acquire(prepared.task.workspaceIdentitySHA256)
-        XCTAssertNotNil(first)
-        let second = await StageDWorkspaceGate.shared.acquire(prepared.task.workspaceIdentitySHA256)
-        XCTAssertNil(second)
-        if let first {
-            await StageDWorkspaceGate.shared.release(prepared.task.workspaceIdentitySHA256, token: first)
+        guard case .completed = await secondAgent.run(command: prepared.writeCommand, cwd: ".") else {
+            return XCTFail("gate was not synchronously released before first return")
         }
-        let next = await StageDWorkspaceGate.shared.acquire(prepared.task.workspaceIdentitySHA256)
-        XCTAssertNotNil(next)
-        if let next {
-            await StageDWorkspaceGate.shared.release(prepared.task.workspaceIdentitySHA256, token: next)
-        }
+        let callsAfterRelease = await secondExecutor.callCount()
+        XCTAssertEqual(callsAfterRelease, 1)
     }
 
     func testUnknownCommandColdRestoreNeverResendsWriteNetworkInstallOrProvider() async throws {
@@ -427,6 +450,46 @@ actor StageDMockExecutor: StageDCommandExecuting {
                 )
             ))
         }
+    }
+
+    func callCount() -> Int { calls }
+    func intentWasVisible() -> Bool { sawIntent }
+}
+
+actor StageDBlockingExecutor: StageDCommandExecuting {
+    private let store: StageDTaskStore
+    private let taskID: UUID
+    private var calls = 0
+    private var sawIntent = false
+    private var enteredContinuation: CheckedContinuation<Void, Never>?
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    init(store: StageDTaskStore, taskID: UUID) {
+        self.store = store
+        self.taskID = taskID
+    }
+
+    func execute(_ command: StageDAuthorizedCommand) async -> StageDExecutorOutcome {
+        calls += 1
+        if let snapshot = try? await store.snapshot(taskID: taskID) {
+            sawIntent = snapshot.attempts.contains {
+                $0.kind == .command && $0.phase == .intentRecorded && $0.command == command
+            }
+        }
+        enteredContinuation?.resume()
+        enteredContinuation = nil
+        await withCheckedContinuation { continuation = $0 }
+        return .succeeded(StageDTestSupport.result(command: command))
+    }
+
+    func allowCompletion() {
+        continuation?.resume()
+        continuation = nil
+    }
+
+    func waitUntilEntered() async {
+        if calls > 0 { return }
+        await withCheckedContinuation { enteredContinuation = $0 }
     }
 
     func callCount() -> Int { calls }

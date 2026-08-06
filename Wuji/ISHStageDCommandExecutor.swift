@@ -24,30 +24,65 @@ private struct StageDRawStep: Sendable {
     let stderr: String
 }
 
+struct StageDSystemResolverEvidence: Equatable, Sendable {
+    let nameserverCount: UInt32
+    let searchDomainCount: UInt32
+    let configurationBytes: Int
+    let configurationCount: UInt32
+}
+
 final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendable {
     private let rootFSURL: URL
     private let workspace: StageBReadyWorkspace
     private let cloneRootURL: URL
     private let limits: StageDLimits
+    private let resolverConfigurator: @Sendable () -> StageDSystemResolverEvidence?
     private let preparationLock = NSLock()
     private var prepared = false
+    private var resolverEvidence: StageDSystemResolverEvidence?
+
+    private static let productionResolverConfigurator: @Sendable () -> StageDSystemResolverEvidence? = {
+        var nameserverCount: UInt32 = 0
+        var searchDomainCount: UInt32 = 0
+        var configurationBytes = 0
+        var configurationCount: UInt32 = 0
+        var error = [CChar](repeating: 0, count: 256)
+        let status = wuji_ish_configure_stage_d_system_resolver(
+            &nameserverCount,
+            &searchDomainCount,
+            &configurationBytes,
+            &configurationCount,
+            &error,
+            error.count
+        )
+        guard status == 0 else { return nil }
+        return StageDSystemResolverEvidence(
+            nameserverCount: nameserverCount,
+            searchDomainCount: searchDomainCount,
+            configurationBytes: configurationBytes,
+            configurationCount: configurationCount
+        )
+    }
 
     init(
         rootFSURL: URL,
         workspace: StageBReadyWorkspace,
         cloneRootURL: URL,
-        limits: StageDLimits = .production
+        limits: StageDLimits = .production,
+        resolverConfigurator: (@Sendable () -> StageDSystemResolverEvidence?)? = nil
     ) {
         self.rootFSURL = rootFSURL
         self.workspace = workspace
         self.cloneRootURL = cloneRootURL
         self.limits = limits
+        self.resolverConfigurator = resolverConfigurator ?? Self.productionResolverConfigurator
     }
 
     static func bundled(
         workspace: StageBReadyWorkspace,
         cloneRootURL: URL,
-        limits: StageDLimits = .production
+        limits: StageDLimits = .production,
+        resolverConfigurator: (@Sendable () -> StageDSystemResolverEvidence?)? = nil
     ) throws -> ISHStageDCommandExecutor {
         guard let rootFSURL = Bundle.main.url(forResource: "rootfs", withExtension: "tar.gz") else {
             throw StageDCommandError.executorFailure
@@ -56,8 +91,15 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
             rootFSURL: rootFSURL,
             workspace: workspace,
             cloneRootURL: cloneRootURL,
-            limits: limits
+            limits: limits,
+            resolverConfigurator: resolverConfigurator
         )
+    }
+
+    func systemResolverEvidence() -> StageDSystemResolverEvidence? {
+        preparationLock.lock()
+        defer { preparationLock.unlock() }
+        return resolverEvidence
     }
 
     func execute(_ command: StageDAuthorizedCommand) async -> StageDExecutorOutcome {
@@ -110,6 +152,16 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
             rootURL.path.withCString { root in wuji_ish_prepare(archive, root, &error, error.count) }
         }
         guard prepareStatus == 0 else { throw StageDCommandError.executorFailure }
+        guard let resolverEvidence = resolverConfigurator(),
+              resolverEvidence.nameserverCount > 0,
+              resolverEvidence.nameserverCount <= 32,
+              resolverEvidence.searchDomainCount <= 7,
+              resolverEvidence.configurationBytes > 0,
+              resolverEvidence.configurationBytes < 4096,
+              resolverEvidence.configurationCount > 0 else {
+            throw StageDCommandError.executorFailure
+        }
+        self.resolverEvidence = resolverEvidence
         error = [CChar](repeating: 0, count: 512)
         let workspaceStatus = workspace.canonicalRootURL.path.withCString {
             wuji_ish_mount_stage_d_workspace($0, &error, error.count)

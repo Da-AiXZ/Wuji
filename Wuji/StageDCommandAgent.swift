@@ -323,87 +323,112 @@ final class StageDCommandAgent: @unchecked Sendable {
                 }
             }
 
-            guard let gateToken = await StageDWorkspaceGate.shared.acquire(record.workspaceIdentitySHA256) else {
+            let workspaceIdentitySHA256 = record.workspaceIdentitySHA256
+            let executionRecord = record
+            guard let gatedOutcome = try await StageDWorkspaceGate.shared.withLease(
+                workspaceIdentitySHA256,
+                operation: { [self] in
+                    try await executeAuthorized(
+                        record: executionRecord,
+                        authorized: authorized,
+                        operationID: operationID,
+                        attemptID: attemptID,
+                        approvalBinding: approvalBinding,
+                        approvalRequest: approvalRequest,
+                        approvalGrant: approvalGrant
+                    )
+                }
+            ) else {
                 return .failed(.workspaceBusy)
             }
-            defer {
-                Task { await StageDWorkspaceGate.shared.release(record.workspaceIdentitySHA256, token: gateToken) }
-            }
-            let intent = StageDAttemptEvidence(
-                taskID: taskID,
-                operationID: operationID,
-                attemptID: attemptID,
-                kind: .command,
-                phase: .intentRecorded,
-                inputSHA256: authorized.bindingSHA256,
-                recordedAt: now(),
-                command: authorized,
-                approvalBindingSHA256: approvalBinding,
-                providerDecision: nil,
-                result: nil,
-                resultSHA256: nil
-            )
-            if let request = approvalRequest, let grant = approvalGrant {
-                record = try await store.consumeApprovalAndRecordIntent(
-                    taskID: taskID,
-                    request: request,
-                    grant: grant,
-                    intent: intent,
-                    now: now()
-                )
-            } else {
-                record = try await store.appendAttempt(taskID: taskID, evidence: intent, phase: .executing)
-            }
-            let outcome = await executor.execute(authorized)
-            switch outcome {
-            case let .succeeded(result):
-                guard let resultSHA = StageDTaskStore.digest(result) else {
-                    throw StageDCommandError.evidenceFailure
-                }
-                let terminal = terminalAttempt(
-                    intent: intent, phase: .succeeded, result: result, resultSHA256: resultSHA
-                )
-                record = try await store.appendAttempt(taskID: taskID, evidence: terminal, phase: .verifying)
-                guard let completion = StageDCompletionVerifier.verify(
-                    record: record,
-                    result: result,
-                    command: authorized,
-                    operationID: operationID,
-                    attemptID: attemptID,
-                    approvalBindingSHA256: approvalBinding,
-                    requireProvider: requireProvider,
-                    now: now()
-                ) else {
-                    _ = try await store.setPhase(taskID: taskID, phase: .failed)
-                    return .failed(.completionRejected)
-                }
-                let completed = try await store.complete(taskID: taskID, completion: completion)
-                guard let durableCompletion = completed.completion else {
-                    throw StageDCommandError.evidenceFailure
-                }
-                return .completed(durableCompletion)
-            case let .failed(result):
-                let resultSHA = result.flatMap { StageDTaskStore.digest($0) }
-                let terminal = terminalAttempt(
-                    intent: intent, phase: .failed, result: result, resultSHA256: resultSHA
-                )
-                _ = try await store.appendAttempt(taskID: taskID, evidence: terminal, phase: .failed)
-                return .failed(.executorFailure)
-            case let .unknown(result):
-                let resultSHA = result.flatMap { StageDTaskStore.digest($0) }
-                let terminal = terminalAttempt(
-                    intent: intent,
-                    phase: .reconciliationRequired,
-                    result: result,
-                    resultSHA256: resultSHA
-                )
-                _ = try await store.appendAttempt(
-                    taskID: taskID, evidence: terminal, phase: .reconciliationRequired
-                )
-                return .reconciliationRequired
-            }
+            return gatedOutcome
         } catch {
             return .failed(.evidenceFailure)
+        }
+    }
+
+    private func executeAuthorized(
+        record initialRecord: StageDTaskRecord,
+        authorized: StageDAuthorizedCommand,
+        operationID: UUID,
+        attemptID: UUID,
+        approvalBinding: String?,
+        approvalRequest: StageDApprovalRequest?,
+        approvalGrant: StageDApprovalGrant?
+    ) async throws -> StageDLoopOutcome {
+        var record = initialRecord
+        let intent = StageDAttemptEvidence(
+            taskID: taskID,
+            operationID: operationID,
+            attemptID: attemptID,
+            kind: .command,
+            phase: .intentRecorded,
+            inputSHA256: authorized.bindingSHA256,
+            recordedAt: now(),
+            command: authorized,
+            approvalBindingSHA256: approvalBinding,
+            providerDecision: nil,
+            result: nil,
+            resultSHA256: nil
+        )
+        if let request = approvalRequest, let grant = approvalGrant {
+            record = try await store.consumeApprovalAndRecordIntent(
+                taskID: taskID,
+                request: request,
+                grant: grant,
+                intent: intent,
+                now: now()
+            )
+        } else {
+            record = try await store.appendAttempt(taskID: taskID, evidence: intent, phase: .executing)
+        }
+        let outcome = await executor.execute(authorized)
+        switch outcome {
+        case let .succeeded(result):
+            guard let resultSHA = StageDTaskStore.digest(result) else {
+                throw StageDCommandError.evidenceFailure
+            }
+            let terminal = terminalAttempt(
+                intent: intent, phase: .succeeded, result: result, resultSHA256: resultSHA
+            )
+            record = try await store.appendAttempt(taskID: taskID, evidence: terminal, phase: .verifying)
+            guard let completion = StageDCompletionVerifier.verify(
+                record: record,
+                result: result,
+                command: authorized,
+                operationID: operationID,
+                attemptID: attemptID,
+                approvalBindingSHA256: approvalBinding,
+                requireProvider: requireProvider,
+                now: now()
+            ) else {
+                _ = try await store.setPhase(taskID: taskID, phase: .failed)
+                return .failed(.completionRejected)
+            }
+            let completed = try await store.complete(taskID: taskID, completion: completion)
+            guard let durableCompletion = completed.completion else {
+                throw StageDCommandError.evidenceFailure
+            }
+            return .completed(durableCompletion)
+        case let .failed(result):
+            let resultSHA = result.flatMap { StageDTaskStore.digest($0) }
+            let terminal = terminalAttempt(
+                intent: intent, phase: .failed, result: result, resultSHA256: resultSHA
+            )
+            _ = try await store.appendAttempt(taskID: taskID, evidence: terminal, phase: .failed)
+            return .failed(.executorFailure)
+        case let .unknown(result):
+            let resultSHA = result.flatMap { StageDTaskStore.digest($0) }
+            let terminal = terminalAttempt(
+                intent: intent,
+                phase: .reconciliationRequired,
+                result: result,
+                resultSHA256: resultSHA
+            )
+            _ = try await store.appendAttempt(
+                taskID: taskID, evidence: terminal, phase: .reconciliationRequired
+            )
+            return .reconciliationRequired
         }
     }
 

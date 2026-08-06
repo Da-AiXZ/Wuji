@@ -98,6 +98,7 @@
 		010000000000000000000059 /* WujiStageDPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000005E /* WujiStageDPolicyTests.swift */; };
 		01000000000000000000005A /* WujiStageDRecoveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000000000000000000005F /* WujiStageDRecoveryTests.swift */; };
 		01000000000000000000005B /* WujiStageDISHIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000060 /* WujiStageDISHIntegrationTests.swift */; };
+		01000000000000000000005C /* libresolv.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 020000000000000000000061 /* libresolv.tbd */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -207,6 +208,7 @@
 		02000000000000000000005E /* WujiStageDPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiStageDPolicyTests.swift; sourceTree = "<group>"; };
 		02000000000000000000005F /* WujiStageDRecoveryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiStageDRecoveryTests.swift; sourceTree = "<group>"; };
 		020000000000000000000060 /* WujiStageDISHIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WujiStageDISHIntegrationTests.swift; sourceTree = "<group>"; };
+		020000000000000000000061 /* libresolv.tbd */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.text-based-dylib-definition; path = usr/lib/libresolv.tbd; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -214,6 +216,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				01000000000000000000005C /* libresolv.tbd in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -230,6 +233,7 @@
 		030000000000000000000001 = {
 			isa = PBXGroup;
 			children = (
+				020000000000000000000061 /* libresolv.tbd */,
 				030000000000000000000003 /* Wuji */,
 				030000000000000000000004 /* WujiTests */,
 				030000000000000000000005 /* StageA ZIP */,
