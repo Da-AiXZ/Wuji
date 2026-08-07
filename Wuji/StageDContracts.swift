@@ -632,8 +632,42 @@ struct StageDCommandResult: Codable, Equatable, Sendable {
     let cloneByteCount: UInt64?
     let toolVersions: [String: String]
     let cloneStages: [StageDCloneStageOutcome]
-    let cloneFilesystemEvidence: StageDCloneFilesystemEvidence? = nil
+    let cloneFilesystemEvidence: StageDCloneFilesystemEvidence?
     let failureCategory: StageDRuntimeFailureCategory?
+
+    init(
+        commandBindingSHA256: String,
+        facts: [StageDProcessFacts],
+        stdout: String,
+        stderr: String,
+        outputProjectionTruncated: Bool,
+        verification: String,
+        verificationSHA256: String,
+        cloneRemote: String?,
+        cloneHEAD: String?,
+        cloneEntryCount: Int?,
+        cloneByteCount: UInt64?,
+        toolVersions: [String: String],
+        cloneStages: [StageDCloneStageOutcome],
+        cloneFilesystemEvidence: StageDCloneFilesystemEvidence? = nil,
+        failureCategory: StageDRuntimeFailureCategory?
+    ) {
+        self.commandBindingSHA256 = commandBindingSHA256
+        self.facts = facts
+        self.stdout = stdout
+        self.stderr = stderr
+        self.outputProjectionTruncated = outputProjectionTruncated
+        self.verification = verification
+        self.verificationSHA256 = verificationSHA256
+        self.cloneRemote = cloneRemote
+        self.cloneHEAD = cloneHEAD
+        self.cloneEntryCount = cloneEntryCount
+        self.cloneByteCount = cloneByteCount
+        self.toolVersions = toolVersions
+        self.cloneStages = cloneStages
+        self.cloneFilesystemEvidence = cloneFilesystemEvidence
+        self.failureCategory = failureCategory
+    }
 
     var verified: Bool {
         !facts.isEmpty

@@ -53,6 +53,24 @@ enum StageDCloneTreeResult: Equatable, Sendable {
     case escape
 }
 
+private func stageDUnknownProbe(
+    _ step: StageDCloneCapabilityStep,
+    subcategory: StageDCloneFilesystemSubcategory
+) -> StageDCloneCapabilityProbeFacts {
+    let stop = StageDCloneCapabilityStep.allCases.firstIndex(of: step) ?? 0
+    return .init(
+        steps: StageDCloneCapabilityStep.allCases.enumerated().map { index, value in
+            .init(
+                step: value,
+                state: index < stop ? .succeeded : (index == stop ? .unknown : .notRun),
+                subcategory: index == stop ? subcategory : nil
+            )
+        },
+        cleanupKnown: false,
+        cleanupVerified: false
+    )
+}
+
 struct StageDClonePipelineResult: Sendable {
     let stages: [StageDCloneStageOutcome]
     let steps: [StageDRawStep]
@@ -144,7 +162,7 @@ enum StageDClonePipeline {
         }
         guard probeFacts.succeeded else {
             guard probeFacts.failureSubcategory != nil else {
-                probeFacts = Self.unknownProbe(.create, subcategory: .generic)
+                probeFacts = stageDUnknownProbe(.create, subcategory: .generic)
                 return completed(failure: .cloneTimeoutUnknown, unknown: true)
             }
             return completed(failure: .cloneProcessNonzero)
@@ -887,13 +905,13 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
         await StageDGlobalExecutionGate.shared.acquire(leaseID)
         if Task.isCancelled {
             await StageDGlobalExecutionGate.shared.release(leaseID)
-            return Self.unknownProbe(.create, subcategory: .createMkdirOpen)
+            return stageDUnknownProbe(.create, subcategory: .createMkdirOpen)
         }
         var raw = WujiISHStageDCloneCapabilityProbe()
         let status = wuji_ish_stage_d_clone_capability_probe(&raw)
         await StageDGlobalExecutionGate.shared.release(leaseID)
         guard status == 0 else {
-            return Self.unknownProbe(.create, subcategory: .generic)
+            return stageDUnknownProbe(.create, subcategory: .generic)
         }
         let subcategory = Self.filesystemSubcategory(raw.failure_category)
         return .init(
@@ -906,24 +924,6 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
             ],
             cleanupKnown: raw.cleanup_known,
             cleanupVerified: raw.cleanup_verified
-        )
-    }
-
-    private static func unknownProbe(
-        _ step: StageDCloneCapabilityStep,
-        subcategory: StageDCloneFilesystemSubcategory
-    ) -> StageDCloneCapabilityProbeFacts {
-        let stop = StageDCloneCapabilityStep.allCases.firstIndex(of: step) ?? 0
-        return .init(
-            steps: StageDCloneCapabilityStep.allCases.enumerated().map { index, value in
-                .init(
-                    step: value,
-                    state: index < stop ? .succeeded : (index == stop ? .unknown : .notRun),
-                    subcategory: index == stop ? subcategory : nil
-                )
-            },
-            cleanupKnown: false,
-            cleanupVerified: false
         )
     }
 
