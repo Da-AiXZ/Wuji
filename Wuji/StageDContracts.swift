@@ -497,7 +497,21 @@ struct StageDCloneFilesystemEvidence: Codable, Equatable, Sendable {
     let preflight: StageDCloneFilesystemPreflightFacts
     let probe: StageDCloneCapabilityProbeFacts
     let residual: StageDCloneResidualFacts
-    let blockingSubcategory: StageDCloneFilesystemSubcategory? = nil
+    let blockingSubcategory: StageDCloneFilesystemSubcategory?
+
+    init(
+        evidenceVersion: Int,
+        preflight: StageDCloneFilesystemPreflightFacts,
+        probe: StageDCloneCapabilityProbeFacts,
+        residual: StageDCloneResidualFacts,
+        blockingSubcategory: StageDCloneFilesystemSubcategory? = nil
+    ) {
+        self.evidenceVersion = evidenceVersion
+        self.preflight = preflight
+        self.probe = probe
+        self.residual = residual
+        self.blockingSubcategory = blockingSubcategory
+    }
 
     var permitsSuccessfulClone: Bool {
         evidenceVersion == 1
