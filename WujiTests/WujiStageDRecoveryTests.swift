@@ -377,6 +377,119 @@ final class WujiStageDRecoveryTests: XCTestCase {
             requireProvider: false, now: Date()
         ))
     }
+
+    func testCloneProbeReconciliationColdRecoveryAndRepeatedInvocationPerformZeroIO() async throws {
+        let prepared = try await StageDTestSupport.prepare()
+        defer { prepared.cleanup() }
+        let task = try await prepared.store.create(
+            session: prepared.base.session,
+            workspace: prepared.base.workspace,
+            ruleSet: prepared.base.ruleSet,
+            write: nil,
+            expectation: .init(
+                kind: .exactClone,
+                relativePath: nil,
+                expectedSHA256: nil,
+                cloneTarget: StageDEnvironmentLock.cloneTarget,
+                cloneRemote: StageDEnvironmentLock.cloneURL,
+                cloneHEAD: StageDEnvironmentLock.acceptedStageCCommit
+            )
+        )
+        let policy = StageDCommandPolicy(
+            workspaceIdentitySHA256: task.workspaceIdentitySHA256,
+            write: nil
+        )
+        let command = StageDTestSupport.cloneCommand(identity: task.workspaceIdentitySHA256)
+        let unknown = StageDMockExecutor(
+            store: prepared.store,
+            taskID: task.id,
+            mode: .unknownCloneProbe
+        )
+        let first = await StageDCommandAgent(
+            provider: nil,
+            executor: unknown,
+            approvalAuthorizer: StageDImmediateApproval(.approve),
+            store: prepared.store,
+            task: task,
+            policy: policy,
+            requireProvider: false
+        ).run(command: command.parsed.original, cwd: ".")
+        XCTAssertEqual(first, .reconciliationRequired)
+        let firstCallCount = await unknown.callCount()
+        XCTAssertEqual(firstCallCount, 1)
+
+        let persisted = try await prepared.store.snapshot(taskID: task.id)
+        XCTAssertEqual(persisted.phase, .reconciliationRequired)
+        XCTAssertEqual(persisted.attempts.count, 2)
+        XCTAssertTrue(persisted.attempts.last?.result?.cloneFilesystemEvidence?
+            .probe.requiresReconciliation == true)
+        XCTAssertTrue(persisted.attempts.last?.result?.cloneStages
+            .allSatisfy { $0.category == .notRun } == true)
+
+        for _ in 0..<2 {
+            let coldExecutor = StageDMockExecutor(
+                store: prepared.store,
+                taskID: task.id,
+                mode: .success
+            )
+            let coldTask = try await prepared.store.snapshot(taskID: task.id)
+            let cold = await StageDCommandAgent(
+                provider: nil,
+                executor: coldExecutor,
+                approvalAuthorizer: StageDImmediateApproval(.approve),
+                store: prepared.store,
+                task: coldTask,
+                policy: policy,
+                requireProvider: false
+            ).run(command: command.parsed.original, cwd: ".")
+            XCTAssertEqual(cold, .reconciliationRequired)
+            let coldCallCount = await coldExecutor.callCount()
+            XCTAssertEqual(coldCallCount, 0)
+        }
+    }
+
+    func testLegacyCloneResultWithoutFilesystemEvidenceCannotMasqueradeAsNewEvidence() async throws {
+        let prepared = try await StageDTestSupport.prepare()
+        defer { prepared.cleanup() }
+        let task = try await prepared.store.create(
+            session: prepared.base.session,
+            workspace: prepared.base.workspace,
+            ruleSet: prepared.base.ruleSet,
+            write: nil,
+            expectation: .init(
+                kind: .exactClone,
+                relativePath: nil,
+                expectedSHA256: nil,
+                cloneTarget: StageDEnvironmentLock.cloneTarget,
+                cloneRemote: StageDEnvironmentLock.cloneURL,
+                cloneHEAD: StageDEnvironmentLock.acceptedStageCCommit
+            )
+        )
+        let policy = StageDCommandPolicy(
+            workspaceIdentitySHA256: task.workspaceIdentitySHA256,
+            write: nil
+        )
+        let command = StageDTestSupport.cloneCommand(identity: task.workspaceIdentitySHA256)
+        let legacy = StageDMockExecutor(
+            store: prepared.store,
+            taskID: task.id,
+            mode: .legacyCloneFailure
+        )
+        let outcome = await StageDCommandAgent(
+            provider: nil,
+            executor: legacy,
+            approvalAuthorizer: StageDImmediateApproval(.approve),
+            store: prepared.store,
+            task: task,
+            policy: policy,
+            requireProvider: false
+        ).run(command: command.parsed.original, cwd: ".")
+
+        XCTAssertEqual(outcome, .failed(.durableTerminalFailure))
+        let snapshot = try await prepared.store.snapshot(taskID: task.id)
+        XCTAssertEqual(snapshot.attempts.count, 1)
+        XCTAssertEqual(snapshot.attempts.first?.phase, .intentRecorded)
+    }
 }
 
 final class StageDTestPrepared {
@@ -495,6 +608,7 @@ enum StageDTestSupport {
         cloneRemote: String? = nil,
         cloneHEAD: String? = nil,
         cloneStages: [StageDCloneStageOutcome] = [],
+        cloneFilesystemEvidence: StageDCloneFilesystemEvidence? = nil,
         failureCategory: StageDRuntimeFailureCategory? = nil
     ) -> StageDCommandResult {
         let verification = "stage-d-test-verification"
@@ -508,7 +622,70 @@ enum StageDTestSupport {
             cloneEntryCount: cloneRemote == nil ? nil : 1,
             cloneByteCount: cloneRemote == nil ? nil : 1,
             toolVersions: [:], cloneStages: cloneStages,
+            cloneFilesystemEvidence: cloneFilesystemEvidence,
             failureCategory: failureCategory
+        )
+    }
+
+    static func unknownCloneProbeResult(command: StageDAuthorizedCommand) -> StageDCommandResult {
+        let verification = "stage-d-clone-probe-reconciliation"
+        let binding = ProviderDigest.sha256Hex("fixed-clone-root")
+        return .init(
+            commandBindingSHA256: command.bindingSHA256,
+            facts: [],
+            stdout: "",
+            stderr: "",
+            outputProjectionTruncated: false,
+            verification: verification,
+            verificationSHA256: ProviderDigest.sha256Hex(verification),
+            cloneRemote: nil,
+            cloneHEAD: nil,
+            cloneEntryCount: nil,
+            cloneByteCount: nil,
+            toolVersions: [:],
+            cloneStages: StageDCloneStage.allCases.map { .notRun(stage: $0) },
+            cloneFilesystemEvidence: .init(
+                evidenceVersion: 1,
+                preflight: .init(
+                    evidenceVersion: 1,
+                    complete: true,
+                    hostRootBindingSHA256: binding,
+                    guestRootBindingSHA256: binding,
+                    bindingMatches: true,
+                    parentExists: true,
+                    parentType: .directory,
+                    parentIsEmpty: true,
+                    parentIsSymlink: false,
+                    targetExists: false,
+                    targetType: .missing,
+                    targetIsEmpty: true,
+                    targetIsSymlink: false,
+                    probeNamesAbsent: true,
+                    mountReadOnly: false,
+                    umask: 0o022,
+                    nameMax: 255,
+                    pathMax: 4_096,
+                    availableBytes: StageDLimits.production.maximumCloneBytes + 1,
+                    availableInodes: UInt64(StageDLimits.production.maximumCloneEntries + 1),
+                    requiredAvailableBytes: StageDLimits.production.maximumCloneBytes,
+                    requiredAvailableInodes: UInt64(StageDLimits.production.maximumCloneEntries),
+                    requiredNameBytes: 40,
+                    requiredPathBytes: 69
+                ),
+                probe: .init(
+                    steps: StageDCloneCapabilityStep.allCases.map {
+                        .init(
+                            step: $0,
+                            state: $0 == .create ? .unknown : .notRun,
+                            subcategory: $0 == .create ? .createMkdirOpen : nil
+                        )
+                    },
+                    cleanupKnown: false,
+                    cleanupVerified: false
+                ),
+                residual: .targetAbsent
+            ),
+            failureCategory: .cloneTimeoutUnknown
         )
     }
 
@@ -560,7 +737,10 @@ enum StageDTestSupport {
 }
 
 actor StageDMockExecutor: StageDCommandExecuting {
-    enum Mode { case success, failure, unknown, unknownCancelled }
+    enum Mode {
+        case success, failure, unknown, unknownCancelled
+        case unknownCloneProbe, legacyCloneFailure
+    }
     private let store: StageDTaskStore
     private let taskID: UUID
     private let mode: Mode
@@ -596,6 +776,14 @@ actor StageDMockExecutor: StageDCommandExecuting {
                 facts: StageDTestSupport.facts(
                     truncated: true, cancelled: true, tree: .descendantsRemain
                 )
+            ))
+        case .unknownCloneProbe:
+            return .unknown(StageDTestSupport.unknownCloneProbeResult(command: command))
+        case .legacyCloneFailure:
+            return .failed(StageDTestSupport.result(
+                command: command,
+                cloneStages: StageDCloneStage.allCases.map { .notRun(stage: $0) },
+                failureCategory: .cloneProcessNonzero
             ))
         }
     }

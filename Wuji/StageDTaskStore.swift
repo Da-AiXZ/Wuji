@@ -386,9 +386,20 @@ actor StageDTaskStore {
             }
             if evidence.phase == .reconciliationRequired, let result = evidence.result {
                 guard valid(result), evidence.resultSHA256 == digest(result) else { return false }
+                if let filesystem = result.cloneFilesystemEvidence,
+                   !filesystem.probe.requiresReconciliation,
+                   !result.cloneStages.contains(where: { $0.category == .timeoutUnknown }),
+                   !result.facts.contains(where: {
+                       !$0.rootExitObserved || $0.finalStateKind == "unknown" ||
+                           $0.cancellationRequested || $0.processTreeState != .quiescent
+                   }) {
+                    return false
+                }
             }
             if evidence.phase == .failed, let result = evidence.result {
-                guard valid(result), evidence.resultSHA256 == digest(result) else { return false }
+                guard valid(result),
+                      result.cloneFilesystemEvidence?.probe.requiresReconciliation != true,
+                      evidence.resultSHA256 == digest(result) else { return false }
             }
         }
         return true
@@ -465,22 +476,120 @@ actor StageDTaskStore {
                 && result.cloneHEAD == nil
                 && result.cloneEntryCount == nil
                 && result.cloneByteCount == nil
+                && result.cloneFilesystemEvidence == nil
         }
         guard result.cloneStages.map(\.stage) == StageDCloneStage.allCases,
+              let filesystem = result.cloneFilesystemEvidence,
+              valid(filesystem),
+              filesystem.blockingSubcategory == (
+                  filesystem.preflight.failureSubcategory
+                      ?? filesystem.probe.failureSubcategory
+                      ?? result.cloneStages.compactMap(\.filesystemSubcategory).first
+              ),
               result.cloneStages.allSatisfy({ outcome in
                   outcome.observedValueSHA256.map(validHash) ?? true
                       && (outcome.entryCount ?? 0) >= 0
                       && outcome.facts.stdoutByteCount >= 0
                       && outcome.facts.stderrByteCount >= 0
+                      && (outcome.category == .filesystemFailure
+                          ? outcome.filesystemSubcategory != nil
+                          : outcome.filesystemSubcategory == nil ||
+                              (outcome.category == .terminalBarrierFailure &&
+                               outcome.capturedProcessCategory == .filesystemFailure))
               }) else { return false }
+        let cloneIORan = result.cloneStages.contains {
+            $0.processStarted || ($0.category != .notRun && $0.stage != .boundedTreeVerify)
+        }
+        if filesystem.preflight.failureSubcategory != nil {
+            guard filesystem.probe == .notRun,
+                  result.cloneStages.allSatisfy({ $0.category == .notRun }) else { return false }
+        } else if !filesystem.probe.succeeded {
+            guard !cloneIORan,
+                  filesystem.probe.failureSubcategory != nil ||
+                    filesystem.probe.requiresReconciliation,
+                  result.cloneStages.allSatisfy({ $0.category == .notRun }) else { return false }
+        } else if cloneIORan {
+            guard filesystem.preflight.failureSubcategory == nil else { return false }
+        }
         if result.failureCategory == nil {
             return result.cloneStages.allSatisfy { $0.category == .succeeded }
+                && filesystem.permitsSuccessfulClone
                 && result.cloneRemote == StageDEnvironmentLock.cloneURL
                 && result.cloneHEAD == StageDEnvironmentLock.acceptedStageCCommit
                 && result.cloneEntryCount != nil
                 && result.cloneByteCount != nil
+                && result.cloneEntryCount == filesystem.residual.entryCount
+                && result.cloneByteCount == filesystem.residual.byteCount
         }
         return result.cloneStages.contains { $0.category != .succeeded }
+    }
+
+    private static func valid(_ evidence: StageDCloneFilesystemEvidence) -> Bool {
+        let preflight = evidence.preflight
+        let probe = evidence.probe
+        let residual = evidence.residual
+        let expectedBlockingSubcategory = preflight.failureSubcategory
+            ?? probe.failureSubcategory
+        guard evidence.evidenceVersion == 1,
+              preflight.evidenceVersion == evidence.evidenceVersion,
+              validHash(preflight.hostRootBindingSHA256),
+              validHash(preflight.guestRootBindingSHA256),
+              preflight.bindingMatches ==
+                (preflight.hostRootBindingSHA256 == preflight.guestRootBindingSHA256),
+              preflight.umask <= 0o777,
+              preflight.requiredNameBytes == 40,
+              preflight.requiredPathBytes == 69,
+              preflight.requiredAvailableBytes > 0,
+              preflight.requiredAvailableInodes > 0,
+              (!preflight.complete || (preflight.nameMax > 0 && preflight.pathMax > 0)),
+              (!preflight.complete || !preflight.parentIsEmpty || !preflight.targetExists),
+              (!preflight.complete || !preflight.targetExists || preflight.targetType != .missing),
+              (!preflight.complete || preflight.targetExists || preflight.targetType == .missing),
+              (!preflight.complete || !preflight.targetIsSymlink || preflight.targetType == .symbolicLink),
+              (!probe.cleanupVerified || probe.cleanupKnown),
+              probe.steps.map(\.step) == StageDCloneCapabilityStep.allCases,
+              probe.steps.allSatisfy({ step in
+                  guard step.succeeded == (step.state == .succeeded) else { return false }
+                  switch step.state {
+                  case .succeeded, .notRun: return step.subcategory == nil
+                  case .failed, .unknown: return step.subcategory != nil
+                  }
+              }),
+              validProbeSequence(probe.steps),
+              residual.entryCount >= 0,
+              (!residual.inspectionComplete || !residual.targetExists || residual.targetType != .missing),
+              (!residual.inspectionComplete || residual.targetExists || residual.targetType == .missing),
+              (!residual.inspectionComplete || !residual.targetIsSymlink || residual.targetType == .symbolicLink),
+              evidence.blockingSubcategory == expectedBlockingSubcategory ||
+                (expectedBlockingSubcategory == nil && evidence.blockingSubcategory != nil) else {
+            return false
+        }
+        if !residual.targetExists {
+            return residual.entryCount == 0
+                && residual.byteCount == 0
+                && !residual.gitDirectory
+                && !residual.gitHEAD
+                && !residual.gitConfig
+                && !residual.gitObjects
+                && !residual.gitRefs
+        }
+        return true
+    }
+
+    private static func validProbeSequence(_ steps: [StageDCloneCapabilityStepFacts]) -> Bool {
+        var stopped = false
+        for step in steps {
+            if stopped {
+                guard step.state == .notRun else { return false }
+                continue
+            }
+            switch step.state {
+            case .succeeded: continue
+            case .failed, .unknown: stopped = true
+            case .notRun: stopped = true
+            }
+        }
+        return true
     }
 
     private static func validExpectation(_ expectation: StageDCompletionExpectation) -> Bool {

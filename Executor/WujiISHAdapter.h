@@ -59,6 +59,65 @@ typedef enum {
     WUJI_ISH_FIXED_ERROR_INTERNAL = 10,
 } WujiISHFixedErrorKind;
 
+typedef enum {
+    WUJI_ISH_STAGE_D_NODE_MISSING = 0,
+    WUJI_ISH_STAGE_D_NODE_DIRECTORY = 1,
+    WUJI_ISH_STAGE_D_NODE_REGULAR_FILE = 2,
+    WUJI_ISH_STAGE_D_NODE_SYMBOLIC_LINK = 3,
+    WUJI_ISH_STAGE_D_NODE_OTHER = 4,
+    WUJI_ISH_STAGE_D_NODE_UNKNOWN = 5,
+} WujiISHStageDNodeType;
+
+typedef enum {
+    WUJI_ISH_STAGE_D_FILESYSTEM_NONE = 0,
+    WUJI_ISH_STAGE_D_FILESYSTEM_PERMISSION_READONLY = 1,
+    WUJI_ISH_STAGE_D_FILESYSTEM_NAME_PATH_LIMIT = 2,
+    WUJI_ISH_STAGE_D_FILESYSTEM_FILEMODE_CHMOD = 3,
+    WUJI_ISH_STAGE_D_FILESYSTEM_CREATE_MKDIR_OPEN = 4,
+    WUJI_ISH_STAGE_D_FILESYSTEM_DESTINATION_STATE = 5,
+    WUJI_ISH_STAGE_D_FILESYSTEM_CAPACITY_INODE = 6,
+    WUJI_ISH_STAGE_D_FILESYSTEM_BIND_IDENTITY = 7,
+    WUJI_ISH_STAGE_D_FILESYSTEM_GENERIC = 8,
+} WujiISHStageDFilesystemCategory;
+
+typedef enum {
+    WUJI_ISH_STAGE_D_PROBE_NOT_RUN = 0,
+    WUJI_ISH_STAGE_D_PROBE_SUCCEEDED = 1,
+    WUJI_ISH_STAGE_D_PROBE_FAILED = 2,
+    WUJI_ISH_STAGE_D_PROBE_UNKNOWN = 3,
+} WujiISHStageDProbeStepState;
+
+typedef struct {
+    bool complete;
+    bool binding_matches;
+    bool parent_exists;
+    WujiISHStageDNodeType parent_type;
+    bool parent_is_empty;
+    bool parent_is_symlink;
+    bool target_exists;
+    WujiISHStageDNodeType target_type;
+    bool target_is_empty;
+    bool target_is_symlink;
+    bool probe_names_absent;
+    bool mount_read_only;
+    uint32_t umask_value;
+    uint64_t name_max;
+    uint64_t path_max;
+    uint64_t available_bytes;
+    uint64_t available_inodes;
+} WujiISHStageDClonePreflight;
+
+typedef struct {
+    WujiISHStageDProbeStepState create_state;
+    WujiISHStageDProbeStepState fchmod_state;
+    WujiISHStageDProbeStepState fsync_state;
+    WujiISHStageDProbeStepState rename_state;
+    WujiISHStageDProbeStepState unlink_state;
+    WujiISHStageDFilesystemCategory failure_category;
+    bool cleanup_known;
+    bool cleanup_verified;
+} WujiISHStageDCloneCapabilityProbe;
+
 typedef struct WujiISHRunResult WujiISHRunResult;
 
 int wuji_ish_prepare(const char *archive_path,
@@ -96,8 +155,13 @@ int wuji_ish_mount_stage_d_workspace(const char *host_path,
                                      size_t error_buffer_size);
 
 int wuji_ish_mount_stage_d_clone_root(const char *host_path,
-                                      char *error_buffer,
-                                      size_t error_buffer_size);
+                                       char *error_buffer,
+                                       size_t error_buffer_size);
+
+int wuji_ish_stage_d_clone_preflight(const char *expected_host_root,
+                                     WujiISHStageDClonePreflight *preflight);
+
+int wuji_ish_stage_d_clone_capability_probe(WujiISHStageDCloneCapabilityProbe *probe);
 
 WujiISHRunResult *wuji_ish_run_self_test(WujiISHSelfTestCase test_case,
                                          size_t output_limit);

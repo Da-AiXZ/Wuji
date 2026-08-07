@@ -329,6 +329,193 @@ enum StageDCloneStageCategory: String, Codable, Equatable, Sendable {
     case terminalBarrierFailure = "terminal_barrier_failure"
 }
 
+enum StageDCloneFilesystemSubcategory: String, Codable, Equatable, Sendable {
+    case permissionReadonly = "permission_readonly"
+    case namePathLimit = "name_path_limit"
+    case filemodeChmod = "filemode_chmod"
+    case createMkdirOpen = "create_mkdir_open"
+    case destinationState = "destination_state"
+    case capacityInode = "capacity_inode"
+    case bindIdentity = "bind_identity"
+    case generic
+}
+
+enum StageDFilesystemNodeType: String, Codable, Equatable, Sendable {
+    case missing
+    case directory
+    case regularFile = "regular_file"
+    case symbolicLink = "symbolic_link"
+    case other
+    case unknown
+}
+
+struct StageDCloneFilesystemPreflightFacts: Codable, Equatable, Sendable {
+    let evidenceVersion: Int
+    let complete: Bool
+    let hostRootBindingSHA256: String
+    let guestRootBindingSHA256: String
+    let bindingMatches: Bool
+    let parentExists: Bool
+    let parentType: StageDFilesystemNodeType
+    let parentIsEmpty: Bool
+    let parentIsSymlink: Bool
+    let targetExists: Bool
+    let targetType: StageDFilesystemNodeType
+    let targetIsEmpty: Bool
+    let targetIsSymlink: Bool
+    let probeNamesAbsent: Bool
+    let mountReadOnly: Bool
+    let umask: UInt32
+    let nameMax: UInt64
+    let pathMax: UInt64
+    let availableBytes: UInt64
+    let availableInodes: UInt64
+    let requiredAvailableBytes: UInt64
+    let requiredAvailableInodes: UInt64
+    let requiredNameBytes: UInt64
+    let requiredPathBytes: UInt64
+
+    var failureSubcategory: StageDCloneFilesystemSubcategory? {
+        guard evidenceVersion == 1,
+              complete,
+              bindingMatches,
+              hostRootBindingSHA256 == guestRootBindingSHA256,
+              parentExists,
+              parentType == .directory,
+              !parentIsSymlink else { return .bindIdentity }
+        guard parentIsEmpty else { return .destinationState }
+        guard !targetExists,
+              targetType == .missing,
+              targetIsEmpty,
+              !targetIsSymlink,
+              probeNamesAbsent else { return .destinationState }
+        guard !mountReadOnly else { return .permissionReadonly }
+        guard nameMax >= requiredNameBytes,
+              pathMax >= requiredPathBytes else { return .namePathLimit }
+        guard availableBytes >= requiredAvailableBytes,
+              availableInodes >= requiredAvailableInodes else {
+            return .capacityInode
+        }
+        return nil
+    }
+}
+
+enum StageDCloneCapabilityStep: String, Codable, CaseIterable, Equatable, Sendable {
+    case create
+    case fchmod
+    case fsync
+    case rename
+    case unlink
+}
+
+enum StageDCloneCapabilityStepState: String, Codable, Equatable, Sendable {
+    case notRun = "not_run"
+    case succeeded
+    case failed
+    case unknown
+}
+
+struct StageDCloneCapabilityStepFacts: Codable, Equatable, Sendable {
+    let step: StageDCloneCapabilityStep
+    let state: StageDCloneCapabilityStepState
+    let succeeded: Bool
+    let subcategory: StageDCloneFilesystemSubcategory?
+
+    init(
+        step: StageDCloneCapabilityStep,
+        state: StageDCloneCapabilityStepState,
+        subcategory: StageDCloneFilesystemSubcategory?
+    ) {
+        self.step = step
+        self.state = state
+        succeeded = state == .succeeded
+        self.subcategory = subcategory
+    }
+}
+
+struct StageDCloneCapabilityProbeFacts: Codable, Equatable, Sendable {
+    let steps: [StageDCloneCapabilityStepFacts]
+    let cleanupKnown: Bool
+    let cleanupVerified: Bool
+
+    var succeeded: Bool {
+        steps.map(\.step) == StageDCloneCapabilityStep.allCases
+            && steps.allSatisfy { $0.state == .succeeded && $0.subcategory == nil }
+            && cleanupKnown
+            && cleanupVerified
+    }
+
+    var requiresReconciliation: Bool {
+        steps.contains { $0.state == .unknown } || !cleanupKnown || !cleanupVerified
+    }
+
+    var failureSubcategory: StageDCloneFilesystemSubcategory? {
+        steps.first { $0.state == .failed || $0.state == .unknown }?.subcategory
+    }
+
+    static let notRun = StageDCloneCapabilityProbeFacts(
+        steps: StageDCloneCapabilityStep.allCases.map {
+            .init(step: $0, state: .notRun, subcategory: nil)
+        },
+        cleanupKnown: true,
+        cleanupVerified: true
+    )
+}
+
+struct StageDCloneResidualFacts: Codable, Equatable, Sendable {
+    let inspectionComplete: Bool
+    let targetExists: Bool
+    let targetType: StageDFilesystemNodeType
+    let targetIsSymlink: Bool
+    let bounded: Bool
+    let entryCount: Int
+    let byteCount: UInt64
+    let gitDirectory: Bool
+    let gitHEAD: Bool
+    let gitConfig: Bool
+    let gitObjects: Bool
+    let gitRefs: Bool
+
+    static let targetAbsent = StageDCloneResidualFacts(
+        inspectionComplete: true,
+        targetExists: false,
+        targetType: .missing,
+        targetIsSymlink: false,
+        bounded: true,
+        entryCount: 0,
+        byteCount: 0,
+        gitDirectory: false,
+        gitHEAD: false,
+        gitConfig: false,
+        gitObjects: false,
+        gitRefs: false
+    )
+}
+
+struct StageDCloneFilesystemEvidence: Codable, Equatable, Sendable {
+    let evidenceVersion: Int
+    let preflight: StageDCloneFilesystemPreflightFacts
+    let probe: StageDCloneCapabilityProbeFacts
+    let residual: StageDCloneResidualFacts
+    let blockingSubcategory: StageDCloneFilesystemSubcategory? = nil
+
+    var permitsSuccessfulClone: Bool {
+        evidenceVersion == 1
+            && preflight.failureSubcategory == nil
+            && probe.succeeded
+            && residual.inspectionComplete
+            && residual.targetExists
+            && residual.targetType == .directory
+            && !residual.targetIsSymlink
+            && residual.bounded
+            && residual.gitDirectory
+            && residual.gitHEAD
+            && residual.gitConfig
+            && residual.gitObjects
+            && residual.gitRefs
+    }
+}
+
 enum StageDRuntimeFailureCategory: String, Codable, Equatable, Sendable {
     case authorizationRejected = "authorization_rejected"
     case intentStoreFailure = "intent_store_failure"
@@ -353,6 +540,7 @@ struct StageDCloneStageOutcome: Codable, Equatable, Sendable {
     let facts: StageDProcessFacts
     let adapterError: StageDAdapterErrorCategory
     let capturedProcessCategory: StageDCloneStageCategory?
+    let filesystemSubcategory: StageDCloneFilesystemSubcategory?
     let observedValueSHA256: String?
     let entryCount: Int?
     let byteCount: UInt64?
@@ -364,6 +552,7 @@ struct StageDCloneStageOutcome: Codable, Equatable, Sendable {
         facts: StageDProcessFacts,
         adapterError: StageDAdapterErrorCategory,
         capturedProcessCategory: StageDCloneStageCategory? = nil,
+        filesystemSubcategory: StageDCloneFilesystemSubcategory? = nil,
         observedValueSHA256: String?,
         entryCount: Int?,
         byteCount: UInt64?
@@ -374,6 +563,7 @@ struct StageDCloneStageOutcome: Codable, Equatable, Sendable {
         self.facts = facts
         self.adapterError = adapterError
         self.capturedProcessCategory = capturedProcessCategory
+        self.filesystemSubcategory = filesystemSubcategory
         self.observedValueSHA256 = observedValueSHA256
         self.entryCount = entryCount
         self.byteCount = byteCount
@@ -386,6 +576,7 @@ struct StageDCloneStageOutcome: Codable, Equatable, Sendable {
             processStarted: false,
             facts: .notRun,
             adapterError: .none,
+            filesystemSubcategory: nil,
             observedValueSHA256: nil,
             entryCount: nil,
             byteCount: nil
@@ -427,6 +618,7 @@ struct StageDCommandResult: Codable, Equatable, Sendable {
     let cloneByteCount: UInt64?
     let toolVersions: [String: String]
     let cloneStages: [StageDCloneStageOutcome]
+    let cloneFilesystemEvidence: StageDCloneFilesystemEvidence? = nil
     let failureCategory: StageDRuntimeFailureCategory?
 
     var verified: Bool {
@@ -435,6 +627,7 @@ struct StageDCommandResult: Codable, Equatable, Sendable {
             && !outputProjectionTruncated
             && ProviderDigest.sha256Hex(verification) == verificationSHA256
             && (cloneStages.isEmpty || cloneStages.allSatisfy { $0.category == .succeeded })
+            && (cloneStages.isEmpty || cloneFilesystemEvidence?.permitsSuccessfulClone == true)
             && failureCategory == nil
     }
 
@@ -507,6 +700,7 @@ struct StageDSafeCloneStageSummary: Codable, Equatable, Sendable {
     let facts: StageDSafeProcessSummary
     let adapterError: StageDAdapterErrorCategory
     let capturedProcessCategory: StageDCloneStageCategory?
+    let filesystemSubcategory: StageDCloneFilesystemSubcategory?
     let observedValueSHA256: String?
     let entryCount: Int?
     let byteCount: UInt64?
@@ -518,6 +712,7 @@ struct StageDSafeCloneStageSummary: Codable, Equatable, Sendable {
         facts = StageDSafeProcessSummary(outcome.facts)
         adapterError = outcome.adapterError
         capturedProcessCategory = outcome.capturedProcessCategory
+        filesystemSubcategory = outcome.filesystemSubcategory
         observedValueSHA256 = outcome.observedValueSHA256
         entryCount = outcome.entryCount
         byteCount = outcome.byteCount
@@ -541,15 +736,19 @@ struct StageDSafeDiagnosticSummary: Codable, Equatable, Sendable {
     let verificationSHA256: String?
     let processFacts: [StageDSafeProcessSummary]
     let cloneStages: [StageDSafeCloneStageSummary]
+    let cloneFilesystemEvidence: StageDCloneFilesystemEvidence?
 
     init(result: StageDCommandResult) {
-        loopCategory = result.verified ? .succeeded : .failed
+        loopCategory = result.cloneFilesystemEvidence?.probe.requiresReconciliation == true
+            ? .reconciliationRequired
+            : (result.verified ? .succeeded : .failed)
         commandError = nil
         failureCategory = result.failureCategory
         commandBindingSHA256 = result.commandBindingSHA256
         verificationSHA256 = result.verificationSHA256
         processFacts = result.facts.map(StageDSafeProcessSummary.init)
         cloneStages = result.cloneStages.map(StageDSafeCloneStageSummary.init)
+        cloneFilesystemEvidence = result.cloneFilesystemEvidence
     }
 
     private init(loopCategory: StageDSafeLoopCategory, commandError: StageDCommandError? = nil) {
@@ -560,6 +759,7 @@ struct StageDSafeDiagnosticSummary: Codable, Equatable, Sendable {
         verificationSHA256 = nil
         processFacts = []
         cloneStages = []
+        cloneFilesystemEvidence = nil
     }
 
     static func forLoopOutcome(_ outcome: StageDLoopOutcome) -> StageDSafeDiagnosticSummary {

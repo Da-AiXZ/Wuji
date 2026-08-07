@@ -215,6 +215,32 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
         XCTAssertEqual(cloneResult.cloneHEAD, StageDEnvironmentLock.acceptedStageCCommit)
         XCTAssertLessThanOrEqual(cloneResult.cloneEntryCount ?? Int.max, StageDLimits.production.maximumCloneEntries)
         XCTAssertLessThanOrEqual(cloneResult.cloneByteCount ?? UInt64.max, StageDLimits.production.maximumCloneBytes)
+        let filesystem = try XCTUnwrap(cloneResult.cloneFilesystemEvidence)
+        XCTAssertEqual(filesystem.evidenceVersion, 1)
+        XCTAssertNil(filesystem.preflight.failureSubcategory)
+        XCTAssertTrue(filesystem.preflight.bindingMatches)
+        XCTAssertEqual(
+            filesystem.preflight.hostRootBindingSHA256,
+            filesystem.preflight.guestRootBindingSHA256
+        )
+        XCTAssertFalse(filesystem.preflight.targetExists)
+        XCTAssertFalse(filesystem.preflight.mountReadOnly)
+        XCTAssertEqual(filesystem.preflight.umask, 0o022)
+        XCTAssertTrue(filesystem.probe.succeeded)
+        XCTAssertTrue(filesystem.probe.cleanupKnown)
+        XCTAssertTrue(filesystem.probe.cleanupVerified)
+        XCTAssertTrue(filesystem.residual.inspectionComplete)
+        XCTAssertTrue(filesystem.residual.targetExists)
+        XCTAssertEqual(filesystem.residual.targetType, .directory)
+        XCTAssertTrue(filesystem.residual.bounded)
+        XCTAssertTrue(filesystem.residual.gitDirectory)
+        XCTAssertTrue(filesystem.residual.gitHEAD)
+        XCTAssertTrue(filesystem.residual.gitConfig)
+        XCTAssertTrue(filesystem.residual.gitObjects)
+        XCTAssertTrue(filesystem.residual.gitRefs)
+        print("STAGE_D_CLONE_FILESYSTEM_PREFLIGHT=PASS")
+        print("STAGE_D_CLONE_CAPABILITY_PROBE=PASS")
+        print("STAGE_D_CLONE_RESIDUAL_AUDIT=PASS")
 
         let writeTask = prepared.task
         let writeAgent = StageDCommandAgent(
@@ -279,8 +305,11 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
             let outcome = await StageDClonePipeline.run(
                 command: command,
                 limits: .production,
+                preflight: clonePreflight(),
+                probe: { successfulCloneProbe() },
                 step: { await script.run($0) },
-                inspectTree: { await script.inspectTree() }
+                inspectTree: { await script.inspectTree() },
+                inspectResidual: { .targetAbsent }
             )
             XCTAssertEqual(outcome.failureCategory, failureCategory)
             XCTAssertEqual(outcome.stages.map(\.stage), StageDCloneStage.allCases)
@@ -311,8 +340,11 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
         let quiescentOutcome = await StageDClonePipeline.run(
             command: command,
             limits: .production,
+            preflight: clonePreflight(),
+            probe: { successfulCloneProbe() },
             step: { await quiescent.run($0) },
-            inspectTree: { await quiescent.inspectTree() }
+            inspectTree: { await quiescent.inspectTree() },
+            inspectResidual: { .targetAbsent }
         )
         let quiescentStage = try XCTUnwrap(quiescentOutcome.stages.first)
         XCTAssertEqual(quiescentStage.category, .processNonzero)
@@ -324,8 +356,11 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
         let descendantOutcome = await StageDClonePipeline.run(
             command: command,
             limits: .production,
+            preflight: clonePreflight(),
+            probe: { successfulCloneProbe() },
             step: { await descendant.run($0) },
-            inspectTree: { await descendant.inspectTree() }
+            inspectTree: { await descendant.inspectTree() },
+            inspectResidual: { .targetAbsent }
         )
         let descendantStage = try XCTUnwrap(descendantOutcome.stages.first)
         XCTAssertEqual(descendantStage.category, .terminalBarrierFailure)
@@ -364,6 +399,278 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
         XCTAssertTrue(secondIsActive)
         await gate.release(second)
     }
+
+    func testCloneFilesystemPreflightCounterexamplesShortCircuitBeforeProbeAndCloneIO() async throws {
+        let command = StageDTestSupport.cloneCommand(identity: String(repeating: "a", count: 64))
+        let cases: [(StageDCloneFilesystemPreflightFacts, StageDCloneFilesystemSubcategory)] = [
+            (clonePreflight(targetExists: true, targetType: .directory, targetIsEmpty: false), .destinationState),
+            (clonePreflight(parentIsEmpty: false), .destinationState),
+            (clonePreflight(parentType: .regularFile), .bindIdentity),
+            (clonePreflight(parentIsSymlink: true), .bindIdentity),
+            (clonePreflight(bindingMatches: false), .bindIdentity),
+            (clonePreflight(mountReadOnly: true), .permissionReadonly),
+            (clonePreflight(nameMax: 39), .namePathLimit),
+            (clonePreflight(pathMax: 68), .namePathLimit),
+            (clonePreflight(availableBytes: 1), .capacityInode),
+            (clonePreflight(availableInodes: 1), .capacityInode),
+        ]
+
+        for (preflight, expected) in cases {
+            let script = StageDClonePipelineScript(
+                failureStage: .cloneProcess,
+                category: .processNonzero
+            )
+            let outcome = await StageDClonePipeline.run(
+                command: command,
+                limits: .production,
+                preflight: preflight,
+                probe: { successfulCloneProbe() },
+                step: { await script.run($0) },
+                inspectTree: { await script.inspectTree() },
+                inspectResidual: { .targetAbsent }
+            )
+
+            XCTAssertEqual(outcome.filesystemEvidence?.preflight.failureSubcategory, expected)
+            XCTAssertEqual(outcome.filesystemEvidence?.probe, .notRun)
+            XCTAssertTrue(outcome.stages.allSatisfy { $0.category == .notRun })
+            let calls = await script.calls()
+            XCTAssertTrue(calls.isEmpty)
+        }
+    }
+
+    func testCloneCapabilityProbeEveryStepFailureAndUnknownCleanupRequireCorrectOutcome() async throws {
+        let command = StageDTestSupport.cloneCommand(identity: String(repeating: "a", count: 64))
+        let expected: [StageDCloneCapabilityStep: StageDCloneFilesystemSubcategory] = [
+            .create: .createMkdirOpen,
+            .fchmod: .filemodeChmod,
+            .fsync: .generic,
+            .rename: .destinationState,
+            .unlink: .permissionReadonly,
+        ]
+
+        for step in StageDCloneCapabilityStep.allCases {
+            for state in [StageDCloneCapabilityStepState.failed, .unknown] {
+                let script = StageDClonePipelineScript(
+                    failureStage: .cloneProcess,
+                    category: .processNonzero
+                )
+                let probe = cloneProbe(
+                    stoppingAt: step,
+                    state: state,
+                    subcategory: expected[step]
+                )
+                let outcome = await StageDClonePipeline.run(
+                    command: command,
+                    limits: .production,
+                    preflight: clonePreflight(),
+                    probe: { probe },
+                    step: { await script.run($0) },
+                    inspectTree: { await script.inspectTree() },
+                    inspectResidual: { .targetAbsent }
+                )
+
+                XCTAssertEqual(outcome.filesystemEvidence?.probe.steps.first {
+                    $0.step == step
+                }?.state, state)
+                XCTAssertEqual(outcome.unknown, state == .unknown)
+                XCTAssertEqual(
+                    outcome.failureCategory,
+                    state == .unknown ? .cloneTimeoutUnknown : .cloneProcessNonzero
+                )
+                XCTAssertTrue(outcome.stages.allSatisfy { $0.category == .notRun })
+                let calls = await script.calls()
+                XCTAssertTrue(calls.isEmpty)
+            }
+        }
+
+        let cleanupUncertain = StageDCloneCapabilityProbeFacts(
+            steps: successfulCloneProbe().steps,
+            cleanupKnown: false,
+            cleanupVerified: false
+        )
+        let script = StageDClonePipelineScript(
+            failureStage: .cloneProcess,
+            category: .processNonzero
+        )
+        let outcome = await StageDClonePipeline.run(
+            command: command,
+            limits: .production,
+            preflight: clonePreflight(),
+            probe: { cleanupUncertain },
+            step: { await script.run($0) },
+            inspectTree: { await script.inspectTree() },
+            inspectResidual: { .targetAbsent }
+        )
+        XCTAssertTrue(outcome.unknown)
+        XCTAssertTrue(outcome.filesystemEvidence?.probe.requiresReconciliation == true)
+        XCTAssertTrue(outcome.stages.allSatisfy { $0.category == .notRun })
+        let calls = await script.calls()
+        XCTAssertTrue(calls.isEmpty)
+    }
+
+    func testSuccessfulCapabilityProbeDoesNotReplaceRealCloneAndPartialResidualCannotBeReused() async throws {
+        let command = StageDTestSupport.cloneCommand(identity: String(repeating: "a", count: 64))
+        let script = StageDClonePipelineScript(
+            failureStage: .cloneProcess,
+            category: .filesystemFailure
+        )
+        let partial = StageDCloneResidualFacts(
+            inspectionComplete: true,
+            targetExists: true,
+            targetType: .directory,
+            targetIsSymlink: false,
+            bounded: true,
+            entryCount: 7,
+            byteCount: 123,
+            gitDirectory: true,
+            gitHEAD: true,
+            gitConfig: false,
+            gitObjects: true,
+            gitRefs: false
+        )
+        let outcome = await StageDClonePipeline.run(
+            command: command,
+            limits: .production,
+            preflight: clonePreflight(),
+            probe: { successfulCloneProbe() },
+            step: { await script.run($0) },
+            inspectTree: { await script.inspectTree() },
+            inspectResidual: { partial }
+        )
+
+        XCTAssertFalse(outcome.succeeded)
+        let cloneCalls = await script.calls()
+        XCTAssertEqual(cloneCalls, [.cloneProcess])
+        XCTAssertEqual(outcome.filesystemEvidence?.probe.succeeded, true)
+        XCTAssertEqual(outcome.filesystemEvidence?.residual, partial)
+        XCTAssertEqual(outcome.filesystemEvidence?.residual.gitConfig, false)
+
+        let reuseScript = StageDClonePipelineScript(
+            failureStage: .cloneProcess,
+            category: .processNonzero
+        )
+        let reuse = await StageDClonePipeline.run(
+            command: command,
+            limits: .production,
+            preflight: clonePreflight(
+                targetExists: true,
+                targetType: .directory,
+                targetIsEmpty: false
+            ),
+            probe: { successfulCloneProbe() },
+            step: { await reuseScript.run($0) },
+            inspectTree: { await reuseScript.inspectTree() },
+            inspectResidual: { partial }
+        )
+        XCTAssertFalse(reuse.succeeded)
+        XCTAssertEqual(reuse.filesystemEvidence?.preflight.failureSubcategory, .destinationState)
+        XCTAssertTrue(reuse.stages.allSatisfy { $0.category == .notRun })
+        let reuseCalls = await reuseScript.calls()
+        XCTAssertTrue(reuseCalls.isEmpty)
+    }
+
+    func testFilesystemSubcategoryMatchingPreservesHigherPriorityCloneCategoriesAndGenericFallback() {
+        let priority: [(String, StageDCloneStageCategory)] = [
+            ("permission denied getaddrinfo", .resolverNetworkFailure),
+            ("operation not permitted unable to find remote helper", .capabilityUnavailable),
+            ("permission denied repository not found", .remoteAccessFailure),
+            ("permission denied unable to checkout working tree", .checkoutWorktreeFailure),
+            ("permission denied invalid index-pack", .protocolFailure),
+        ]
+        for (value, expected) in priority {
+            let classification = StageDClonePipeline.safeCloneProcessClassification(value)
+            XCTAssertEqual(classification.category, expected)
+            XCTAssertNil(classification.filesystemSubcategory)
+        }
+
+        let filesystem: [(String, StageDCloneFilesystemSubcategory)] = [
+            ("permission denied", .permissionReadonly),
+            ("file name too long", .namePathLimit),
+            ("could not set 'core.filemode'", .filemodeChmod),
+            ("unable to create leading directories", .createMkdirOpen),
+            ("destination path already exists", .destinationState),
+            ("no space left on device", .capacityInode),
+            ("different Stage D root already mounted", .bindIdentity),
+            ("filesystem failure", .generic),
+        ]
+        for (value, expected) in filesystem {
+            let classification = StageDClonePipeline.safeCloneProcessClassification(value)
+            XCTAssertEqual(classification.category, .filesystemFailure)
+            XCTAssertEqual(classification.filesystemSubcategory, expected)
+        }
+    }
+}
+
+private func clonePreflight(
+    bindingMatches: Bool = true,
+    parentType: StageDFilesystemNodeType = .directory,
+    parentIsEmpty: Bool = true,
+    parentIsSymlink: Bool = false,
+    targetExists: Bool = false,
+    targetType: StageDFilesystemNodeType = .missing,
+    targetIsEmpty: Bool = true,
+    mountReadOnly: Bool = false,
+    nameMax: UInt64 = 255,
+    pathMax: UInt64 = 4_096,
+    availableBytes: UInt64 = StageDLimits.production.maximumCloneBytes + 1,
+    availableInodes: UInt64 = UInt64(StageDLimits.production.maximumCloneEntries + 1)
+) -> StageDCloneFilesystemPreflightFacts {
+    let host = ProviderDigest.sha256Hex("fixed-host-root")
+    return .init(
+        evidenceVersion: 1,
+        complete: true,
+        hostRootBindingSHA256: host,
+        guestRootBindingSHA256: bindingMatches ? host : ProviderDigest.sha256Hex("other-root"),
+        bindingMatches: bindingMatches,
+        parentExists: true,
+        parentType: parentType,
+        parentIsEmpty: parentIsEmpty,
+        parentIsSymlink: parentIsSymlink,
+        targetExists: targetExists,
+        targetType: targetType,
+        targetIsEmpty: targetIsEmpty,
+        targetIsSymlink: targetType == .symbolicLink,
+        probeNamesAbsent: true,
+        mountReadOnly: mountReadOnly,
+        umask: 0o022,
+        nameMax: nameMax,
+        pathMax: pathMax,
+        availableBytes: availableBytes,
+        availableInodes: availableInodes,
+        requiredAvailableBytes: StageDLimits.production.maximumCloneBytes,
+        requiredAvailableInodes: UInt64(StageDLimits.production.maximumCloneEntries),
+        requiredNameBytes: 40,
+        requiredPathBytes: 69
+    )
+}
+
+private func successfulCloneProbe() -> StageDCloneCapabilityProbeFacts {
+    .init(
+        steps: StageDCloneCapabilityStep.allCases.map {
+            .init(step: $0, state: .succeeded, subcategory: nil)
+        },
+        cleanupKnown: true,
+        cleanupVerified: true
+    )
+}
+
+private func cloneProbe(
+    stoppingAt step: StageDCloneCapabilityStep,
+    state: StageDCloneCapabilityStepState,
+    subcategory: StageDCloneFilesystemSubcategory?
+) -> StageDCloneCapabilityProbeFacts {
+    let stop = StageDCloneCapabilityStep.allCases.firstIndex(of: step)!
+    return .init(
+        steps: StageDCloneCapabilityStep.allCases.enumerated().map { index, value in
+            .init(
+                step: value,
+                state: index < stop ? .succeeded : (index == stop ? state : .notRun),
+                subcategory: index == stop ? subcategory : nil
+            )
+        },
+        cleanupKnown: true,
+        cleanupVerified: true
+    )
 }
 
 private actor StageDClonePipelineScript {

@@ -18,6 +18,10 @@ private final class StageDTimeoutFlag: @unchecked Sendable {
     }
 }
 
+private final class StageDResidualInspectionFlag: @unchecked Sendable {
+    var complete = true
+}
+
 struct StageDRawStep: Sendable {
     let facts: StageDProcessFacts
     let stdout: String
@@ -56,6 +60,7 @@ struct StageDClonePipelineResult: Sendable {
     let head: String?
     let entryCount: Int?
     let byteCount: UInt64?
+    let filesystemEvidence: StageDCloneFilesystemEvidence?
     let failureCategory: StageDRuntimeFailureCategory?
     let unknown: Bool
 
@@ -68,8 +73,11 @@ enum StageDClonePipeline {
     static func run(
         command: StageDAuthorizedCommand,
         limits: StageDLimits,
+        preflight: StageDCloneFilesystemPreflightFacts,
+        probe: @escaping @Sendable () async -> StageDCloneCapabilityProbeFacts,
         step: @escaping @Sendable (StageDCloneStage) async -> StageDCloneStepResult,
-        inspectTree: @escaping @Sendable () async -> StageDCloneTreeResult
+        inspectTree: @escaping @Sendable () async -> StageDCloneTreeResult,
+        inspectResidual: @escaping @Sendable () -> StageDCloneResidualFacts
     ) async -> StageDClonePipelineResult {
         let exactArguments = [
             "clone", "--depth", "8", "--no-tags", "--single-branch",
@@ -86,6 +94,7 @@ enum StageDClonePipeline {
             return .init(
                 stages: StageDCloneStage.allCases.map { .notRun(stage: $0) },
                 steps: [], remote: nil, head: nil, entryCount: nil, byteCount: nil,
+                filesystemEvidence: nil,
                 failureCategory: .authorizationRejected, unknown: false
             )
         }
@@ -95,6 +104,7 @@ enum StageDClonePipeline {
         var head: String?
         var entryCount: Int?
         var byteCount: UInt64?
+        var probeFacts = StageDCloneCapabilityProbeFacts.notRun
 
         func completed(
             failure: StageDRuntimeFailureCategory?,
@@ -111,9 +121,33 @@ enum StageDClonePipeline {
                 head: head,
                 entryCount: entryCount,
                 byteCount: byteCount,
+                filesystemEvidence: .init(
+                    evidenceVersion: 1,
+                    preflight: preflight,
+                    probe: probeFacts,
+                    residual: inspectResidual(),
+                    blockingSubcategory: preflight.failureSubcategory
+                        ?? probeFacts.failureSubcategory
+                        ?? outcomes.compactMap(\.filesystemSubcategory).first
+                ),
                 failureCategory: failure,
                 unknown: unknown
             )
+        }
+
+        guard preflight.failureSubcategory == nil else {
+            return completed(failure: .cloneProcessNonzero)
+        }
+        probeFacts = await probe()
+        if probeFacts.requiresReconciliation {
+            return completed(failure: .cloneTimeoutUnknown, unknown: true)
+        }
+        guard probeFacts.succeeded else {
+            guard probeFacts.failureSubcategory != nil else {
+                probeFacts = Self.unknownProbe(.create, subcategory: .generic)
+                return completed(failure: .cloneTimeoutUnknown, unknown: true)
+            }
+            return completed(failure: .cloneProcessNonzero)
         }
 
         for stage in StageDCloneStage.allCases.dropLast() {
@@ -136,22 +170,29 @@ enum StageDClonePipeline {
                       raw.facts.activeDescendantCount == 0 else {
                     let capturedProcessCategory: StageDCloneStageCategory?
                     if raw.facts.finalStateKind == "exited", raw.facts.finalStateValue != 0 {
-                        capturedProcessCategory = nonzeroClassification(stage: stage, raw: raw).0
+                        capturedProcessCategory = nonzeroClassification(stage: stage, raw: raw).category
                     } else {
                         capturedProcessCategory = nil
                     }
+                    let classification = nonzeroClassification(stage: stage, raw: raw)
                     outcomes.append(stageOutcome(
                         stage: stage,
                         category: .terminalBarrierFailure,
                         raw: raw,
-                        capturedProcessCategory: capturedProcessCategory
+                        capturedProcessCategory: capturedProcessCategory,
+                        filesystemSubcategory: classification.filesystemSubcategory
                     ))
                     return completed(failure: .eofTruncationProcessTreeFailure)
                 }
                 guard raw.facts.finalStateKind == "exited", raw.facts.finalStateValue == 0 else {
-                    let (category, failure) = nonzeroClassification(stage: stage, raw: raw)
-                    outcomes.append(stageOutcome(stage: stage, category: category, raw: raw))
-                    return completed(failure: failure)
+                    let classification = nonzeroClassification(stage: stage, raw: raw)
+                    outcomes.append(stageOutcome(
+                        stage: stage,
+                        category: classification.category,
+                        raw: raw,
+                        filesystemSubcategory: classification.filesystemSubcategory
+                    ))
+                    return completed(failure: classification.failure)
                 }
                 if stage == .remoteVerify {
                     let value = raw.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -186,9 +227,14 @@ enum StageDClonePipeline {
                     ))
                     return completed(failure: .adapterFixedError)
                 }
-                let (category, failure) = nonzeroClassification(stage: stage, raw: raw)
-                outcomes.append(stageOutcome(stage: stage, category: category, raw: raw))
-                return completed(failure: failure)
+                let classification = nonzeroClassification(stage: stage, raw: raw)
+                outcomes.append(stageOutcome(
+                    stage: stage,
+                    category: classification.category,
+                    raw: raw,
+                    filesystemSubcategory: classification.filesystemSubcategory
+                ))
+                return completed(failure: classification.failure)
             case let .unknown(raw, fixedError):
                 if let raw { steps.append(raw) }
                 outcomes.append(stageOutcome(
@@ -225,6 +271,7 @@ enum StageDClonePipeline {
         raw: StageDRawStep?,
         fixedError: StageDAdapterErrorCategory = .none,
         capturedProcessCategory: StageDCloneStageCategory? = nil,
+        filesystemSubcategory: StageDCloneFilesystemSubcategory? = nil,
         observedValueSHA256: String? = nil
     ) -> StageDCloneStageOutcome {
         .init(
@@ -234,6 +281,7 @@ enum StageDClonePipeline {
             facts: raw?.facts ?? .notRun,
             adapterError: fixedError == .none ? raw?.fixedError ?? .none : fixedError,
             capturedProcessCategory: capturedProcessCategory,
+            filesystemSubcategory: filesystemSubcategory,
             observedValueSHA256: observedValueSHA256,
             entryCount: nil,
             byteCount: nil
@@ -243,21 +291,38 @@ enum StageDClonePipeline {
     private static func nonzeroClassification(
         stage: StageDCloneStage,
         raw: StageDRawStep?
-    ) -> (StageDCloneStageCategory, StageDRuntimeFailureCategory) {
+    ) -> (
+        category: StageDCloneStageCategory,
+        failure: StageDRuntimeFailureCategory,
+        filesystemSubcategory: StageDCloneFilesystemSubcategory?
+    ) {
         if stage == .checkoutExactCommit {
-            return (.targetUnavailable, .checkoutTargetUnavailable)
+            return (.targetUnavailable, .checkoutTargetUnavailable, nil)
         }
         if stage == .cloneProcess, let raw {
-            let category = safeCloneProcessCategory(raw.stderr)
-            if category == .resolverNetworkFailure {
-                return (category, .resolverNetworkFailure)
+            let classification = safeCloneProcessClassification(raw.stderr)
+            if classification.category == .resolverNetworkFailure {
+                return (
+                    classification.category,
+                    .resolverNetworkFailure,
+                    classification.filesystemSubcategory
+                )
             }
-            return (category, .cloneProcessNonzero)
+            return (
+                classification.category,
+                .cloneProcessNonzero,
+                classification.filesystemSubcategory
+            )
         }
-        return (.processNonzero, .cloneProcessNonzero)
+        return (.processNonzero, .cloneProcessNonzero, nil)
     }
 
-    private static func safeCloneProcessCategory(_ stderr: String) -> StageDCloneStageCategory {
+    static func safeCloneProcessClassification(
+        _ stderr: String
+    ) -> (
+        category: StageDCloneStageCategory,
+        filesystemSubcategory: StageDCloneFilesystemSubcategory?
+    ) {
         let value = stderr.lowercased()
         let categories: [(StageDCloneStageCategory, [String])] = [
             (.resolverNetworkFailure, [
@@ -278,20 +343,44 @@ enum StageDClonePipeline {
             (.checkoutWorktreeFailure, [
                 "unable to checkout working tree", "checkout failed", "invalid path",
             ]),
-            (.filesystemFailure, [
-                "operation not permitted", "permission denied", "read-only file system",
-                "file name too long", "could not set 'core.filemode'", "chmod on",
-                "unable to create", "could not create", "cannot create",
-                "destination path",
-            ]),
             (.protocolFailure, [
                 "rpc failed", "early eof", "invalid index-pack", "unexpected disconnect",
                 "protocol error", "bad pack header",
             ]),
         ]
-        return categories.first(where: { category in
+        if let category = categories.first(where: { category in
             category.1.contains { value.contains($0) }
-        })?.0 ?? .processNonzero
+        })?.0 {
+            return (category, nil)
+        }
+        let filesystem: [(StageDCloneFilesystemSubcategory, [String])] = [
+            (.permissionReadonly, [
+                "operation not permitted", "permission denied", "read-only file system",
+            ]),
+            (.namePathLimit, ["file name too long", "name too long", "path too long"]),
+            (.filemodeChmod, ["could not set 'core.filemode'", "chmod on", "fchmod"]),
+            (.createMkdirOpen, [
+                "unable to create", "could not create", "cannot create",
+                "could not open", "unable to open", "mkdir",
+            ]),
+            (.destinationState, [
+                "destination path", "already exists and is not an empty directory",
+            ]),
+            (.capacityInode, [
+                "no space left on device", "disk quota exceeded", "not enough space",
+                "no free inodes",
+            ]),
+            (.bindIdentity, [
+                "different stage d root", "bind identity", "bind mount", "mount point",
+            ]),
+            (.generic, ["filesystem failure", "filesystem error"]),
+        ]
+        if let subcategory = filesystem.first(where: { entry in
+            entry.1.contains { value.contains($0) }
+        })?.0 {
+            return (.filesystemFailure, subcategory)
+        }
+        return (.processNonzero, nil)
     }
 
     private static func treeOutcome(
@@ -305,6 +394,7 @@ enum StageDClonePipeline {
             processStarted: false,
             facts: .notRun,
             adapterError: .none,
+            filesystemSubcategory: nil,
             observedValueSHA256: nil,
             entryCount: entries,
             byteCount: bytes
@@ -538,8 +628,7 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
         }
         if command.risk == .network, let target = command.cloneTarget {
             let destination = canonicalRoot.appendingPathComponent(target, isDirectory: true)
-            guard contained(destination.standardizedFileURL, in: canonicalRoot),
-                  !FileManager.default.fileExists(atPath: destination.path) else {
+            guard contained(destination.standardizedFileURL, in: canonicalRoot) else {
                 throw StageDCommandError.invalidClone
             }
         }
@@ -640,15 +729,22 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
             StageDEnvironmentLock.cloneURL, StageDEnvironmentLock.cloneTarget
         ], command.cloneTarget == StageDEnvironmentLock.cloneTarget else { return .failed(nil) }
         let target = cloneRootURL.appendingPathComponent(StageDEnvironmentLock.cloneTarget, isDirectory: true)
+        let preflight = await cloneFilesystemPreflight()
         let pipeline = await StageDClonePipeline.run(
             command: command,
             limits: limits,
+            preflight: preflight,
+            probe: { [self] in await cloneCapabilityProbe() },
             step: { [self] stage in await cloneStep(stage, command: command) },
-            inspectTree: { [self] in inspectCloneTree(at: target) }
+            inspectTree: { [self] in inspectCloneTree(at: target) },
+            inspectResidual: { [self] in inspectCloneResidual(at: target) }
         )
         let categories = pipeline.stages.map { $0.stage.rawValue + "=" + $0.category.rawValue }
             .joined(separator: ",")
-        let verification = "clone_stages=\(ProviderDigest.sha256Hex(categories))"
+        let filesystemDigest = pipeline.filesystemEvidence.flatMap {
+            StageDTaskStore.digest($0)
+        } ?? "none"
+        let verification = "clone_stages=\(ProviderDigest.sha256Hex(categories)) filesystem=\(filesystemDigest)"
         let result = makeResult(
             command: command,
             steps: pipeline.steps,
@@ -660,6 +756,7 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
             cloneEntryCount: pipeline.entryCount,
             cloneByteCount: pipeline.byteCount,
             cloneStages: pipeline.stages,
+            cloneFilesystemEvidence: pipeline.filesystemEvidence,
             failureCategory: pipeline.failureCategory
         )
         if pipeline.succeeded && result.verified { return .succeeded(result) }
@@ -741,6 +838,256 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
             return .escape
         }
         return .succeeded(entries: entries, bytes: bytes)
+    }
+
+    private func cloneFilesystemPreflight() async -> StageDCloneFilesystemPreflightFacts {
+        let leaseID = UUID()
+        await StageDGlobalExecutionGate.shared.acquire(leaseID)
+        var raw = WujiISHStageDClonePreflight()
+        let status = cloneRootURL.path.withCString {
+            wuji_ish_stage_d_clone_preflight($0, &raw)
+        }
+        await StageDGlobalExecutionGate.shared.release(leaseID)
+        let hostBinding = ProviderDigest.sha256Hex(
+            cloneRootURL.standardizedFileURL.resolvingSymlinksInPath().path
+        )
+        let guestBinding = raw.binding_matches
+            ? hostBinding
+            : ProviderDigest.sha256Hex("unverified-stage-d-clone-root")
+        return .init(
+            evidenceVersion: 1,
+            complete: status == 0 && raw.complete,
+            hostRootBindingSHA256: hostBinding,
+            guestRootBindingSHA256: guestBinding,
+            bindingMatches: status == 0 && raw.binding_matches,
+            parentExists: raw.parent_exists,
+            parentType: Self.nodeType(raw.parent_type),
+            parentIsEmpty: raw.parent_is_empty,
+            parentIsSymlink: raw.parent_is_symlink,
+            targetExists: raw.target_exists,
+            targetType: Self.nodeType(raw.target_type),
+            targetIsEmpty: raw.target_is_empty,
+            targetIsSymlink: raw.target_is_symlink,
+            probeNamesAbsent: raw.probe_names_absent,
+            mountReadOnly: raw.mount_read_only,
+            umask: raw.umask_value,
+            nameMax: raw.name_max,
+            pathMax: raw.path_max,
+            availableBytes: raw.available_bytes,
+            availableInodes: raw.available_inodes,
+            requiredAvailableBytes: limits.maximumCloneBytes,
+            requiredAvailableInodes: UInt64(limits.maximumCloneEntries),
+            requiredNameBytes: 40,
+            requiredPathBytes: 69
+        )
+    }
+
+    private func cloneCapabilityProbe() async -> StageDCloneCapabilityProbeFacts {
+        let leaseID = UUID()
+        await StageDGlobalExecutionGate.shared.acquire(leaseID)
+        if Task.isCancelled {
+            await StageDGlobalExecutionGate.shared.release(leaseID)
+            return Self.unknownProbe(.create, subcategory: .createMkdirOpen)
+        }
+        var raw = WujiISHStageDCloneCapabilityProbe()
+        let status = wuji_ish_stage_d_clone_capability_probe(&raw)
+        await StageDGlobalExecutionGate.shared.release(leaseID)
+        guard status == 0 else {
+            return Self.unknownProbe(.create, subcategory: .generic)
+        }
+        let subcategory = Self.filesystemSubcategory(raw.failure_category)
+        return .init(
+            steps: [
+                .init(step: .create, state: Self.probeState(raw.create_state), subcategory: Self.probeState(raw.create_state) == .succeeded || Self.probeState(raw.create_state) == .notRun ? nil : subcategory),
+                .init(step: .fchmod, state: Self.probeState(raw.fchmod_state), subcategory: Self.probeState(raw.fchmod_state) == .succeeded || Self.probeState(raw.fchmod_state) == .notRun ? nil : subcategory),
+                .init(step: .fsync, state: Self.probeState(raw.fsync_state), subcategory: Self.probeState(raw.fsync_state) == .succeeded || Self.probeState(raw.fsync_state) == .notRun ? nil : subcategory),
+                .init(step: .rename, state: Self.probeState(raw.rename_state), subcategory: Self.probeState(raw.rename_state) == .succeeded || Self.probeState(raw.rename_state) == .notRun ? nil : subcategory),
+                .init(step: .unlink, state: Self.probeState(raw.unlink_state), subcategory: Self.probeState(raw.unlink_state) == .succeeded || Self.probeState(raw.unlink_state) == .notRun ? nil : subcategory),
+            ],
+            cleanupKnown: raw.cleanup_known,
+            cleanupVerified: raw.cleanup_verified
+        )
+    }
+
+    private static func unknownProbe(
+        _ step: StageDCloneCapabilityStep,
+        subcategory: StageDCloneFilesystemSubcategory
+    ) -> StageDCloneCapabilityProbeFacts {
+        let stop = StageDCloneCapabilityStep.allCases.firstIndex(of: step) ?? 0
+        return .init(
+            steps: StageDCloneCapabilityStep.allCases.enumerated().map { index, value in
+                .init(
+                    step: value,
+                    state: index < stop ? .succeeded : (index == stop ? .unknown : .notRun),
+                    subcategory: index == stop ? subcategory : nil
+                )
+            },
+            cleanupKnown: false,
+            cleanupVerified: false
+        )
+    }
+
+    private static func probeState(
+        _ value: WujiISHStageDProbeStepState
+    ) -> StageDCloneCapabilityStepState {
+        switch value {
+        case WUJI_ISH_STAGE_D_PROBE_SUCCEEDED: return .succeeded
+        case WUJI_ISH_STAGE_D_PROBE_FAILED: return .failed
+        case WUJI_ISH_STAGE_D_PROBE_UNKNOWN: return .unknown
+        default: return .notRun
+        }
+    }
+
+    private static func filesystemSubcategory(
+        _ value: WujiISHStageDFilesystemCategory
+    ) -> StageDCloneFilesystemSubcategory? {
+        switch value {
+        case WUJI_ISH_STAGE_D_FILESYSTEM_PERMISSION_READONLY: return .permissionReadonly
+        case WUJI_ISH_STAGE_D_FILESYSTEM_NAME_PATH_LIMIT: return .namePathLimit
+        case WUJI_ISH_STAGE_D_FILESYSTEM_FILEMODE_CHMOD: return .filemodeChmod
+        case WUJI_ISH_STAGE_D_FILESYSTEM_CREATE_MKDIR_OPEN: return .createMkdirOpen
+        case WUJI_ISH_STAGE_D_FILESYSTEM_DESTINATION_STATE: return .destinationState
+        case WUJI_ISH_STAGE_D_FILESYSTEM_CAPACITY_INODE: return .capacityInode
+        case WUJI_ISH_STAGE_D_FILESYSTEM_BIND_IDENTITY: return .bindIdentity
+        case WUJI_ISH_STAGE_D_FILESYSTEM_GENERIC: return .generic
+        default: return nil
+        }
+    }
+
+    private static func nodeType(_ value: WujiISHStageDNodeType) -> StageDFilesystemNodeType {
+        switch value {
+        case WUJI_ISH_STAGE_D_NODE_MISSING: return .missing
+        case WUJI_ISH_STAGE_D_NODE_DIRECTORY: return .directory
+        case WUJI_ISH_STAGE_D_NODE_REGULAR_FILE: return .regularFile
+        case WUJI_ISH_STAGE_D_NODE_SYMBOLIC_LINK: return .symbolicLink
+        case WUJI_ISH_STAGE_D_NODE_OTHER: return .other
+        default: return .unknown
+        }
+    }
+
+    private func inspectCloneResidual(at target: URL) -> StageDCloneResidualFacts {
+        let fileManager = FileManager.default
+        let targetType = Self.nodeType(at: target)
+        if targetType == .missing { return .targetAbsent }
+        if targetType == .unknown {
+            return .init(
+                    inspectionComplete: false,
+                    targetExists: fileManager.fileExists(atPath: target.path),
+                    targetType: .unknown,
+                    targetIsSymlink: false,
+                    bounded: false,
+                    entryCount: 0,
+                    byteCount: 0,
+                    gitDirectory: false,
+                    gitHEAD: false,
+                    gitConfig: false,
+                    gitObjects: false,
+                    gitRefs: false
+                )
+        }
+        let isSymlink = targetType == .symbolicLink
+        guard targetType == .directory, !isSymlink else {
+            return .init(
+                inspectionComplete: true,
+                targetExists: true,
+                targetType: targetType,
+                targetIsSymlink: isSymlink,
+                bounded: true,
+                entryCount: 0,
+                byteCount: 0,
+                gitDirectory: false,
+                gitHEAD: false,
+                gitConfig: false,
+                gitObjects: false,
+                gitRefs: false
+            )
+        }
+
+        let keys: Set<URLResourceKey> = [
+            .isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey,
+        ]
+        let inspection = StageDResidualInspectionFlag()
+        guard let enumerator = fileManager.enumerator(
+            at: target,
+            includingPropertiesForKeys: Array(keys),
+            options: [],
+            errorHandler: { _, _ in inspection.complete = false; return false }
+        ) else {
+            return .init(
+                inspectionComplete: false,
+                targetExists: true,
+                targetType: .directory,
+                targetIsSymlink: false,
+                bounded: false,
+                entryCount: 0,
+                byteCount: 0,
+                gitDirectory: false,
+                gitHEAD: false,
+                gitConfig: false,
+                gitObjects: false,
+                gitRefs: false
+            )
+        }
+        var entries = 0
+        var bytes: UInt64 = 0
+        var bounded = true
+        while let url = enumerator.nextObject() as? URL {
+            entries += 1
+            if entries > limits.maximumCloneEntries {
+                bounded = false
+                break
+            }
+            guard let values = try? url.resourceValues(forKeys: keys),
+                  values.isSymbolicLink != true else {
+                inspection.complete = false
+                bounded = false
+                break
+            }
+            if values.isRegularFile == true {
+                let size = UInt64(max(0, values.fileSize ?? 0))
+                if UInt64.max - bytes < size {
+                    bounded = false
+                    break
+                }
+                bytes += size
+                if bytes > limits.maximumCloneBytes {
+                    bounded = false
+                    break
+                }
+            }
+        }
+        return .init(
+            inspectionComplete: inspection.complete,
+            targetExists: true,
+            targetType: .directory,
+            targetIsSymlink: false,
+            bounded: bounded,
+            entryCount: entries,
+            byteCount: bytes,
+            gitDirectory: Self.isNode(.directory, at: target.appendingPathComponent(".git")),
+            gitHEAD: Self.isNode(.regularFile, at: target.appendingPathComponent(".git/HEAD")),
+            gitConfig: Self.isNode(.regularFile, at: target.appendingPathComponent(".git/config")),
+            gitObjects: Self.isNode(.directory, at: target.appendingPathComponent(".git/objects")),
+            gitRefs: Self.isNode(.directory, at: target.appendingPathComponent(".git/refs"))
+        )
+    }
+
+    private static func isNode(_ expected: StageDFilesystemNodeType, at url: URL) -> Bool {
+        nodeType(at: url) == expected
+    }
+
+    private static func nodeType(at url: URL) -> StageDFilesystemNodeType {
+        if (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) != nil {
+            return .symbolicLink
+        }
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+        guard let values = try? url.resourceValues(forKeys: keys) else {
+            return FileManager.default.fileExists(atPath: url.path) ? .unknown : .missing
+        }
+        if values.isSymbolicLink == true { return .symbolicLink }
+        if values.isDirectory == true { return .directory }
+        if values.isRegularFile == true { return .regularFile }
+        return .other
     }
 
     private func run(
@@ -906,6 +1253,7 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
         cloneByteCount: UInt64? = nil,
         toolVersions: [String: String] = [:],
         cloneStages: [StageDCloneStageOutcome] = [],
+        cloneFilesystemEvidence: StageDCloneFilesystemEvidence? = nil,
         failureCategory: StageDRuntimeFailureCategory? = nil
     ) -> StageDCommandResult {
         let stdoutData = Data(stdout.utf8)
@@ -926,6 +1274,7 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
             cloneByteCount: cloneByteCount,
             toolVersions: toolVersions,
             cloneStages: cloneStages,
+            cloneFilesystemEvidence: cloneFilesystemEvidence,
             failureCategory: failureCategory
         )
     }

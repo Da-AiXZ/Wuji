@@ -186,6 +186,12 @@ jobs:
               "testCPIDTableTaskStateFilterExcludesZombieExitingAndMismatchedContext",
               "testExit128AndDescendantBarrierPreservesCapturedProcessCategoryAndShortCircuits",
               "testCrossWorkspaceWaiterCannotStartWatchdogOrCancelActiveExecution",
+              "testCloneFilesystemPreflightCounterexamplesShortCircuitBeforeProbeAndCloneIO",
+              "testCloneCapabilityProbeEveryStepFailureAndUnknownCleanupRequireCorrectOutcome",
+              "testSuccessfulCapabilityProbeDoesNotReplaceRealCloneAndPartialResidualCannotBeReused",
+              "testFilesystemSubcategoryMatchingPreservesHigherPriorityCloneCategoriesAndGenericFallback",
+              "testCloneProbeReconciliationColdRecoveryAndRepeatedInvocationPerformZeroIO",
+              "testLegacyCloneResultWithoutFilesystemEvidenceCannotMasqueradeAsNewEvidence",
           ]
           missing = [name for name in required if name not in text]
           if missing:
@@ -343,19 +349,17 @@ jobs:
           unexpected = [path for path in changed if not allowed.fullmatch(path)]
           if unexpected:
               raise SystemExit("Stage D scope escaped: " + ", ".join(unexpected))
-          repair_parent = "e59b25fd7023b71e862f61e34c275d48a1178fd8"
+          repair_parent = "041cfb18467da08ef25837eb507107e5362e686a"
           repair_changed = subprocess.check_output(
               ["git", "diff", "--name-only", repair_parent + "..HEAD"], text=True
           ).splitlines()
           repair_allowed = {
               "Executor/WujiISHAdapter.c", "Executor/WujiISHAdapter.h",
               "Wuji/StageDContracts.swift", "Wuji/StageDTaskStore.swift",
-              "Wuji/ISHStageDCommandExecutor.swift", "Wuji/StageDCommandAgent.swift",
-              "WujiTests/WujiStageDPolicyTests.swift",
+              "Wuji/ISHStageDCommandExecutor.swift",
               "WujiTests/WujiStageDRecoveryTests.swift",
               "WujiTests/WujiStageDISHIntegrationTests.swift",
               ".github/workflows/stage-d-ish-development.yml",
-              ".github/workflows/stage-d-raw-log-audit.yml",
           }
           unexpected_repair = sorted(set(repair_changed) - repair_allowed)
           if unexpected_repair:
@@ -401,9 +405,43 @@ jobs:
               "expectedInputSHA256", "revalidates(command, using: policy)",
               "capturedProcessCategory", "initialActiveDescendantCount",
               "processTreeObservationCount", "boundedProcessTreeObservationSatisfied",
+              "cloneFilesystemEvidence", "StageDCloneFilesystemPreflightFacts",
+              "StageDCloneCapabilityProbeFacts", "StageDCloneResidualFacts",
+              "permission_readonly", "name_path_limit", "filemode_chmod",
+              "create_mkdir_open", "destination_state", "capacity_inode",
+              "bind_identity", "generic",
           ]:
               if required not in contracts + executor + agent:
                   raise SystemExit("Stage D post-03 contract missing: " + required)
+          for required in [
+              "wuji_ish_stage_d_clone_preflight",
+              "wuji_ish_stage_d_clone_capability_probe",
+              "WUJI_STAGE_D_PROBE_CREATE", "WUJI_STAGE_D_PROBE_RENAMED",
+              "fstatvfs", "fpathconf", "AT_SYMLINK_NOFOLLOW",
+          ]:
+              if required not in adapter:
+                  raise SystemExit("Stage D filesystem diagnostic boundary missing: " + required)
+          preflight = adapter[
+              adapter.index("int wuji_ish_stage_d_clone_preflight"):
+              adapter.index("static WujiISHStageDFilesystemCategory")
+          ]
+          if "access(" in preflight:
+              raise SystemExit("Stage D zero-write preflight relies on access(W_OK)")
+          probe = adapter[
+              adapter.index("int wuji_ish_stage_d_clone_capability_probe"):
+              adapter.index("static bool attach_host_fd")
+          ]
+          ordered_probe = ["openat(", "fchmod(", "fsync(", "renameat(", "unlinkat("]
+          positions = [probe.index(value) for value in ordered_probe]
+          if positions != sorted(positions):
+              raise SystemExit("Stage D capability probe order changed")
+          store = pathlib.Path("Wuji/StageDTaskStore.swift").read_text()
+          for required in [
+              "validProbeSequence", "cloneFilesystemEvidence",
+              "requiresReconciliation", "permitsSuccessfulClone",
+          ]:
+              if required not in store + contracts:
+                  raise SystemExit("Stage D durable filesystem evidence validation missing: " + required)
           snapshot_start = adapter.index("static int32_t snapshot_active_process_context_tasks")
           snapshot_end = adapter.index("static void observe_process_tree_after_terminal_barrier")
           snapshot = adapter[snapshot_start:snapshot_end]
@@ -603,6 +641,9 @@ jobs:
                   b"STAGE_D_AUTHORIZATION_REVALIDATION_AUDIT=PASS",
                   b"STAGE_D_PROCESS_ISOLATION_AUDIT=PASS",
                   b"STAGE_D_PROCESS_TREE_QUIESCENCE=",
+                  b"STAGE_D_CLONE_FILESYSTEM_PREFLIGHT=PASS",
+                  b"STAGE_D_CLONE_CAPABILITY_PROBE=PASS",
+                  b"STAGE_D_CLONE_RESIDUAL_AUDIT=PASS",
                   b"STAGE_D_XCRESULT_AUDIT=PASS",
                   b"STAGE_D_REAL_ISH_DEEPSEEK_COMMAND=PASS",
                   b"STAGE_D_DURABLE_INTENT_AUDIT=PASS",

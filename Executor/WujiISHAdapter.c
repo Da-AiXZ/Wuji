@@ -1,6 +1,7 @@
 #include "WujiISHAdapter.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -11,6 +12,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -26,6 +28,9 @@
 
 #define WUJI_PROCESS_TREE_MAX_OBSERVATIONS 11U
 #define WUJI_PROCESS_TREE_OBSERVATION_INTERVAL_NS 50000000L
+#define WUJI_STAGE_D_CLONE_TARGET "Wuji-StageC"
+#define WUJI_STAGE_D_PROBE_CREATE ".wuji-stage-d-capability-probe"
+#define WUJI_STAGE_D_PROBE_RENAMED ".wuji-stage-d-capability-probe-renamed"
 
 extern const char *uname_hostname_override;
 static const char wuji_hostname_override[] = "wuji";
@@ -594,7 +599,343 @@ int wuji_ish_mount_stage_d_clone_root(const char *host_path,
                                       size_t error_buffer_size) {
     return mount_stage_d_root(host_path, "/wuji-stage-d-clones", &g_stage_d_clone_root_mounted,
                               g_stage_d_clone_root_source, sizeof(g_stage_d_clone_root_source),
-                              error_buffer, error_buffer_size);
+                               error_buffer, error_buffer_size);
+}
+
+static WujiISHStageDNodeType stage_d_node_type(const struct stat *info) {
+    if (S_ISDIR(info->st_mode)) return WUJI_ISH_STAGE_D_NODE_DIRECTORY;
+    if (S_ISREG(info->st_mode)) return WUJI_ISH_STAGE_D_NODE_REGULAR_FILE;
+    if (S_ISLNK(info->st_mode)) return WUJI_ISH_STAGE_D_NODE_SYMBOLIC_LINK;
+    return WUJI_ISH_STAGE_D_NODE_OTHER;
+}
+
+static bool stage_d_node_at(int root_fd,
+                            const char *name,
+                            bool *exists,
+                            WujiISHStageDNodeType *type,
+                            bool *is_symlink) {
+    struct stat info = {};
+    if (fstatat(root_fd, name, &info, AT_SYMLINK_NOFOLLOW) == 0) {
+        *exists = true;
+        *type = stage_d_node_type(&info);
+        *is_symlink = S_ISLNK(info.st_mode);
+        return true;
+    }
+    if (errno == ENOENT) {
+        *exists = false;
+        *type = WUJI_ISH_STAGE_D_NODE_MISSING;
+        *is_symlink = false;
+        return true;
+    }
+    *exists = false;
+    *type = WUJI_ISH_STAGE_D_NODE_UNKNOWN;
+    *is_symlink = false;
+    return false;
+}
+
+static bool stage_d_directory_empty_at(int root_fd, const char *name, bool *empty) {
+    int directory_fd = openat(root_fd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory_fd < 0)
+        return false;
+    DIR *directory = fdopendir(directory_fd);
+    if (directory == NULL) {
+        close(directory_fd);
+        return false;
+    }
+    bool found = false;
+    errno = 0;
+    for (;;) {
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL)
+            break;
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+            found = true;
+            break;
+        }
+    }
+    bool read_ok = errno == 0;
+    closedir(directory);
+    *empty = !found;
+    return read_ok;
+}
+
+int wuji_ish_stage_d_clone_preflight(const char *expected_host_root,
+                                     WujiISHStageDClonePreflight *preflight) {
+    if (expected_host_root == NULL || expected_host_root[0] == '\0' || preflight == NULL)
+        return -1;
+    memset(preflight, 0, sizeof(*preflight));
+    preflight->parent_type = WUJI_ISH_STAGE_D_NODE_UNKNOWN;
+    preflight->target_type = WUJI_ISH_STAGE_D_NODE_UNKNOWN;
+
+    char canonical_path[4096];
+    if (realpath(expected_host_root, canonical_path) == NULL)
+        return -1;
+    struct stat supplied_parent = {};
+    bool supplied_parent_known = lstat(expected_host_root, &supplied_parent) == 0;
+
+    pthread_mutex_lock(&g_boot_lock);
+    if (!g_booted || !g_stage_d_clone_root_mounted) {
+        pthread_mutex_unlock(&g_boot_lock);
+        return -1;
+    }
+    char guest_path[] = "/wuji-stage-d-clones";
+    struct mount *mount = mount_find(guest_path);
+    if (mount == NULL) {
+        pthread_mutex_unlock(&g_boot_lock);
+        return -1;
+    }
+    preflight->binding_matches =
+        strcmp(canonical_path, g_stage_d_clone_root_source) == 0 &&
+        strcmp(canonical_path, mount->source) == 0 &&
+        mount->fs == &realfs;
+    preflight->mount_read_only = (mount->flags & MS_READONLY_) != 0;
+
+    if (supplied_parent_known) {
+        preflight->parent_exists = true;
+        preflight->parent_type = stage_d_node_type(&supplied_parent);
+        preflight->parent_is_symlink = S_ISLNK(supplied_parent.st_mode);
+    }
+    bool parent_empty_known = preflight->parent_type == WUJI_ISH_STAGE_D_NODE_DIRECTORY &&
+        stage_d_directory_empty_at(mount->root_fd, ".", &preflight->parent_is_empty);
+
+    bool target_known = stage_d_node_at(
+        mount->root_fd,
+        WUJI_STAGE_D_CLONE_TARGET,
+        &preflight->target_exists,
+        &preflight->target_type,
+        &preflight->target_is_symlink
+    );
+    preflight->target_is_empty = !preflight->target_exists;
+    bool target_empty_known = true;
+    if (preflight->target_type == WUJI_ISH_STAGE_D_NODE_DIRECTORY) {
+        target_empty_known = stage_d_directory_empty_at(
+            mount->root_fd,
+            WUJI_STAGE_D_CLONE_TARGET,
+            &preflight->target_is_empty
+        );
+    }
+
+    bool first_exists = false, first_link = false;
+    bool second_exists = false, second_link = false;
+    WujiISHStageDNodeType first_type = WUJI_ISH_STAGE_D_NODE_UNKNOWN;
+    WujiISHStageDNodeType second_type = WUJI_ISH_STAGE_D_NODE_UNKNOWN;
+    bool first_known = stage_d_node_at(
+        mount->root_fd, WUJI_STAGE_D_PROBE_CREATE,
+        &first_exists, &first_type, &first_link
+    );
+    bool second_known = stage_d_node_at(
+        mount->root_fd, WUJI_STAGE_D_PROBE_RENAMED,
+        &second_exists, &second_type, &second_link
+    );
+    preflight->probe_names_absent = first_known && second_known && !first_exists && !second_exists;
+
+    struct statvfs capacity = {};
+    bool capacity_known = fstatvfs(mount->root_fd, &capacity) == 0;
+    if (capacity_known) {
+        uint64_t block_size = capacity.f_frsize == 0 ? capacity.f_bsize : capacity.f_frsize;
+        if (block_size == 0)
+            block_size = 1;
+        uint64_t available_blocks = capacity.f_bavail;
+        preflight->available_bytes = available_blocks > UINT64_MAX / block_size
+            ? UINT64_MAX
+            : available_blocks * block_size;
+        preflight->available_inodes = capacity.f_favail != 0
+            ? capacity.f_favail
+            : capacity.f_ffree;
+    }
+
+    errno = 0;
+    long name_max = fpathconf(mount->root_fd, _PC_NAME_MAX);
+    bool name_known = name_max >= 0 || errno == 0;
+    preflight->name_max = name_max < 0 ? UINT64_MAX : (uint64_t)name_max;
+    errno = 0;
+    long path_max = fpathconf(mount->root_fd, _PC_PATH_MAX);
+    bool path_known = path_max >= 0 || errno == 0;
+    preflight->path_max = path_max < 0 ? UINT64_MAX : (uint64_t)path_max;
+
+    if (g_init_task != NULL && g_init_task->fs != NULL) {
+        lock(&g_init_task->fs->lock);
+        preflight->umask_value = g_init_task->fs->umask;
+        unlock(&g_init_task->fs->lock);
+    }
+
+    preflight->complete = supplied_parent_known && preflight->parent_exists && parent_empty_known &&
+        target_known && target_empty_known &&
+        first_known && second_known && capacity_known && name_known && path_known;
+    mount_release(mount);
+    pthread_mutex_unlock(&g_boot_lock);
+    return 0;
+}
+
+static WujiISHStageDFilesystemCategory stage_d_filesystem_error_category(
+    int error,
+    WujiISHStageDFilesystemCategory step_category
+) {
+    switch (error) {
+        case EACCES:
+        case EPERM:
+        case EROFS:
+            return WUJI_ISH_STAGE_D_FILESYSTEM_PERMISSION_READONLY;
+        case ENAMETOOLONG:
+            return WUJI_ISH_STAGE_D_FILESYSTEM_NAME_PATH_LIMIT;
+        case ENOSPC:
+#ifdef EDQUOT
+        case EDQUOT:
+#endif
+            return WUJI_ISH_STAGE_D_FILESYSTEM_CAPACITY_INODE;
+        case EEXIST:
+        case ENOTEMPTY:
+        case EISDIR:
+        case ENOTDIR:
+            return WUJI_ISH_STAGE_D_FILESYSTEM_DESTINATION_STATE;
+        default:
+            return step_category;
+    }
+}
+
+static void stage_d_verify_probe_cleanup(int root_fd,
+                                         WujiISHStageDCloneCapabilityProbe *probe) {
+    struct stat info = {};
+    errno = 0;
+    int first = fstatat(root_fd, WUJI_STAGE_D_PROBE_CREATE, &info, AT_SYMLINK_NOFOLLOW);
+    bool first_absent = first != 0 && errno == ENOENT;
+    bool first_known = first == 0 || first_absent;
+    errno = 0;
+    int second = fstatat(root_fd, WUJI_STAGE_D_PROBE_RENAMED, &info, AT_SYMLINK_NOFOLLOW);
+    bool second_absent = second != 0 && errno == ENOENT;
+    bool second_known = second == 0 || second_absent;
+    probe->cleanup_known = first_known && second_known;
+    probe->cleanup_verified = probe->cleanup_known && first_absent && second_absent;
+}
+
+static void stage_d_cleanup_owned_probe(int root_fd,
+                                        WujiISHStageDCloneCapabilityProbe *probe) {
+    bool cleanup_error = false;
+    if (unlinkat(root_fd, WUJI_STAGE_D_PROBE_CREATE, 0) != 0 && errno != ENOENT) {
+        cleanup_error = true;
+    }
+    if (unlinkat(root_fd, WUJI_STAGE_D_PROBE_RENAMED, 0) != 0 && errno != ENOENT) {
+        cleanup_error = true;
+    }
+    stage_d_verify_probe_cleanup(root_fd, probe);
+    if (cleanup_error) {
+        probe->cleanup_known = false;
+        probe->cleanup_verified = false;
+    }
+}
+
+int wuji_ish_stage_d_clone_capability_probe(WujiISHStageDCloneCapabilityProbe *probe) {
+    if (probe == NULL)
+        return -1;
+    memset(probe, 0, sizeof(*probe));
+    probe->failure_category = WUJI_ISH_STAGE_D_FILESYSTEM_NONE;
+
+    pthread_mutex_lock(&g_run_lock);
+    pthread_mutex_lock(&g_boot_lock);
+    if (!g_booted || !g_stage_d_clone_root_mounted) {
+        pthread_mutex_unlock(&g_boot_lock);
+        pthread_mutex_unlock(&g_run_lock);
+        return -1;
+    }
+    char guest_path[] = "/wuji-stage-d-clones";
+    struct mount *mount = mount_find(guest_path);
+    pthread_mutex_unlock(&g_boot_lock);
+    if (mount == NULL) {
+        pthread_mutex_unlock(&g_run_lock);
+        return -1;
+    }
+
+    stage_d_verify_probe_cleanup(mount->root_fd, probe);
+    if (!probe->cleanup_known || !probe->cleanup_verified) {
+        probe->create_state = WUJI_ISH_STAGE_D_PROBE_FAILED;
+        probe->failure_category = WUJI_ISH_STAGE_D_FILESYSTEM_DESTINATION_STATE;
+        mount_release(mount);
+        pthread_mutex_unlock(&g_run_lock);
+        return 0;
+    }
+
+    int fd = openat(
+        mount->root_fd,
+        WUJI_STAGE_D_PROBE_CREATE,
+        O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC,
+        0600
+    );
+    if (fd < 0) {
+        probe->create_state = WUJI_ISH_STAGE_D_PROBE_FAILED;
+        probe->failure_category = stage_d_filesystem_error_category(
+            errno, WUJI_ISH_STAGE_D_FILESYSTEM_CREATE_MKDIR_OPEN
+        );
+        stage_d_verify_probe_cleanup(mount->root_fd, probe);
+        mount_release(mount);
+        pthread_mutex_unlock(&g_run_lock);
+        return 0;
+    }
+    probe->create_state = WUJI_ISH_STAGE_D_PROBE_SUCCEEDED;
+
+    if (fchmod(fd, 0644) != 0) {
+        probe->fchmod_state = WUJI_ISH_STAGE_D_PROBE_FAILED;
+        probe->failure_category = stage_d_filesystem_error_category(
+            errno, WUJI_ISH_STAGE_D_FILESYSTEM_FILEMODE_CHMOD
+        );
+        close(fd);
+        stage_d_cleanup_owned_probe(mount->root_fd, probe);
+        mount_release(mount);
+        pthread_mutex_unlock(&g_run_lock);
+        return 0;
+    }
+    probe->fchmod_state = WUJI_ISH_STAGE_D_PROBE_SUCCEEDED;
+
+    if (fsync(fd) != 0) {
+        probe->fsync_state = WUJI_ISH_STAGE_D_PROBE_FAILED;
+        probe->failure_category = stage_d_filesystem_error_category(
+            errno, WUJI_ISH_STAGE_D_FILESYSTEM_GENERIC
+        );
+        close(fd);
+        stage_d_cleanup_owned_probe(mount->root_fd, probe);
+        mount_release(mount);
+        pthread_mutex_unlock(&g_run_lock);
+        return 0;
+    }
+    probe->fsync_state = WUJI_ISH_STAGE_D_PROBE_SUCCEEDED;
+
+    if (close(fd) != 0) {
+        probe->rename_state = WUJI_ISH_STAGE_D_PROBE_UNKNOWN;
+        probe->failure_category = WUJI_ISH_STAGE_D_FILESYSTEM_GENERIC;
+        stage_d_cleanup_owned_probe(mount->root_fd, probe);
+        mount_release(mount);
+        pthread_mutex_unlock(&g_run_lock);
+        return 0;
+    }
+    if (renameat(
+        mount->root_fd, WUJI_STAGE_D_PROBE_CREATE,
+        mount->root_fd, WUJI_STAGE_D_PROBE_RENAMED
+    ) != 0) {
+        probe->rename_state = WUJI_ISH_STAGE_D_PROBE_FAILED;
+        probe->failure_category = stage_d_filesystem_error_category(
+            errno, WUJI_ISH_STAGE_D_FILESYSTEM_DESTINATION_STATE
+        );
+        stage_d_cleanup_owned_probe(mount->root_fd, probe);
+        mount_release(mount);
+        pthread_mutex_unlock(&g_run_lock);
+        return 0;
+    }
+    probe->rename_state = WUJI_ISH_STAGE_D_PROBE_SUCCEEDED;
+
+    if (unlinkat(mount->root_fd, WUJI_STAGE_D_PROBE_RENAMED, 0) != 0) {
+        probe->unlink_state = WUJI_ISH_STAGE_D_PROBE_FAILED;
+        probe->failure_category = stage_d_filesystem_error_category(
+            errno, WUJI_ISH_STAGE_D_FILESYSTEM_PERMISSION_READONLY
+        );
+        stage_d_cleanup_owned_probe(mount->root_fd, probe);
+        mount_release(mount);
+        pthread_mutex_unlock(&g_run_lock);
+        return 0;
+    }
+    probe->unlink_state = WUJI_ISH_STAGE_D_PROBE_SUCCEEDED;
+    stage_d_verify_probe_cleanup(mount->root_fd, probe);
+    mount_release(mount);
+    pthread_mutex_unlock(&g_run_lock);
+    return 0;
 }
 
 static bool attach_host_fd(struct task *task, int guest_fd, int host_fd) {
