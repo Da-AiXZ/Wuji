@@ -650,10 +650,10 @@ static const char *fixed_script(WujiISHSelfTestCase test_case) {
             return "while :; do :; done";
         case WUJI_ISH_CASE_PROCESS_TREE_TRANSIENT_NONZERO:
             return "printf WUJI_TREE_NONZERO >&2; "
-                "(exec >/dev/null 2>&1; sleep 0.2) & exit 128";
+                "(exec >/dev/null 2>&1; sleep 0.2) & exec /bin/sh -c 'exit 128'";
         case WUJI_ISH_CASE_PROCESS_TREE_PERSISTENT_NONZERO:
             return "printf WUJI_TREE_NONZERO >&2; "
-                "(exec >/dev/null 2>&1; sleep 2) & exit 128";
+                "(exec >/dev/null 2>&1; sleep 2) & exec /bin/sh -c 'exit 128'";
         case WUJI_ISH_CASE_PROCESS_TREE_CONTEXT_CLEAN:
             return "exit 0";
     }
