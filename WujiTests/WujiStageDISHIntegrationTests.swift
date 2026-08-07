@@ -216,7 +216,7 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
         XCTAssertLessThanOrEqual(cloneResult.cloneEntryCount ?? Int.max, StageDLimits.production.maximumCloneEntries)
         XCTAssertLessThanOrEqual(cloneResult.cloneByteCount ?? UInt64.max, StageDLimits.production.maximumCloneBytes)
         let filesystem = try XCTUnwrap(cloneResult.cloneFilesystemEvidence)
-        XCTAssertEqual(filesystem.evidenceVersion, 1)
+        XCTAssertEqual(filesystem.evidenceVersion, 2)
         XCTAssertNil(filesystem.preflight.failureSubcategory)
         XCTAssertTrue(filesystem.preflight.bindingMatches)
         XCTAssertEqual(
@@ -229,6 +229,14 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
         XCTAssertTrue(filesystem.probe.succeeded)
         XCTAssertTrue(filesystem.probe.cleanupKnown)
         XCTAssertTrue(filesystem.probe.cleanupVerified)
+        XCTAssertTrue(filesystem.guestGitProbe.usedGuestRealFSPath)
+        XCTAssertTrue(filesystem.guestGitProbe.succeeded)
+        XCTAssertEqual(
+            filesystem.guestGitProbe.steps.map(\.stage),
+            StageDGuestGitProbeStage.allCases
+        )
+        XCTAssertTrue(filesystem.guestGitProbe.cleanupKnown)
+        XCTAssertTrue(filesystem.guestGitProbe.cleanupVerified)
         XCTAssertTrue(filesystem.residual.inspectionComplete)
         XCTAssertTrue(filesystem.residual.targetExists)
         XCTAssertEqual(filesystem.residual.targetType, .directory)
@@ -240,6 +248,7 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
         XCTAssertTrue(filesystem.residual.gitRefs)
         print("STAGE_D_CLONE_FILESYSTEM_PREFLIGHT=PASS")
         print("STAGE_D_CLONE_CAPABILITY_PROBE=PASS")
+        print("STAGE_D_GUEST_GIT_PROBE=PASS")
         print("STAGE_D_CLONE_RESIDUAL_AUDIT=PASS")
 
         let writeTask = prepared.task
@@ -307,6 +316,7 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
                 limits: .production,
                 preflight: clonePreflight(),
                 probe: { successfulCloneProbe() },
+                guestGitProbe: { successfulGuestGitProbeExecution() },
                 step: { await script.run($0) },
                 inspectTree: { await script.inspectTree() },
                 inspectResidual: { .targetAbsent }
@@ -342,6 +352,7 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
             limits: .production,
             preflight: clonePreflight(),
             probe: { successfulCloneProbe() },
+            guestGitProbe: { successfulGuestGitProbeExecution() },
             step: { await quiescent.run($0) },
             inspectTree: { await quiescent.inspectTree() },
             inspectResidual: { .targetAbsent }
@@ -358,6 +369,7 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
             limits: .production,
             preflight: clonePreflight(),
             probe: { successfulCloneProbe() },
+            guestGitProbe: { successfulGuestGitProbeExecution() },
             step: { await descendant.run($0) },
             inspectTree: { await descendant.inspectTree() },
             inspectResidual: { .targetAbsent }
@@ -425,6 +437,7 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
                 limits: .production,
                 preflight: preflight,
                 probe: { successfulCloneProbe() },
+                guestGitProbe: { successfulGuestGitProbeExecution() },
                 step: { await script.run($0) },
                 inspectTree: { await script.inspectTree() },
                 inspectResidual: { .targetAbsent }
@@ -464,6 +477,7 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
                     limits: .production,
                     preflight: clonePreflight(),
                     probe: { probe },
+                    guestGitProbe: { successfulGuestGitProbeExecution() },
                     step: { await script.run($0) },
                     inspectTree: { await script.inspectTree() },
                     inspectResidual: { .targetAbsent }
@@ -497,6 +511,7 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
             limits: .production,
             preflight: clonePreflight(),
             probe: { cleanupUncertain },
+            guestGitProbe: { successfulGuestGitProbeExecution() },
             step: { await script.run($0) },
             inspectTree: { await script.inspectTree() },
             inspectResidual: { .targetAbsent }
@@ -533,6 +548,7 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
             limits: .production,
             preflight: clonePreflight(),
             probe: { successfulCloneProbe() },
+            guestGitProbe: { successfulGuestGitProbeExecution() },
             step: { await script.run($0) },
             inspectTree: { await script.inspectTree() },
             inspectResidual: { partial }
@@ -542,6 +558,7 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
         let cloneCalls = await script.calls()
         XCTAssertEqual(cloneCalls, [.cloneProcess])
         XCTAssertEqual(outcome.filesystemEvidence?.probe.succeeded, true)
+        XCTAssertEqual(outcome.filesystemEvidence?.guestGitProbe.succeeded, true)
         XCTAssertEqual(outcome.filesystemEvidence?.residual, partial)
         XCTAssertEqual(outcome.filesystemEvidence?.residual.gitConfig, false)
 
@@ -558,6 +575,7 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
                 targetIsEmpty: false
             ),
             probe: { successfulCloneProbe() },
+            guestGitProbe: { successfulGuestGitProbeExecution() },
             step: { await reuseScript.run($0) },
             inspectTree: { await reuseScript.inspectTree() },
             inspectResidual: { partial }
@@ -575,7 +593,6 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
             ("operation not permitted unable to find remote helper", .capabilityUnavailable),
             ("permission denied repository not found", .remoteAccessFailure),
             ("permission denied unable to checkout working tree", .checkoutWorktreeFailure),
-            ("permission denied invalid index-pack", .protocolFailure),
         ]
         for (value, expected) in priority {
             let classification = StageDClonePipeline.safeCloneProcessClassification(value)
@@ -597,6 +614,123 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
             let classification = StageDClonePipeline.safeCloneProcessClassification(value)
             XCTAssertEqual(classification.category, .filesystemFailure)
             XCTAssertEqual(classification.filesystemSubcategory, expected)
+        }
+    }
+
+    func testOrderedSafeFeatureCodesPreserveFilesystemAndProtocolWithoutSingleRootClaim() {
+        let filesystemFirst = StageDClonePipeline.safeCloneProcessClassification(
+            "permission denied before invalid index-pack"
+        )
+        XCTAssertEqual(filesystemFirst.category, .mixedSignals)
+        XCTAssertEqual(filesystemFirst.filesystemSubcategory, .permissionReadonly)
+        XCTAssertEqual(
+            filesystemFirst.safeFeatureCodes,
+            [.filesystemPermissionReadonly, .protocolFailure]
+        )
+
+        let protocolFirst = StageDClonePipeline.safeCloneProcessClassification(
+            "invalid index-pack before permission denied"
+        )
+        XCTAssertEqual(protocolFirst.category, .mixedSignals)
+        XCTAssertEqual(
+            protocolFirst.safeFeatureCodes,
+            [.protocolFailure, .filesystemPermissionReadonly]
+        )
+        XCTAssertNotEqual(filesystemFirst.safeFeatureCodes, protocolFirst.safeFeatureCodes)
+
+        let higherPriority = StageDClonePipeline.safeCloneProcessClassification(
+            "permission denied before getaddrinfo"
+        )
+        XCTAssertEqual(higherPriority.category, .resolverNetworkFailure)
+        XCTAssertEqual(
+            higherPriority.safeFeatureCodes,
+            [.filesystemPermissionReadonly, .resolverNetwork]
+        )
+    }
+
+    func testSafeFeatureDiagnosticsOmitRawMatcherPathURLUserinfoArgvAndProcessIdentity() throws {
+        let raw = "permission denied invalid index-pack /private/probe "
+            + "https://user:credential@example.invalid/repository argv-sentinel pid-sentinel"
+        let classification = StageDClonePipeline.safeCloneProcessClassification(raw)
+        let outcome = StageDCloneStageOutcome(
+            stage: .cloneProcess,
+            category: classification.category,
+            processStarted: true,
+            facts: StageDTestSupport.facts().replacingFinalState(kind: "exited", value: 128),
+            adapterError: .none,
+            filesystemSubcategory: classification.filesystemSubcategory,
+            safeFeatureCodes: classification.safeFeatureCodes,
+            observedValueSHA256: nil,
+            entryCount: nil,
+            byteCount: nil
+        )
+        let data = try JSONEncoder().encode(StageDSafeCloneStageSummary(outcome))
+        let diagnostic = try XCTUnwrap(String(data: data, encoding: .utf8))
+        for forbidden in [
+            raw, "permission denied", "invalid index-pack", "/private/probe",
+            "user:credential", "argv-sentinel", "pid-sentinel",
+        ] {
+            XCTAssertFalse(diagnostic.contains(forbidden))
+        }
+        XCTAssertTrue(diagnostic.contains("mixed_signals"))
+        XCTAssertTrue(diagnostic.contains("filesystem_permission_readonly"))
+        XCTAssertTrue(diagnostic.contains("protocol_failure"))
+    }
+
+    func testGuestGitProbeStagesRemainSeparateFromHostProbeAndShortCircuitCloneIO() async throws {
+        let command = StageDTestSupport.cloneCommand(identity: String(repeating: "a", count: 64))
+        for stage in StageDGuestGitProbeStage.allCases.dropLast() {
+            for state in [StageDGuestGitProbeState.failed, .unknown] {
+                let script = StageDClonePipelineScript(
+                    failureStage: .cloneProcess,
+                    category: .processNonzero
+                )
+                let guest = guestGitProbe(stoppingAt: stage, state: state)
+                let outcome = await StageDClonePipeline.run(
+                    command: command,
+                    limits: .production,
+                    preflight: clonePreflight(),
+                    probe: { successfulCloneProbe() },
+                    guestGitProbe: { .init(facts: guest, steps: []) },
+                    step: { await script.run($0) },
+                    inspectTree: { await script.inspectTree() },
+                    inspectResidual: { .targetAbsent }
+                )
+
+                XCTAssertTrue(outcome.filesystemEvidence?.probe.succeeded == true)
+                XCTAssertEqual(
+                    outcome.filesystemEvidence?.guestGitProbe.steps.first { $0.stage == stage }?.state,
+                    state
+                )
+                XCTAssertEqual(outcome.unknown, state == .unknown)
+                XCTAssertTrue(outcome.stages.allSatisfy { $0.category == .notRun })
+                let calls = await script.calls()
+                XCTAssertTrue(calls.isEmpty)
+            }
+        }
+
+        for state in [StageDGuestGitProbeState.failed, .unknown] {
+            let cleanupUncertain = guestGitProbe(stoppingAt: .cleanup, state: state)
+            let cleanupScript = StageDClonePipelineScript(
+                failureStage: .cloneProcess,
+                category: .processNonzero
+            )
+            let cleanupOutcome = await StageDClonePipeline.run(
+                command: command,
+                limits: .production,
+                preflight: clonePreflight(),
+                probe: { successfulCloneProbe() },
+                guestGitProbe: { .init(facts: cleanupUncertain, steps: []) },
+                step: { await cleanupScript.run($0) },
+                inspectTree: { await cleanupScript.inspectTree() },
+                inspectResidual: { .targetAbsent }
+            )
+            XCTAssertTrue(cleanupOutcome.unknown)
+            XCTAssertTrue(
+                cleanupOutcome.filesystemEvidence?.guestGitProbe.requiresReconciliation == true
+            )
+            let cleanupCalls = await cleanupScript.calls()
+            XCTAssertTrue(cleanupCalls.isEmpty)
         }
     }
 }
@@ -651,6 +785,66 @@ private func successfulCloneProbe() -> StageDCloneCapabilityProbeFacts {
         },
         cleanupKnown: true,
         cleanupVerified: true
+    )
+}
+
+private func successfulGuestGitProbeExecution() -> StageDGuestGitProbeExecution {
+    .init(
+        facts: .init(
+            version: StageDGuestGitProbeFacts.evidenceVersion,
+            bindingSHA256: StageDGuestGitProbeFacts.fixedBindingSHA256,
+            usedGuestRealFSPath: true,
+            steps: StageDGuestGitProbeStage.allCases.map {
+                .init(stage: $0, state: .succeeded, failureCategory: nil, safeFeatureCodes: [])
+            },
+            cleanupKnown: true,
+            cleanupVerified: true
+        ),
+        steps: []
+    )
+}
+
+private func guestGitProbe(
+    stoppingAt stage: StageDGuestGitProbeStage,
+    state: StageDGuestGitProbeState
+) -> StageDGuestGitProbeFacts {
+    let stop = StageDGuestGitProbeStage.allCases.firstIndex(of: stage)!
+    let cleanupIndex = StageDGuestGitProbeStage.allCases.count - 1
+    let steps = StageDGuestGitProbeStage.allCases.enumerated().map { index, value in
+        let stepState: StageDGuestGitProbeState
+        if value == .cleanup {
+            stepState = stage == .cleanup ? state : .succeeded
+        } else if index < stop {
+            stepState = .succeeded
+        } else if index == stop {
+            stepState = state
+        } else if stop < cleanupIndex {
+            stepState = .notRun
+        } else {
+            stepState = .succeeded
+        }
+        let category: StageDGuestGitProbeFailureCategory?
+        switch (value, stepState) {
+        case (_, .succeeded), (_, .notRun): category = nil
+        case (.isolatedRoot, _): category = .filesystem
+        case (.bareRepository, _): category = .gitRepository
+        case (.fixedObject, _): category = .gitObject
+        case (.reference, _): category = .gitReference
+        case (.indexPack, _): category = .gitIndexPack
+        case (.fsckRead, _): category = .gitFsckRead
+        case (.nestedDirectory, _): category = .nestedDirectory
+        case (.cleanup, _): category = .cleanup
+        }
+        return .init(stage: value, state: stepState, failureCategory: category, safeFeatureCodes: [])
+    }
+    let cleanupVerified = stage != .cleanup
+    return .init(
+        version: StageDGuestGitProbeFacts.evidenceVersion,
+        bindingSHA256: StageDGuestGitProbeFacts.fixedBindingSHA256,
+        usedGuestRealFSPath: true,
+        steps: steps,
+        cleanupKnown: cleanupVerified,
+        cleanupVerified: cleanupVerified
     )
 }
 
@@ -712,7 +906,7 @@ private actor StageDClonePipelineScript {
             switch category {
             case .processNonzero, .resolverNetworkFailure, .remoteAccessFailure,
                     .filesystemFailure, .checkoutWorktreeFailure, .protocolFailure,
-                    .capabilityUnavailable:
+                    .mixedSignals, .capabilityUnavailable:
                 let stderr: String
                 switch category {
                 case .processNonzero: stderr = "fixed generic clone failure"
@@ -721,6 +915,7 @@ private actor StageDClonePipelineScript {
                 case .filesystemFailure: stderr = "fixed operation not permitted"
                 case .checkoutWorktreeFailure: stderr = "fixed unable to checkout working tree"
                 case .protocolFailure: stderr = "fixed invalid index-pack"
+                case .mixedSignals: stderr = "fixed invalid index-pack permission denied"
                 case .capabilityUnavailable: stderr = "fixed unable to find remote helper"
                 default: stderr = ""
                 }

@@ -87,12 +87,18 @@ struct StageDClonePipelineResult: Sendable {
     }
 }
 
+struct StageDGuestGitProbeExecution: Sendable {
+    let facts: StageDGuestGitProbeFacts
+    let steps: [StageDRawStep]
+}
+
 enum StageDClonePipeline {
     static func run(
         command: StageDAuthorizedCommand,
         limits: StageDLimits,
         preflight: StageDCloneFilesystemPreflightFacts,
         probe: @escaping @Sendable () async -> StageDCloneCapabilityProbeFacts,
+        guestGitProbe: @escaping @Sendable () async -> StageDGuestGitProbeExecution,
         step: @escaping @Sendable (StageDCloneStage) async -> StageDCloneStepResult,
         inspectTree: @escaping @Sendable () async -> StageDCloneTreeResult,
         inspectResidual: @escaping @Sendable () -> StageDCloneResidualFacts
@@ -123,6 +129,7 @@ enum StageDClonePipeline {
         var entryCount: Int?
         var byteCount: UInt64?
         var probeFacts = StageDCloneCapabilityProbeFacts.notRun
+        var guestGitProbeFacts = StageDGuestGitProbeFacts.notRun
 
         func completed(
             failure: StageDRuntimeFailureCategory?,
@@ -140,9 +147,10 @@ enum StageDClonePipeline {
                 entryCount: entryCount,
                 byteCount: byteCount,
                 filesystemEvidence: .init(
-                    evidenceVersion: 1,
+                    evidenceVersion: 2,
                     preflight: preflight,
                     probe: probeFacts,
+                    guestGitProbe: guestGitProbeFacts,
                     residual: inspectResidual(),
                     blockingSubcategory: preflight.failureSubcategory
                         ?? probeFacts.failureSubcategory
@@ -165,6 +173,15 @@ enum StageDClonePipeline {
                 probeFacts = stageDUnknownProbe(.create, subcategory: .generic)
                 return completed(failure: .cloneTimeoutUnknown, unknown: true)
             }
+            return completed(failure: .cloneProcessNonzero)
+        }
+        let guestProbeExecution = await guestGitProbe()
+        guestGitProbeFacts = guestProbeExecution.facts
+        steps.append(contentsOf: guestProbeExecution.steps)
+        if guestGitProbeFacts.requiresReconciliation {
+            return completed(failure: .cloneTimeoutUnknown, unknown: true)
+        }
+        guard guestGitProbeFacts.succeeded else {
             return completed(failure: .cloneProcessNonzero)
         }
 
@@ -198,7 +215,8 @@ enum StageDClonePipeline {
                         category: .terminalBarrierFailure,
                         raw: raw,
                         capturedProcessCategory: capturedProcessCategory,
-                        filesystemSubcategory: classification.filesystemSubcategory
+                        filesystemSubcategory: classification.filesystemSubcategory,
+                        safeFeatureCodes: classification.safeFeatureCodes
                     ))
                     return completed(failure: .eofTruncationProcessTreeFailure)
                 }
@@ -208,7 +226,8 @@ enum StageDClonePipeline {
                         stage: stage,
                         category: classification.category,
                         raw: raw,
-                        filesystemSubcategory: classification.filesystemSubcategory
+                        filesystemSubcategory: classification.filesystemSubcategory,
+                        safeFeatureCodes: classification.safeFeatureCodes
                     ))
                     return completed(failure: classification.failure)
                 }
@@ -250,7 +269,8 @@ enum StageDClonePipeline {
                     stage: stage,
                     category: classification.category,
                     raw: raw,
-                    filesystemSubcategory: classification.filesystemSubcategory
+                    filesystemSubcategory: classification.filesystemSubcategory,
+                    safeFeatureCodes: classification.safeFeatureCodes
                 ))
                 return completed(failure: classification.failure)
             case let .unknown(raw, fixedError):
@@ -290,6 +310,7 @@ enum StageDClonePipeline {
         fixedError: StageDAdapterErrorCategory = .none,
         capturedProcessCategory: StageDCloneStageCategory? = nil,
         filesystemSubcategory: StageDCloneFilesystemSubcategory? = nil,
+        safeFeatureCodes: [StageDCloneSafeFeatureCode] = [],
         observedValueSHA256: String? = nil
     ) -> StageDCloneStageOutcome {
         .init(
@@ -300,6 +321,7 @@ enum StageDClonePipeline {
             adapterError: fixedError == .none ? raw?.fixedError ?? .none : fixedError,
             capturedProcessCategory: capturedProcessCategory,
             filesystemSubcategory: filesystemSubcategory,
+            safeFeatureCodes: safeFeatureCodes,
             observedValueSHA256: observedValueSHA256,
             entryCount: nil,
             byteCount: nil
@@ -312,10 +334,11 @@ enum StageDClonePipeline {
     ) -> (
         category: StageDCloneStageCategory,
         failure: StageDRuntimeFailureCategory,
-        filesystemSubcategory: StageDCloneFilesystemSubcategory?
+        filesystemSubcategory: StageDCloneFilesystemSubcategory?,
+        safeFeatureCodes: [StageDCloneSafeFeatureCode]
     ) {
         if stage == .checkoutExactCommit {
-            return (.targetUnavailable, .checkoutTargetUnavailable, nil)
+            return (.targetUnavailable, .checkoutTargetUnavailable, nil, [])
         }
         if stage == .cloneProcess, let raw {
             let classification = safeCloneProcessClassification(raw.stderr)
@@ -323,27 +346,30 @@ enum StageDClonePipeline {
                 return (
                     classification.category,
                     .resolverNetworkFailure,
-                    classification.filesystemSubcategory
+                    classification.filesystemSubcategory,
+                    classification.safeFeatureCodes
                 )
             }
             return (
                 classification.category,
                 .cloneProcessNonzero,
-                classification.filesystemSubcategory
+                classification.filesystemSubcategory,
+                classification.safeFeatureCodes
             )
         }
-        return (.processNonzero, .cloneProcessNonzero, nil)
+        return (.processNonzero, .cloneProcessNonzero, nil, [])
     }
 
     static func safeCloneProcessClassification(
         _ stderr: String
     ) -> (
         category: StageDCloneStageCategory,
-        filesystemSubcategory: StageDCloneFilesystemSubcategory?
+        filesystemSubcategory: StageDCloneFilesystemSubcategory?,
+        safeFeatureCodes: [StageDCloneSafeFeatureCode]
     ) {
-        let value = stderr.lowercased()
-        let categories: [(StageDCloneStageCategory, [String])] = [
-            (.resolverNetworkFailure, [
+        let value = stderr.lowercased() as NSString
+        let definitions: [(StageDCloneSafeFeatureCode, [String])] = [
+            (.resolverNetwork, [
                 "could not resolve", "couldn't resolve", "getaddrinfo",
                 "failed to connect", "connection timed out", "connection refused",
                 "connection reset", "network is unreachable", "ssl", "tls",
@@ -354,51 +380,70 @@ enum StageDClonePipeline {
                 "unable to find remote helper", "remote-https is not a git command",
                 "not a git command",
             ]),
-            (.remoteAccessFailure, [
+            (.remoteAccess, [
                 "repository not found", "authentication failed", "could not read username",
                 "requested url returned error",
             ]),
-            (.checkoutWorktreeFailure, [
+            (.checkoutWorktree, [
                 "unable to checkout working tree", "checkout failed", "invalid path",
             ]),
             (.protocolFailure, [
                 "rpc failed", "early eof", "invalid index-pack", "unexpected disconnect",
                 "protocol error", "bad pack header",
             ]),
-        ]
-        if let category = categories.first(where: { category in
-            category.1.contains { value.contains($0) }
-        })?.0 {
-            return (category, nil)
-        }
-        let filesystem: [(StageDCloneFilesystemSubcategory, [String])] = [
-            (.permissionReadonly, [
+            (.filesystemPermissionReadonly, [
                 "operation not permitted", "permission denied", "read-only file system",
             ]),
-            (.namePathLimit, ["file name too long", "name too long", "path too long"]),
-            (.filemodeChmod, ["could not set 'core.filemode'", "chmod on", "fchmod"]),
-            (.createMkdirOpen, [
+            (.filesystemNamePathLimit, ["file name too long", "name too long", "path too long"]),
+            (.filesystemFilemodeChmod, ["could not set 'core.filemode'", "chmod on", "fchmod"]),
+            (.filesystemCreateMkdirOpen, [
                 "unable to create", "could not create", "cannot create",
                 "could not open", "unable to open", "mkdir",
             ]),
-            (.destinationState, [
+            (.filesystemDestinationState, [
                 "destination path", "already exists and is not an empty directory",
             ]),
-            (.capacityInode, [
+            (.filesystemCapacityInode, [
                 "no space left on device", "disk quota exceeded", "not enough space",
                 "no free inodes",
             ]),
-            (.bindIdentity, [
+            (.filesystemBindIdentity, [
                 "different stage d root", "bind identity", "bind mount", "mount point",
             ]),
-            (.generic, ["filesystem failure", "filesystem error"]),
+            (.filesystemGeneric, ["filesystem failure", "filesystem error"]),
         ]
-        if let subcategory = filesystem.first(where: { entry in
-            entry.1.contains { value.contains($0) }
-        })?.0 {
-            return (.filesystemFailure, subcategory)
+        var earliest: [StageDCloneSafeFeatureCode: Int] = [:]
+        for (code, markers) in definitions {
+            for marker in markers {
+                let location = value.range(of: marker).location
+                if location != NSNotFound {
+                    earliest[code] = min(earliest[code] ?? Int.max, location)
+                }
+            }
         }
-        return (.processNonzero, nil)
+        let featureCodes = earliest.sorted {
+            $0.value == $1.value ? $0.key.rawValue < $1.key.rawValue : $0.value < $1.value
+        }.map(\.key)
+        return (
+            projectedCloneCategory(for: featureCodes),
+            featureCodes.compactMap(\.filesystemSubcategory).first,
+            featureCodes
+        )
+    }
+
+    static func projectedCloneCategory(
+        for featureCodes: [StageDCloneSafeFeatureCode]
+    ) -> StageDCloneStageCategory {
+        if featureCodes.contains(.resolverNetwork) { return .resolverNetworkFailure }
+        if featureCodes.contains(.capabilityUnavailable) { return .capabilityUnavailable }
+        if featureCodes.contains(.remoteAccess) { return .remoteAccessFailure }
+        if featureCodes.contains(.checkoutWorktree) { return .checkoutWorktreeFailure }
+        let hasProtocol = featureCodes.contains(.protocolFailure)
+        let hasFilesystem = featureCodes.contains { $0.filesystemSubcategory != nil }
+        if hasProtocol && hasFilesystem { return .mixedSignals }
+        if hasProtocol { return .protocolFailure }
+        if hasFilesystem { return .filesystemFailure }
+        return .processNonzero
     }
 
     private static func treeOutcome(
@@ -753,6 +798,7 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
             limits: limits,
             preflight: preflight,
             probe: { [self] in await cloneCapabilityProbe() },
+            guestGitProbe: { [self] in await guestGitProbe() },
             step: { [self] stage in await cloneStep(stage, command: command) },
             inspectTree: { [self] in inspectCloneTree(at: target) },
             inspectResidual: { [self] in inspectCloneResidual(at: target) }
@@ -925,6 +971,127 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
             cleanupKnown: raw.cleanup_known,
             cleanupVerified: raw.cleanup_verified
         )
+    }
+
+    private func guestGitProbe() async -> StageDGuestGitProbeExecution {
+        let root = ".wuji-stage-d-guest-git-probe-v1"
+        let repository = "\(root)/repo.git"
+        let commands: [(StageDGuestGitProbeStage, String, [String])] = [
+            (.isolatedRoot, "sh", ["-c", "test ! -e '\(root)' && mkdir -- '\(root)'"]),
+            (.bareRepository, "git", ["init", "--bare", "--quiet", repository]),
+            (.fixedObject, "sh", ["-c", "set -eu; root='\(root)'; repo=\"$root/repo.git\"; blob=$(printf '%s\\n' 'wuji-stage-d-guest-probe-v1' | git --git-dir=\"$repo\" hash-object -w --stdin); printf '%s\\n' \"$blob\" > \"$root/blob-id\"; tree=$(printf '100644 blob %s\\tprobe.txt\\n' \"$blob\" | git --git-dir=\"$repo\" mktree); GIT_AUTHOR_NAME='WujiProbe' GIT_AUTHOR_EMAIL='probe@invalid' GIT_AUTHOR_DATE='2000-01-01T00:00:00Z' GIT_COMMITTER_NAME='WujiProbe' GIT_COMMITTER_EMAIL='probe@invalid' GIT_COMMITTER_DATE='2000-01-01T00:00:00Z' git --git-dir=\"$repo\" commit-tree \"$tree\" -m 'wuji-stage-d-guest-probe-v1' > \"$root/commit-id\""]),
+            (.reference, "sh", ["-c", "set -eu; root='\(root)'; repo=\"$root/repo.git\"; commit=$(cat \"$root/commit-id\"); git --git-dir=\"$repo\" update-ref refs/heads/probe \"$commit\"; git --git-dir=\"$repo\" symbolic-ref HEAD refs/heads/probe"]),
+            (.indexPack, "sh", ["-c", "set -eu; repo='\(repository)'; git --git-dir=\"$repo\" repack -ad; set -- \"$repo\"/objects/pack/*.pack; test \"$#\" -eq 1; test -f \"$1\"; idx=${1%.pack}.idx; test -f \"$idx\"; git --git-dir=\"$repo\" verify-pack -q \"$idx\""]),
+            (.fsckRead, "sh", ["-c", "set -eu; root='\(root)'; repo=\"$root/repo.git\"; git --git-dir=\"$repo\" fsck --full --strict; commit=$(git --git-dir=\"$repo\" rev-parse refs/heads/probe); git --git-dir=\"$repo\" cat-file -e \"$commit^{commit}\"; blob=$(cat \"$root/blob-id\"); test \"$(git --git-dir=\"$repo\" cat-file -p \"$blob\")\" = 'wuji-stage-d-guest-probe-v1'"]),
+            (.nestedDirectory, "sh", ["-c", "set -eu; root='\(root)'; mkdir -p \"$root/nested/level/leaf\"; test -d \"$root/nested/level/leaf\"; rmdir \"$root/nested/level/leaf\" \"$root/nested/level\" \"$root/nested\""]),
+        ]
+        var recorded: [StageDGuestGitProbeStepFacts] = []
+        var rawSteps: [StageDRawStep] = []
+        var stopped = false
+        for (stage, executable, arguments) in commands {
+            if stopped {
+                recorded.append(.init(
+                    stage: stage, state: .notRun, failureCategory: nil, safeFeatureCodes: []
+                ))
+                continue
+            }
+            let execution = await runGuestGitProbeStage(
+                stage: stage, executable: executable, arguments: arguments
+            )
+            recorded.append(execution.fact)
+            if let raw = execution.raw { rawSteps.append(raw) }
+            stopped = execution.fact.state != .succeeded
+        }
+
+        let cleanup = await runGuestGitProbeStage(
+            stage: .cleanup,
+            executable: "sh",
+            arguments: ["-c", "set -eu; rm -rf -- '\(root)'; test ! -e '\(root)'"]
+        )
+        recorded.append(cleanup.fact)
+        if let raw = cleanup.raw { rawSteps.append(raw) }
+        let cleanupVerified = cleanup.fact.state == .succeeded
+        return .init(
+            facts: .init(
+                version: StageDGuestGitProbeFacts.evidenceVersion,
+                bindingSHA256: StageDGuestGitProbeFacts.fixedBindingSHA256,
+                usedGuestRealFSPath: true,
+                steps: recorded,
+                cleanupKnown: cleanupVerified,
+                cleanupVerified: cleanupVerified
+            ),
+            steps: rawSteps
+        )
+    }
+
+    private func runGuestGitProbeStage(
+        stage: StageDGuestGitProbeStage,
+        executable: String,
+        arguments: [String]
+    ) async -> (fact: StageDGuestGitProbeStepFacts, raw: StageDRawStep?) {
+        do {
+            let raw = try await run(
+                executable: executable,
+                arguments: arguments,
+                cwd: "",
+                root: .cloneRoot,
+                timeout: limits.commandTimeoutSeconds
+            )
+            let features = StageDClonePipeline.safeCloneProcessClassification(raw.stderr)
+                .safeFeatureCodes
+            if raw.fixedError != .none {
+                return (.init(
+                    stage: stage, state: .failed, failureCategory: .adapter,
+                    safeFeatureCodes: features
+                ), raw)
+            }
+            if raw.facts.cancellationRequested || raw.facts.finalStateKind == "unknown" {
+                return (.init(
+                    stage: stage, state: .unknown, failureCategory: .unknown,
+                    safeFeatureCodes: features
+                ), raw)
+            }
+            guard raw.facts.terminalBarrierSatisfied,
+                  raw.facts.processTreeObservedAfterTerminalBarrier,
+                  raw.facts.boundedProcessTreeObservationSatisfied,
+                  !raw.facts.truncated,
+                  raw.facts.processTreeState == .quiescent,
+                  raw.facts.activeDescendantCount == 0 else {
+                return (.init(
+                    stage: stage, state: .unknown, failureCategory: .processBarrier,
+                    safeFeatureCodes: features
+                ), raw)
+            }
+            guard raw.facts.finalStateKind == "exited", raw.facts.finalStateValue == 0 else {
+                return (.init(
+                    stage: stage, state: .failed,
+                    failureCategory: Self.guestGitFailureCategory(stage),
+                    safeFeatureCodes: features
+                ), raw)
+            }
+            return (.init(
+                stage: stage, state: .succeeded, failureCategory: nil, safeFeatureCodes: []
+            ), raw)
+        } catch {
+            return (.init(
+                stage: stage, state: .unknown, failureCategory: .unknown, safeFeatureCodes: []
+            ), nil)
+        }
+    }
+
+    private static func guestGitFailureCategory(
+        _ stage: StageDGuestGitProbeStage
+    ) -> StageDGuestGitProbeFailureCategory {
+        switch stage {
+        case .isolatedRoot: return .filesystem
+        case .bareRepository: return .gitRepository
+        case .fixedObject: return .gitObject
+        case .reference: return .gitReference
+        case .indexPack: return .gitIndexPack
+        case .fsckRead: return .gitFsckRead
+        case .nestedDirectory: return .nestedDirectory
+        case .cleanup: return .cleanup
+        }
     }
 
     private static func probeState(

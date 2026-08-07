@@ -448,6 +448,77 @@ final class WujiStageDRecoveryTests: XCTestCase {
         }
     }
 
+    func testGuestGitProbeCleanupUncertainColdRecoveryAndRepeatedInvocationPerformZeroIO() async throws {
+        let prepared = try await StageDTestSupport.prepare()
+        defer { prepared.cleanup() }
+        let task = try await prepared.store.create(
+            session: prepared.base.session,
+            workspace: prepared.base.workspace,
+            ruleSet: prepared.base.ruleSet,
+            write: nil,
+            expectation: .init(
+                kind: .exactClone,
+                relativePath: nil,
+                expectedSHA256: nil,
+                cloneTarget: StageDEnvironmentLock.cloneTarget,
+                cloneRemote: StageDEnvironmentLock.cloneURL,
+                cloneHEAD: StageDEnvironmentLock.acceptedStageCCommit
+            )
+        )
+        let policy = StageDCommandPolicy(
+            workspaceIdentitySHA256: task.workspaceIdentitySHA256,
+            write: nil
+        )
+        let command = StageDTestSupport.cloneCommand(identity: task.workspaceIdentitySHA256)
+        let executor = StageDMockExecutor(
+            store: prepared.store,
+            taskID: task.id,
+            mode: .unknownGuestGitProbe
+        )
+        let first = await StageDCommandAgent(
+            provider: nil,
+            executor: executor,
+            approvalAuthorizer: StageDImmediateApproval(.approve),
+            store: prepared.store,
+            task: task,
+            policy: policy,
+            requireProvider: false
+        ).run(command: command.parsed.original, cwd: ".")
+        XCTAssertEqual(first, .reconciliationRequired)
+        let firstCalls = await executor.callCount()
+        XCTAssertEqual(firstCalls, 1)
+
+        let persisted = try await prepared.store.snapshot(taskID: task.id)
+        let filesystem = try XCTUnwrap(persisted.attempts.last?.result?.cloneFilesystemEvidence)
+        XCTAssertTrue(filesystem.probe.succeeded)
+        XCTAssertTrue(filesystem.guestGitProbe.requiresReconciliation)
+        XCTAssertFalse(filesystem.guestGitProbe.cleanupKnown)
+        XCTAssertFalse(filesystem.guestGitProbe.cleanupVerified)
+        XCTAssertTrue(persisted.attempts.last?.result?.cloneStages
+            .allSatisfy { $0.category == .notRun } == true)
+
+        for _ in 0..<2 {
+            let coldExecutor = StageDMockExecutor(
+                store: prepared.store,
+                taskID: task.id,
+                mode: .success
+            )
+            let coldTask = try await prepared.store.snapshot(taskID: task.id)
+            let cold = await StageDCommandAgent(
+                provider: nil,
+                executor: coldExecutor,
+                approvalAuthorizer: StageDImmediateApproval(.approve),
+                store: prepared.store,
+                task: coldTask,
+                policy: policy,
+                requireProvider: false
+            ).run(command: command.parsed.original, cwd: ".")
+            XCTAssertEqual(cold, .reconciliationRequired)
+            let coldCalls = await coldExecutor.callCount()
+            XCTAssertEqual(coldCalls, 0)
+        }
+    }
+
     func testLegacyCloneResultWithoutFilesystemEvidenceCannotMasqueradeAsNewEvidence() async throws {
         let prepared = try await StageDTestSupport.prepare()
         defer { prepared.cleanup() }
@@ -489,6 +560,25 @@ final class WujiStageDRecoveryTests: XCTestCase {
         let snapshot = try await prepared.store.snapshot(taskID: task.id)
         XCTAssertEqual(snapshot.attempts.count, 1)
         XCTAssertEqual(snapshot.attempts.first?.phase, .intentRecorded)
+    }
+
+    func testLegacyCloneEvidenceWithoutGuestProbeOrFeatureListCannotMasqueradeAsNewEvidence() throws {
+        let command = StageDTestSupport.cloneCommand(identity: String(repeating: "a", count: 64))
+        let result = StageDTestSupport.unknownCloneProbeResult(command: command)
+        let encoded = try JSONEncoder().encode(result)
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        var filesystem = try XCTUnwrap(object["cloneFilesystemEvidence"] as? [String: Any])
+        filesystem.removeValue(forKey: "guestGitProbe")
+        object["cloneFilesystemEvidence"] = filesystem
+        var stages = try XCTUnwrap(object["cloneStages"] as? [[String: Any]])
+        for index in stages.indices {
+            stages[index].removeValue(forKey: "safeFeatureCodes")
+        }
+        object["cloneStages"] = stages
+        let legacy = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        XCTAssertThrowsError(try JSONDecoder().decode(StageDCommandResult.self, from: legacy))
     }
 }
 
@@ -627,7 +717,10 @@ enum StageDTestSupport {
         )
     }
 
-    static func unknownCloneProbeResult(command: StageDAuthorizedCommand) -> StageDCommandResult {
+    static func unknownCloneProbeResult(
+        command: StageDAuthorizedCommand,
+        guest: Bool = false
+    ) -> StageDCommandResult {
         let verification = "stage-d-clone-probe-reconciliation"
         let binding = ProviderDigest.sha256Hex("fixed-clone-root")
         return .init(
@@ -645,7 +738,7 @@ enum StageDTestSupport {
             toolVersions: [:],
             cloneStages: StageDCloneStage.allCases.map { .notRun(stage: $0) },
             cloneFilesystemEvidence: .init(
-                evidenceVersion: 1,
+                evidenceVersion: 2,
                 preflight: .init(
                     evidenceVersion: 1,
                     complete: true,
@@ -672,7 +765,13 @@ enum StageDTestSupport {
                     requiredNameBytes: 40,
                     requiredPathBytes: 69
                 ),
-                probe: .init(
+                probe: guest ? .init(
+                    steps: StageDCloneCapabilityStep.allCases.map {
+                        .init(step: $0, state: .succeeded, subcategory: nil)
+                    },
+                    cleanupKnown: true,
+                    cleanupVerified: true
+                ) : .init(
                     steps: StageDCloneCapabilityStep.allCases.map {
                         .init(
                             step: $0,
@@ -683,7 +782,24 @@ enum StageDTestSupport {
                     cleanupKnown: false,
                     cleanupVerified: false
                 ),
-                residual: .targetAbsent
+                guestGitProbe: guest ? .init(
+                    version: StageDGuestGitProbeFacts.evidenceVersion,
+                    bindingSHA256: StageDGuestGitProbeFacts.fixedBindingSHA256,
+                    usedGuestRealFSPath: true,
+                    steps: StageDGuestGitProbeStage.allCases.map {
+                        .init(
+                            stage: $0,
+                            state: $0 == .isolatedRoot || $0 == .cleanup ? .unknown : .notRun,
+                            failureCategory: $0 == .isolatedRoot ? .unknown
+                                : ($0 == .cleanup ? .cleanup : nil),
+                            safeFeatureCodes: []
+                        )
+                    },
+                    cleanupKnown: false,
+                    cleanupVerified: false
+                ) : .notRun,
+                residual: .targetAbsent,
+                blockingSubcategory: guest ? nil : .createMkdirOpen
             ),
             failureCategory: .cloneTimeoutUnknown
         )
@@ -739,7 +855,7 @@ enum StageDTestSupport {
 actor StageDMockExecutor: StageDCommandExecuting {
     enum Mode {
         case success, failure, unknown, unknownCancelled
-        case unknownCloneProbe, legacyCloneFailure
+        case unknownCloneProbe, unknownGuestGitProbe, legacyCloneFailure
     }
     private let store: StageDTaskStore
     private let taskID: UUID
@@ -779,6 +895,11 @@ actor StageDMockExecutor: StageDCommandExecuting {
             ))
         case .unknownCloneProbe:
             return .unknown(StageDTestSupport.unknownCloneProbeResult(command: command))
+        case .unknownGuestGitProbe:
+            return .unknown(StageDTestSupport.unknownCloneProbeResult(
+                command: command,
+                guest: true
+            ))
         case .legacyCloneFailure:
             return .failed(StageDTestSupport.result(
                 command: command,

@@ -388,6 +388,7 @@ actor StageDTaskStore {
                 guard valid(result), evidence.resultSHA256 == digest(result) else { return false }
                 if let filesystem = result.cloneFilesystemEvidence,
                    !filesystem.probe.requiresReconciliation,
+                   !filesystem.guestGitProbe.requiresReconciliation,
                    !result.cloneStages.contains(where: { $0.category == .timeoutUnknown }),
                    !result.facts.contains(where: {
                        !$0.rootExitObserved || $0.finalStateKind == "unknown" ||
@@ -399,6 +400,7 @@ actor StageDTaskStore {
             if evidence.phase == .failed, let result = evidence.result {
                 guard valid(result),
                       result.cloneFilesystemEvidence?.probe.requiresReconciliation != true,
+                      result.cloneFilesystemEvidence?.guestGitProbe.requiresReconciliation != true,
                       evidence.resultSHA256 == digest(result) else { return false }
             }
         }
@@ -491,11 +493,7 @@ actor StageDTaskStore {
                       && (outcome.entryCount ?? 0) >= 0
                       && outcome.facts.stdoutByteCount >= 0
                       && outcome.facts.stderrByteCount >= 0
-                      && (outcome.category == .filesystemFailure
-                          ? outcome.filesystemSubcategory != nil
-                          : outcome.filesystemSubcategory == nil ||
-                              (outcome.category == .terminalBarrierFailure &&
-                               outcome.capturedProcessCategory == .filesystemFailure))
+                      && validFeatureProjection(outcome)
               }) else { return false }
         let cloneIORan = result.cloneStages.contains {
             $0.processStarted || ($0.category != .notRun && $0.stage != .boundedTreeVerify)
@@ -507,6 +505,9 @@ actor StageDTaskStore {
             guard !cloneIORan,
                   filesystem.probe.failureSubcategory != nil ||
                     filesystem.probe.requiresReconciliation,
+                  result.cloneStages.allSatisfy({ $0.category == .notRun }) else { return false }
+        } else if !filesystem.guestGitProbe.succeeded {
+            guard !cloneIORan,
                   result.cloneStages.allSatisfy({ $0.category == .notRun }) else { return false }
         } else if cloneIORan {
             guard filesystem.preflight.failureSubcategory == nil else { return false }
@@ -527,11 +528,12 @@ actor StageDTaskStore {
     private static func valid(_ evidence: StageDCloneFilesystemEvidence) -> Bool {
         let preflight = evidence.preflight
         let probe = evidence.probe
+        let guest = evidence.guestGitProbe
         let residual = evidence.residual
         let expectedBlockingSubcategory = preflight.failureSubcategory
             ?? probe.failureSubcategory
-        guard evidence.evidenceVersion == 1,
-              preflight.evidenceVersion == evidence.evidenceVersion,
+        guard evidence.evidenceVersion == 2,
+              preflight.evidenceVersion == 1,
               validHash(preflight.hostRootBindingSHA256),
               validHash(preflight.guestRootBindingSHA256),
               preflight.bindingMatches ==
@@ -556,6 +558,7 @@ actor StageDTaskStore {
                   }
               }),
               validProbeSequence(probe.steps),
+              valid(guest),
               residual.entryCount >= 0,
               (!residual.inspectionComplete || !residual.targetExists || residual.targetType != .missing),
               (!residual.inspectionComplete || residual.targetExists || residual.targetType == .missing),
@@ -574,6 +577,69 @@ actor StageDTaskStore {
                 && !residual.gitRefs
         }
         return true
+    }
+
+    private static func valid(_ guest: StageDGuestGitProbeFacts) -> Bool {
+        guard guest.version == StageDGuestGitProbeFacts.evidenceVersion,
+              guest.bindingSHA256 == StageDGuestGitProbeFacts.fixedBindingSHA256,
+              guest.usedGuestRealFSPath,
+              guest.steps.map(\.stage) == StageDGuestGitProbeStage.allCases,
+              (!guest.cleanupVerified || guest.cleanupKnown),
+              guest.steps.allSatisfy({ step in
+                  Set(step.safeFeatureCodes).count == step.safeFeatureCodes.count
+                      && step.safeFeatureCodes.count <= StageDCloneSafeFeatureCode.allCases.count
+                      && ((step.state == .succeeded || step.state == .notRun)
+                          ? step.failureCategory == nil && step.safeFeatureCodes.isEmpty
+                          : step.failureCategory != nil)
+              }) else { return false }
+        if guest == .notRun { return true }
+        guard guest.steps.last?.stage == .cleanup,
+              guest.steps.last?.state != .notRun else { return false }
+        var stopped = false
+        for step in guest.steps.dropLast() {
+            if stopped {
+                guard step.state == .notRun else { return false }
+                continue
+            }
+            switch step.state {
+            case .succeeded: continue
+            case .failed, .unknown: stopped = true
+            case .notRun: return false
+            }
+        }
+        if guest.cleanupVerified {
+            guard guest.cleanupKnown, guest.steps.last?.state == .succeeded else { return false }
+        } else {
+            guard guest.requiresReconciliation else { return false }
+        }
+        return true
+    }
+
+    private static func validFeatureProjection(_ outcome: StageDCloneStageOutcome) -> Bool {
+        guard Set(outcome.safeFeatureCodes).count == outcome.safeFeatureCodes.count,
+              outcome.safeFeatureCodes.count <= StageDCloneSafeFeatureCode.allCases.count else {
+            return false
+        }
+        guard outcome.stage == .cloneProcess else {
+            return outcome.safeFeatureCodes.isEmpty
+        }
+        let projected = StageDClonePipeline.projectedCloneCategory(for: outcome.safeFeatureCodes)
+        let filesystem = outcome.safeFeatureCodes.compactMap(\.filesystemSubcategory).first
+        if outcome.category == .terminalBarrierFailure {
+            return outcome.capturedProcessCategory == projected
+                && outcome.filesystemSubcategory == filesystem
+        }
+        switch outcome.category {
+        case .processNonzero, .resolverNetworkFailure, .remoteAccessFailure,
+                .filesystemFailure, .checkoutWorktreeFailure, .protocolFailure,
+                .mixedSignals, .capabilityUnavailable:
+            return outcome.category == projected && outcome.filesystemSubcategory == filesystem
+        case .notRun, .succeeded, .timeoutUnknown, .adapterError,
+                .targetUnavailable, .valueMismatch, .treeOverflow, .treeEscape,
+                .terminalBarrierFailure:
+            return outcome.safeFeatureCodes.isEmpty
+                && outcome.filesystemSubcategory == nil
+        }
     }
 
     private static func validProbeSequence(_ steps: [StageDCloneCapabilityStepFacts]) -> Bool {

@@ -190,8 +190,13 @@ jobs:
               "testCloneCapabilityProbeEveryStepFailureAndUnknownCleanupRequireCorrectOutcome",
               "testSuccessfulCapabilityProbeDoesNotReplaceRealCloneAndPartialResidualCannotBeReused",
               "testFilesystemSubcategoryMatchingPreservesHigherPriorityCloneCategoriesAndGenericFallback",
+              "testOrderedSafeFeatureCodesPreserveFilesystemAndProtocolWithoutSingleRootClaim",
+              "testSafeFeatureDiagnosticsOmitRawMatcherPathURLUserinfoArgvAndProcessIdentity",
+              "testGuestGitProbeStagesRemainSeparateFromHostProbeAndShortCircuitCloneIO",
               "testCloneProbeReconciliationColdRecoveryAndRepeatedInvocationPerformZeroIO",
+              "testGuestGitProbeCleanupUncertainColdRecoveryAndRepeatedInvocationPerformZeroIO",
               "testLegacyCloneResultWithoutFilesystemEvidenceCannotMasqueradeAsNewEvidence",
+              "testLegacyCloneEvidenceWithoutGuestProbeOrFeatureListCannotMasqueradeAsNewEvidence",
           ]
           missing = [name for name in required if name not in text]
           if missing:
@@ -349,12 +354,11 @@ jobs:
           unexpected = [path for path in changed if not allowed.fullmatch(path)]
           if unexpected:
               raise SystemExit("Stage D scope escaped: " + ", ".join(unexpected))
-          repair_parent = "041cfb18467da08ef25837eb507107e5362e686a"
+          repair_parent = "2c65b58c756052a29c01ff32daefbab71a5a86a9"
           repair_changed = subprocess.check_output(
               ["git", "diff", "--name-only", repair_parent + "..HEAD"], text=True
           ).splitlines()
           repair_allowed = {
-              "Executor/WujiISHAdapter.c", "Executor/WujiISHAdapter.h",
               "Wuji/StageDContracts.swift", "Wuji/StageDTaskStore.swift",
               "Wuji/ISHStageDCommandExecutor.swift",
               "WujiTests/WujiStageDRecoveryTests.swift",
@@ -407,6 +411,8 @@ jobs:
               "processTreeObservationCount", "boundedProcessTreeObservationSatisfied",
               "cloneFilesystemEvidence", "StageDCloneFilesystemPreflightFacts",
               "StageDCloneCapabilityProbeFacts", "StageDCloneResidualFacts",
+              "StageDGuestGitProbeFacts", "StageDGuestGitProbeStage",
+              "StageDCloneSafeFeatureCode", "mixed_signals",
               "permission_readonly", "name_path_limit", "filemode_chmod",
               "create_mkdir_open", "destination_state", "capacity_inode",
               "bind_identity", "generic",
@@ -439,9 +445,24 @@ jobs:
           for required in [
               "validProbeSequence", "cloneFilesystemEvidence",
               "requiresReconciliation", "permitsSuccessfulClone",
+              "validFeatureProjection", "guestGitProbe",
           ]:
               if required not in store + contracts:
                   raise SystemExit("Stage D durable filesystem evidence validation missing: " + required)
+          guest_probe = executor[
+              executor.index("private func guestGitProbe"):
+              executor.index("private static func probeState")
+          ]
+          for required in [
+              ".wuji-stage-d-guest-git-probe-v1", "git", "init", "--bare",
+              "hash-object", "mktree", "commit-tree", "update-ref", "repack",
+              "verify-pack", "fsck", "cat-file", "nested/level/leaf",
+              "cleanupVerified", "usedGuestRealFSPath",
+          ]:
+              if required not in guest_probe + contracts:
+                  raise SystemExit("Stage D guest Git probe boundary missing: " + required)
+          if "wuji_ish_stage_d_clone_capability_probe" in guest_probe:
+              raise SystemExit("Stage D guest Git probe calls the host C capability probe")
           snapshot_start = adapter.index("static int32_t snapshot_active_process_context_tasks")
           snapshot_end = adapter.index("static void observe_process_tree_after_terminal_barrier")
           snapshot = adapter[snapshot_start:snapshot_end]
@@ -643,6 +664,7 @@ jobs:
                   b"STAGE_D_PROCESS_TREE_QUIESCENCE=",
                   b"STAGE_D_CLONE_FILESYSTEM_PREFLIGHT=PASS",
                   b"STAGE_D_CLONE_CAPABILITY_PROBE=PASS",
+                  b"STAGE_D_GUEST_GIT_PROBE=PASS",
                   b"STAGE_D_CLONE_RESIDUAL_AUDIT=PASS",
                   b"STAGE_D_XCRESULT_AUDIT=PASS",
                   b"STAGE_D_REAL_ISH_DEEPSEEK_COMMAND=PASS",
