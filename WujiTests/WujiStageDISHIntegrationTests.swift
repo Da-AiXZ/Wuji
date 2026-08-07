@@ -810,7 +810,8 @@ private func guestGitProbe(
 ) -> StageDGuestGitProbeFacts {
     let stop = StageDGuestGitProbeStage.allCases.firstIndex(of: stage)!
     let cleanupIndex = StageDGuestGitProbeStage.allCases.count - 1
-    let steps = StageDGuestGitProbeStage.allCases.enumerated().map { index, value in
+    let steps: [StageDGuestGitProbeStepFacts] =
+        StageDGuestGitProbeStage.allCases.enumerated().map { index, value in
         let stepState: StageDGuestGitProbeState
         if value == .cleanup {
             stepState = stage == .cleanup ? state : .succeeded
