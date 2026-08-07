@@ -11,6 +11,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define ISH_INTERNAL
@@ -22,6 +23,9 @@
 #include "kernel/signal.h"
 #include "kernel/task.h"
 #include "tools/fakefs.h"
+
+#define WUJI_PROCESS_TREE_MAX_OBSERVATIONS 11U
+#define WUJI_PROCESS_TREE_OBSERVATION_INTERVAL_NS 50000000L
 
 extern const char *uname_hostname_override;
 static const char wuji_hostname_override[] = "wuji";
@@ -46,7 +50,9 @@ struct WujiISHRunResult {
     int32_t final_value;
     uint64_t process_context;
     WujiISHProcessTreeKind process_tree_kind;
+    int32_t initial_active_descendant_count;
     int32_t active_descendant_count;
+    uint32_t process_tree_observation_count;
     bool process_tree_observed_after_terminal_barrier;
     WujiISHFixedErrorKind fixed_error_kind;
     char error[256];
@@ -101,25 +107,57 @@ static void wuji_exit_hook(struct task *task, int code) {
     pthread_mutex_unlock(&g_state_lock);
 }
 
-static void observe_process_tree_after_terminal_barrier(struct WujiISHRunResult *result) {
-    if (result == NULL || result->process_context == 0)
-        return;
+bool wuji_ish_process_tree_task_state_is_active(uint64_t process_context,
+                                                uint64_t task_process_context,
+                                                bool zombie,
+                                                bool exiting) {
+    return process_context != 0 && task_process_context == process_context &&
+        !zombie && !exiting;
+}
+
+static int32_t snapshot_active_process_context_tasks(uint64_t process_context) {
     int32_t active = 0;
-    pthread_mutex_lock(&g_state_lock);
+    lock(&pids_lock);
     for (dword_t pid = 1; pid <= MAX_PID; pid++) {
         struct task *candidate = pid_get_task_zombie(pid);
         if (candidate != NULL && candidate->group != NULL &&
-            candidate->group->fs_context == result->process_context &&
-            !candidate->zombie && !candidate->exiting)
+            wuji_ish_process_tree_task_state_is_active(
+                process_context,
+                candidate->group->fs_context,
+                candidate->zombie,
+                candidate->exiting
+            ))
             active++;
     }
-    result->active_descendant_count = active;
-    result->process_tree_kind = active == 0
+    unlock(&pids_lock);
+    return active;
+}
+
+static void observe_process_tree_after_terminal_barrier(struct WujiISHRunResult *result) {
+    if (result == NULL || result->process_context == 0 || !result->root_exited ||
+        !result->stdout_stream.eof || !result->stderr_stream.eof)
+        return;
+
+    result->process_tree_observed_after_terminal_barrier = true;
+    for (uint32_t index = 0; index < WUJI_PROCESS_TREE_MAX_OBSERVATIONS; index++) {
+        int32_t active = snapshot_active_process_context_tasks(result->process_context);
+        if (index == 0)
+            result->initial_active_descendant_count = active;
+        result->active_descendant_count = active;
+        result->process_tree_observation_count = index + 1;
+        if (active == 0)
+            break;
+        if (index + 1 < WUJI_PROCESS_TREE_MAX_OBSERVATIONS) {
+            struct timespec interval = {
+                .tv_sec = 0,
+                .tv_nsec = WUJI_PROCESS_TREE_OBSERVATION_INTERVAL_NS,
+            };
+            nanosleep(&interval, NULL);
+        }
+    }
+    result->process_tree_kind = result->active_descendant_count == 0
         ? WUJI_ISH_PROCESS_TREE_QUIESCENT
         : WUJI_ISH_PROCESS_TREE_DESCENDANTS_REMAIN;
-    result->process_tree_observed_after_terminal_barrier =
-        result->root_exited && result->stdout_stream.eof && result->stderr_stream.eof;
-    pthread_mutex_unlock(&g_state_lock);
 }
 
 int wuji_ish_prepare(const char *archive_path,
@@ -610,6 +648,14 @@ static const char *fixed_script(WujiISHSelfTestCase test_case) {
             return "yes X | head -c 8192; exit 0";
         case WUJI_ISH_CASE_CANCELLATION:
             return "while :; do :; done";
+        case WUJI_ISH_CASE_PROCESS_TREE_TRANSIENT_NONZERO:
+            return "printf WUJI_TREE_NONZERO >&2; "
+                "(exec >/dev/null 2>&1; sleep 0.2) & exit 128";
+        case WUJI_ISH_CASE_PROCESS_TREE_PERSISTENT_NONZERO:
+            return "printf WUJI_TREE_NONZERO >&2; "
+                "(exec >/dev/null 2>&1; sleep 2) & exit 128";
+        case WUJI_ISH_CASE_PROCESS_TREE_CONTEXT_CLEAN:
+            return "exit 0";
     }
     return NULL;
 }
@@ -774,8 +820,10 @@ static WujiISHRunResult *run_arguments_in_directory(const char *executable,
         if (context == 0)
             context = g_next_process_context++;
         result->process_context = context;
-        guest_task->group->fs_context = context;
         pthread_mutex_unlock(&g_state_lock);
+        lock(&pids_lock);
+        guest_task->group->fs_context = context;
+        unlock(&pids_lock);
     }
 
     if (guest_cwd != NULL) {
@@ -911,7 +959,13 @@ WujiISHRunResult *wuji_ish_run_self_test(WujiISHSelfTestCase test_case,
         !append_argument(arguments, sizeof(arguments), &offset, "-c") ||
         !append_argument(arguments, sizeof(arguments), &offset, script))
         return NULL;
-    return run_arguments("/bin/sh", 3, arguments, output_limit);
+    bool observe_process_tree =
+        test_case == WUJI_ISH_CASE_PROCESS_TREE_TRANSIENT_NONZERO ||
+        test_case == WUJI_ISH_CASE_PROCESS_TREE_PERSISTENT_NONZERO ||
+        test_case == WUJI_ISH_CASE_PROCESS_TREE_CONTEXT_CLEAN;
+    return run_arguments_in_directory(
+        "/bin/sh", 3, arguments, output_limit, NULL, observe_process_tree
+    );
 }
 
 static WujiISHRunResult *run_read_only_operation(WujiISHReadOnlyOperation operation,
@@ -1382,6 +1436,12 @@ WujiISHProcessTreeKind wuji_ish_result_process_tree_kind(const WujiISHRunResult 
 }
 int32_t wuji_ish_result_active_descendant_count(const WujiISHRunResult *result) {
     return result->active_descendant_count;
+}
+int32_t wuji_ish_result_initial_active_descendant_count(const WujiISHRunResult *result) {
+    return result->initial_active_descendant_count;
+}
+uint32_t wuji_ish_result_process_tree_observation_count(const WujiISHRunResult *result) {
+    return result->process_tree_observation_count;
 }
 bool wuji_ish_result_process_tree_observed_after_terminal_barrier(const WujiISHRunResult *result) {
     return result->process_tree_observed_after_terminal_barrier;

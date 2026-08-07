@@ -29,6 +29,40 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
             workspace: prepared.base.workspace,
             cloneRootURL: cloneRootURL
         )
+
+        let transientTree = try processTreeEvidence(
+            WUJI_ISH_CASE_PROCESS_TREE_TRANSIENT_NONZERO
+        )
+        XCTAssertTrue(transientTree.rootExitObserved)
+        XCTAssertTrue(transientTree.stdoutEOFObserved)
+        XCTAssertTrue(transientTree.stderrEOFObserved)
+        XCTAssertEqual(transientTree.finalValue, 128)
+        XCTAssertGreaterThan(transientTree.initialActiveDescendantCount, 0)
+        XCTAssertEqual(transientTree.finalActiveDescendantCount, 0)
+        XCTAssertGreaterThanOrEqual(transientTree.observationCount, 2)
+        XCTAssertLessThanOrEqual(transientTree.observationCount, 11)
+        XCTAssertEqual(transientTree.processTreeState, WUJI_ISH_PROCESS_TREE_QUIESCENT)
+
+        let persistentTree = try processTreeEvidence(
+            WUJI_ISH_CASE_PROCESS_TREE_PERSISTENT_NONZERO
+        )
+        XCTAssertEqual(persistentTree.finalValue, 128)
+        XCTAssertEqual(persistentTree.stderrSHA256, transientTree.stderrSHA256)
+        XCTAssertGreaterThan(persistentTree.initialActiveDescendantCount, 0)
+        XCTAssertGreaterThan(persistentTree.finalActiveDescendantCount, 0)
+        XCTAssertEqual(persistentTree.observationCount, 11)
+        XCTAssertEqual(persistentTree.processTreeState, WUJI_ISH_PROCESS_TREE_DESCENDANTS_REMAIN)
+
+        let cleanContext = try processTreeEvidence(WUJI_ISH_CASE_PROCESS_TREE_CONTEXT_CLEAN)
+        XCTAssertEqual(cleanContext.initialActiveDescendantCount, 0)
+        XCTAssertEqual(cleanContext.finalActiveDescendantCount, 0)
+        XCTAssertEqual(cleanContext.observationCount, 1)
+        XCTAssertEqual(cleanContext.processTreeState, WUJI_ISH_PROCESS_TREE_QUIESCENT)
+        print(
+            "STAGE_D_PROCESS_TREE_QUIESCENCE=initial=\(transientTree.initialActiveDescendantCount)," +
+            "final=\(transientTree.finalActiveDescendantCount)," +
+            "observations=\(transientTree.observationCount),bounded=1"
+        )
         let forged = StageDAuthorizedCommand(
             parsed: pwd.parsed,
             risk: .installation,
@@ -260,6 +294,52 @@ final class WujiStageDISHIntegrationTests: XCTestCase {
         }
     }
 
+    func testCPIDTableTaskStateFilterExcludesZombieExitingAndMismatchedContext() {
+        XCTAssertTrue(wuji_ish_process_tree_task_state_is_active(7, 7, false, false))
+        XCTAssertFalse(wuji_ish_process_tree_task_state_is_active(7, 7, true, false))
+        XCTAssertFalse(wuji_ish_process_tree_task_state_is_active(7, 7, false, true))
+        XCTAssertFalse(wuji_ish_process_tree_task_state_is_active(7, 8, false, false))
+        XCTAssertFalse(wuji_ish_process_tree_task_state_is_active(0, 0, false, false))
+    }
+
+    func testExit128AndDescendantBarrierPreservesCapturedProcessCategoryAndShortCircuits() async throws {
+        let command = StageDTestSupport.cloneCommand(identity: String(repeating: "a", count: 64))
+        let quiescent = StageDClonePipelineScript(
+            failureStage: .cloneProcess,
+            category: .processNonzero
+        )
+        let quiescentOutcome = await StageDClonePipeline.run(
+            command: command,
+            limits: .production,
+            step: { await quiescent.run($0) },
+            inspectTree: { await quiescent.inspectTree() }
+        )
+        let quiescentStage = try XCTUnwrap(quiescentOutcome.stages.first)
+        XCTAssertEqual(quiescentStage.category, .processNonzero)
+
+        let descendant = StageDClonePipelineScript(
+            failureStage: .cloneProcess,
+            category: .terminalBarrierFailure
+        )
+        let descendantOutcome = await StageDClonePipeline.run(
+            command: command,
+            limits: .production,
+            step: { await descendant.run($0) },
+            inspectTree: { await descendant.inspectTree() }
+        )
+        let descendantStage = try XCTUnwrap(descendantOutcome.stages.first)
+        XCTAssertEqual(descendantStage.category, .terminalBarrierFailure)
+        XCTAssertEqual(descendantStage.capturedProcessCategory, quiescentStage.category)
+        XCTAssertEqual(descendantStage.facts.finalStateValue, 128)
+        XCTAssertEqual(descendantOutcome.failureCategory, .eofTruncationProcessTreeFailure)
+        XCTAssertEqual(
+            descendantOutcome.stages.dropFirst().map(\.category),
+            Array(repeating: .notRun, count: StageDCloneStage.allCases.count - 1)
+        )
+        let descendantCalls = await descendant.calls()
+        XCTAssertEqual(descendantCalls, [.cloneProcess])
+    }
+
     func testCrossWorkspaceWaiterCannotStartWatchdogOrCancelActiveExecution() async throws {
         let gate = StageDGlobalExecutionGate()
         let first = UUID(), second = UUID()
@@ -311,6 +391,10 @@ private actor StageDClonePipelineScript {
                     .replacingFinalState(kind: "unknown", value: 0)
             case .adapterError:
                 return .failed(nil, fixedError: .guestExec)
+            case .terminalBarrierFailure:
+                facts = StageDTestSupport.facts()
+                    .replacingFinalState(kind: "exited", value: 128)
+                    .replacingProcessTree(state: .descendantsRemain, descendants: 1)
             default:
                 facts = StageDTestSupport.facts()
             }
@@ -340,9 +424,15 @@ private actor StageDClonePipelineScript {
                 return .unknown(.init(facts: facts, stdout: "", stderr: ""), fixedError: .none)
             case .adapterError:
                 return .failed(nil, fixedError: .guestExec)
+            case .terminalBarrierFailure:
+                return .succeeded(.init(
+                    facts: facts,
+                    stdout: "",
+                    stderr: "fixed generic clone failure"
+                ))
             case .valueMismatch:
                 return .succeeded(.init(facts: facts, stdout: "wrong\n", stderr: ""))
-            case .treeOverflow, .treeEscape, .notRun, .succeeded, .terminalBarrierFailure:
+            case .treeOverflow, .treeEscape, .notRun, .succeeded:
                 break
             }
         }
@@ -396,4 +486,60 @@ private extension StageDProcessFacts {
             processTreeObservedAfterTerminalBarrier: processTreeObservedAfterTerminalBarrier
         )
     }
+
+    func replacingProcessTree(
+        state: StageDProcessTreeState,
+        descendants: Int
+    ) -> StageDProcessFacts {
+        .init(
+            rootExitObserved: rootExitObserved,
+            finalStateKind: finalStateKind,
+            finalStateValue: finalStateValue,
+            stdoutEOFObserved: stdoutEOFObserved,
+            stderrEOFObserved: stderrEOFObserved,
+            stdoutByteCount: stdoutByteCount,
+            stderrByteCount: stderrByteCount,
+            stdoutSHA256: stdoutSHA256,
+            stderrSHA256: stderrSHA256,
+            truncated: truncated,
+            cancellationRequested: cancellationRequested,
+            cancelDelivery: cancelDelivery,
+            processTreeState: state,
+            activeDescendantCount: descendants,
+            processTreeObservedAfterTerminalBarrier: processTreeObservedAfterTerminalBarrier
+        )
+    }
+}
+
+private struct StageDCProcessTreeEvidence {
+    let rootExitObserved: Bool
+    let stdoutEOFObserved: Bool
+    let stderrEOFObserved: Bool
+    let finalValue: Int32
+    let stderrSHA256: String
+    let initialActiveDescendantCount: Int32
+    let finalActiveDescendantCount: Int32
+    let observationCount: UInt32
+    let processTreeState: WujiISHProcessTreeKind
+}
+
+private func processTreeEvidence(
+    _ testCase: WujiISHSelfTestCase
+) throws -> StageDCProcessTreeEvidence {
+    let raw = try XCTUnwrap(wuji_ish_run_self_test(testCase, 4_096))
+    defer { wuji_ish_result_free(raw) }
+    let stderrCount = wuji_ish_result_stderr_length(raw)
+    let stderr = Data(bytes: wuji_ish_result_stderr(raw), count: stderrCount)
+    return .init(
+        rootExitObserved: wuji_ish_result_root_exited(raw),
+        stdoutEOFObserved: wuji_ish_result_stdout_eof(raw),
+        stderrEOFObserved: wuji_ish_result_stderr_eof(raw),
+        finalValue: wuji_ish_result_final_value(raw),
+        stderrSHA256: ProviderDigest.sha256Hex(stderr),
+        initialActiveDescendantCount:
+            wuji_ish_result_initial_active_descendant_count(raw),
+        finalActiveDescendantCount: wuji_ish_result_active_descendant_count(raw),
+        observationCount: wuji_ish_result_process_tree_observation_count(raw),
+        processTreeState: wuji_ish_result_process_tree_kind(raw)
+    )
 }

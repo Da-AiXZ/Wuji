@@ -130,11 +130,21 @@ enum StageDClonePipeline {
                 }
                 guard raw.facts.terminalBarrierSatisfied,
                       raw.facts.processTreeObservedAfterTerminalBarrier,
+                      raw.facts.boundedProcessTreeObservationSatisfied,
                       !raw.facts.truncated,
                       raw.facts.processTreeState == .quiescent,
                       raw.facts.activeDescendantCount == 0 else {
+                    let capturedProcessCategory: StageDCloneStageCategory?
+                    if raw.facts.finalStateKind == "exited", raw.facts.finalStateValue != 0 {
+                        capturedProcessCategory = nonzeroClassification(stage: stage, raw: raw).0
+                    } else {
+                        capturedProcessCategory = nil
+                    }
                     outcomes.append(stageOutcome(
-                        stage: stage, category: .terminalBarrierFailure, raw: raw
+                        stage: stage,
+                        category: .terminalBarrierFailure,
+                        raw: raw,
+                        capturedProcessCategory: capturedProcessCategory
                     ))
                     return completed(failure: .eofTruncationProcessTreeFailure)
                 }
@@ -214,6 +224,7 @@ enum StageDClonePipeline {
         category: StageDCloneStageCategory,
         raw: StageDRawStep?,
         fixedError: StageDAdapterErrorCategory = .none,
+        capturedProcessCategory: StageDCloneStageCategory? = nil,
         observedValueSHA256: String? = nil
     ) -> StageDCloneStageOutcome {
         .init(
@@ -222,6 +233,7 @@ enum StageDClonePipeline {
             processStarted: raw != nil,
             facts: raw?.facts ?? .notRun,
             adapterError: fixedError == .none ? raw?.fixedError ?? .none : fixedError,
+            capturedProcessCategory: capturedProcessCategory,
             observedValueSHA256: observedValueSHA256,
             entryCount: nil,
             byteCount: nil
@@ -841,7 +853,11 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
             cancellationRequested: timeoutRequested || wuji_ish_result_cancellation_requested(raw),
             cancelDelivery: cancelDelivery(raw),
             processTreeState: treeState,
+            initialActiveDescendantCount:
+                Int(wuji_ish_result_initial_active_descendant_count(raw)),
             activeDescendantCount: Int(wuji_ish_result_active_descendant_count(raw)),
+            processTreeObservationCount:
+                Int(wuji_ish_result_process_tree_observation_count(raw)),
             processTreeObservedAfterTerminalBarrier:
                 wuji_ish_result_process_tree_observed_after_terminal_barrier(raw)
         )
@@ -932,6 +948,7 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
         result.facts.contains(where: {
             !$0.rootExitObserved || $0.finalStateKind == "unknown" || $0.cancellationRequested
                 || $0.processTreeState != .quiescent
+                || !$0.boundedProcessTreeObservationSatisfied
                 || !$0.processTreeObservedAfterTerminalBarrier
         }) ? .unknown(result) : .failed(result)
     }

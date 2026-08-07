@@ -10,6 +10,9 @@ typedef enum {
     WUJI_ISH_CASE_NONZERO = 1,
     WUJI_ISH_CASE_TRUNCATION = 2,
     WUJI_ISH_CASE_CANCELLATION = 3,
+    WUJI_ISH_CASE_PROCESS_TREE_TRANSIENT_NONZERO = 4,
+    WUJI_ISH_CASE_PROCESS_TREE_PERSISTENT_NONZERO = 5,
+    WUJI_ISH_CASE_PROCESS_TREE_CONTEXT_CLEAN = 6,
 } WujiISHSelfTestCase;
 
 typedef enum {
@@ -157,7 +160,13 @@ WujiISHFinalKind wuji_ish_result_final_kind(const WujiISHRunResult *result);
 int32_t wuji_ish_result_final_value(const WujiISHRunResult *result);
 WujiISHProcessTreeKind wuji_ish_result_process_tree_kind(const WujiISHRunResult *result);
 int32_t wuji_ish_result_active_descendant_count(const WujiISHRunResult *result);
+int32_t wuji_ish_result_initial_active_descendant_count(const WujiISHRunResult *result);
+uint32_t wuji_ish_result_process_tree_observation_count(const WujiISHRunResult *result);
 bool wuji_ish_result_process_tree_observed_after_terminal_barrier(const WujiISHRunResult *result);
+bool wuji_ish_process_tree_task_state_is_active(uint64_t process_context,
+                                                uint64_t task_process_context,
+                                                bool zombie,
+                                                bool exiting);
 WujiISHFixedErrorKind wuji_ish_result_fixed_error_kind(const WujiISHRunResult *result);
 const char *wuji_ish_result_error(const WujiISHRunResult *result);
 void wuji_ish_result_free(WujiISHRunResult *result);

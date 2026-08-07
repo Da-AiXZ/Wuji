@@ -219,11 +219,59 @@ struct StageDProcessFacts: Codable, Equatable, Sendable {
     let cancellationRequested: Bool
     let cancelDelivery: StageDCancelDelivery
     let processTreeState: StageDProcessTreeState
+    let initialActiveDescendantCount: Int?
     let activeDescendantCount: Int
+    let processTreeObservationCount: Int?
     let processTreeObservedAfterTerminalBarrier: Bool
+
+    init(
+        rootExitObserved: Bool,
+        finalStateKind: String,
+        finalStateValue: Int32,
+        stdoutEOFObserved: Bool,
+        stderrEOFObserved: Bool,
+        stdoutByteCount: Int,
+        stderrByteCount: Int,
+        stdoutSHA256: String,
+        stderrSHA256: String,
+        truncated: Bool,
+        cancellationRequested: Bool,
+        cancelDelivery: StageDCancelDelivery,
+        processTreeState: StageDProcessTreeState,
+        initialActiveDescendantCount: Int? = nil,
+        activeDescendantCount: Int,
+        processTreeObservationCount: Int? = nil,
+        processTreeObservedAfterTerminalBarrier: Bool
+    ) {
+        self.rootExitObserved = rootExitObserved
+        self.finalStateKind = finalStateKind
+        self.finalStateValue = finalStateValue
+        self.stdoutEOFObserved = stdoutEOFObserved
+        self.stderrEOFObserved = stderrEOFObserved
+        self.stdoutByteCount = stdoutByteCount
+        self.stderrByteCount = stderrByteCount
+        self.stdoutSHA256 = stdoutSHA256
+        self.stderrSHA256 = stderrSHA256
+        self.truncated = truncated
+        self.cancellationRequested = cancellationRequested
+        self.cancelDelivery = cancelDelivery
+        self.processTreeState = processTreeState
+        self.initialActiveDescendantCount = initialActiveDescendantCount
+        self.activeDescendantCount = activeDescendantCount
+        self.processTreeObservationCount = processTreeObservationCount
+        self.processTreeObservedAfterTerminalBarrier = processTreeObservedAfterTerminalBarrier
+    }
 
     var terminalBarrierSatisfied: Bool {
         rootExitObserved && stdoutEOFObserved && stderrEOFObserved
+    }
+
+    var boundedProcessTreeObservationSatisfied: Bool {
+        guard let initialActiveDescendantCount, let processTreeObservationCount else {
+            return true
+        }
+        return processTreeObservationCount >= 1 &&
+            (initialActiveDescendantCount == 0 || processTreeObservationCount >= 2)
     }
 
     var verifiedSuccessBarrier: Bool {
@@ -235,6 +283,7 @@ struct StageDProcessFacts: Codable, Equatable, Sendable {
             && cancelDelivery == .notRequested
             && processTreeState == .quiescent
             && activeDescendantCount == 0
+            && boundedProcessTreeObservationSatisfied
             && processTreeObservedAfterTerminalBarrier
     }
 }
@@ -303,9 +352,32 @@ struct StageDCloneStageOutcome: Codable, Equatable, Sendable {
     let processStarted: Bool
     let facts: StageDProcessFacts
     let adapterError: StageDAdapterErrorCategory
+    let capturedProcessCategory: StageDCloneStageCategory?
     let observedValueSHA256: String?
     let entryCount: Int?
     let byteCount: UInt64?
+
+    init(
+        stage: StageDCloneStage,
+        category: StageDCloneStageCategory,
+        processStarted: Bool,
+        facts: StageDProcessFacts,
+        adapterError: StageDAdapterErrorCategory,
+        capturedProcessCategory: StageDCloneStageCategory? = nil,
+        observedValueSHA256: String?,
+        entryCount: Int?,
+        byteCount: UInt64?
+    ) {
+        self.stage = stage
+        self.category = category
+        self.processStarted = processStarted
+        self.facts = facts
+        self.adapterError = adapterError
+        self.capturedProcessCategory = capturedProcessCategory
+        self.observedValueSHA256 = observedValueSHA256
+        self.entryCount = entryCount
+        self.byteCount = byteCount
+    }
 
     static func notRun(stage: StageDCloneStage) -> StageDCloneStageOutcome {
         .init(
@@ -402,7 +474,9 @@ struct StageDSafeProcessSummary: Codable, Equatable, Sendable {
     let cancellationRequested: Bool
     let cancelDelivery: StageDCancelDelivery
     let processTreeState: StageDProcessTreeState
+    let initialActiveDescendantCount: Int?
     let activeDescendantCount: Int
+    let processTreeObservationCount: Int?
     let processTreeObservedAfterTerminalBarrier: Bool
 
     init(_ facts: StageDProcessFacts) {
@@ -419,7 +493,9 @@ struct StageDSafeProcessSummary: Codable, Equatable, Sendable {
         cancellationRequested = facts.cancellationRequested
         cancelDelivery = facts.cancelDelivery
         processTreeState = facts.processTreeState
+        initialActiveDescendantCount = facts.initialActiveDescendantCount
         activeDescendantCount = facts.activeDescendantCount
+        processTreeObservationCount = facts.processTreeObservationCount
         processTreeObservedAfterTerminalBarrier = facts.processTreeObservedAfterTerminalBarrier
     }
 }
@@ -430,6 +506,7 @@ struct StageDSafeCloneStageSummary: Codable, Equatable, Sendable {
     let processStarted: Bool
     let facts: StageDSafeProcessSummary
     let adapterError: StageDAdapterErrorCategory
+    let capturedProcessCategory: StageDCloneStageCategory?
     let observedValueSHA256: String?
     let entryCount: Int?
     let byteCount: UInt64?
@@ -440,6 +517,7 @@ struct StageDSafeCloneStageSummary: Codable, Equatable, Sendable {
         processStarted = outcome.processStarted
         facts = StageDSafeProcessSummary(outcome.facts)
         adapterError = outcome.adapterError
+        capturedProcessCategory = outcome.capturedProcessCategory
         observedValueSHA256 = outcome.observedValueSHA256
         entryCount = outcome.entryCount
         byteCount = outcome.byteCount

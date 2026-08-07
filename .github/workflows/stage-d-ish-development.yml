@@ -183,6 +183,8 @@ jobs:
               "testCodeOwnedCompletionRejectsWrongCloneHeadAndIncompleteProcessFacts",
               "testRealARM64ISHStageDSystemResolverCommandMatrixInstallVersionsCloneWriteAndProcessTruth",
               "testClonePipelineShortCircuitsEveryFailureAndUnknownStageWithSafeStructuredOutcome",
+              "testCPIDTableTaskStateFilterExcludesZombieExitingAndMismatchedContext",
+              "testExit128AndDescendantBarrierPreservesCapturedProcessCategoryAndShortCircuits",
               "testCrossWorkspaceWaiterCannotStartWatchdogOrCancelActiveExecution",
           ]
           missing = [name for name in required if name not in text]
@@ -397,9 +399,42 @@ jobs:
               "bounded_tree_verify", "safeDiagnosticSummaryData", "StageDGlobalExecutionGate",
               "processTreeObservedAfterTerminalBarrier", "providerDecisionSHA256",
               "expectedInputSHA256", "revalidates(command, using: policy)",
+              "capturedProcessCategory", "initialActiveDescendantCount",
+              "processTreeObservationCount", "boundedProcessTreeObservationSatisfied",
           ]:
               if required not in contracts + executor + agent:
                   raise SystemExit("Stage D post-03 contract missing: " + required)
+          snapshot_start = adapter.index("static int32_t snapshot_active_process_context_tasks")
+          snapshot_end = adapter.index("static void observe_process_tree_after_terminal_barrier")
+          snapshot = adapter[snapshot_start:snapshot_end]
+          if "lock(&pids_lock)" not in snapshot or "unlock(&pids_lock)" not in snapshot:
+              raise SystemExit("Stage D PID-table snapshot is not protected by pids_lock")
+          if "pid_get_task_zombie" not in snapshot or "pthread_mutex_lock(&g_state_lock)" in snapshot:
+              raise SystemExit("Stage D PID-table snapshot violates fixed iSH lock ownership/order")
+          if "nanosleep" in snapshot:
+              raise SystemExit("Stage D PID-table snapshot waits while pids_lock is held")
+          context_assignment = adapter[adapter.index("if (observe_process_tree) {"):adapter.index("if (guest_cwd != NULL)")]
+          if "unlock(&pids_lock)" not in context_assignment or \
+             context_assignment.index("pthread_mutex_unlock(&g_state_lock)") > context_assignment.index("lock(&pids_lock)"):
+              raise SystemExit("Stage D fs_context publication violates non-nested pids_lock ownership")
+          observation_start = snapshot_end
+          observation_end = adapter.index("int wuji_ish_prepare")
+          observation = adapter[observation_start:observation_end]
+          for required in [
+              "WUJI_PROCESS_TREE_MAX_OBSERVATIONS", "WUJI_PROCESS_TREE_OBSERVATION_INTERVAL_NS",
+              "nanosleep", "process_tree_observation_count",
+              "initial_active_descendant_count",
+          ]:
+              if required not in observation and required not in adapter:
+                  raise SystemExit("Stage D bounded process-tree observation missing: " + required)
+          if "#define WUJI_PROCESS_TREE_MAX_OBSERVATIONS 11U" not in adapter or \
+             "#define WUJI_PROCESS_TREE_OBSERVATION_INTERVAL_NS 50000000L" not in adapter:
+              raise SystemExit("Stage D process-tree observation bound changed")
+          fixed_exit = pathlib.Path("ThirdParty/ish/kernel/exit.c").read_text()
+          hook = fixed_exit.index("exit_hook(current, status)")
+          if fixed_exit.rfind("lock(&pids_lock);", 0, hook) < 0 or \
+             fixed_exit.index("unlock(&pids_lock);", hook) < hook:
+              raise SystemExit("fixed iSH exit-hook pids_lock ownership changed")
           project = pathlib.Path("Wuji.xcodeproj/project.pbxproj").read_text()
           file_refs = re.findall(
               r'/\* libresolv\.tbd \*/ = \{isa = PBXFileReference; '
@@ -566,6 +601,7 @@ jobs:
                   b"STAGE_D_CANONICAL_PROVIDER_AUDIT=PASS",
                   b"STAGE_D_AUTHORIZATION_REVALIDATION_AUDIT=PASS",
                   b"STAGE_D_PROCESS_ISOLATION_AUDIT=PASS",
+                  b"STAGE_D_PROCESS_TREE_QUIESCENCE=",
                   b"STAGE_D_XCRESULT_AUDIT=PASS",
                   b"STAGE_D_REAL_ISH_DEEPSEEK_COMMAND=PASS",
                   b"STAGE_D_DURABLE_INTENT_AUDIT=PASS",
