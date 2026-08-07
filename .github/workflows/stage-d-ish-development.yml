@@ -423,7 +423,8 @@ jobs:
           for required in [
               "WUJI_PROCESS_TREE_MAX_OBSERVATIONS", "WUJI_PROCESS_TREE_OBSERVATION_INTERVAL_NS",
               "nanosleep", "process_tree_observation_count",
-              "initial_active_descendant_count",
+              "initial_active_descendant_count", "make_process_tree_test_task",
+              "task_create_", "task_destroy",
           ]:
               if required not in observation and required not in adapter:
                   raise SystemExit("Stage D bounded process-tree observation missing: " + required)

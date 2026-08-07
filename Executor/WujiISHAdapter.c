@@ -649,13 +649,9 @@ static const char *fixed_script(WujiISHSelfTestCase test_case) {
         case WUJI_ISH_CASE_CANCELLATION:
             return "while :; do :; done";
         case WUJI_ISH_CASE_PROCESS_TREE_TRANSIENT_NONZERO:
-            return "printf WUJI_TREE_NONZERO >&2; "
-                "(exec >/dev/null 2>&1; sleep 0.2) & exec /bin/sh -c 'exit 128'";
         case WUJI_ISH_CASE_PROCESS_TREE_PERSISTENT_NONZERO:
-            return "printf WUJI_TREE_NONZERO >&2; "
-                "(exec >/dev/null 2>&1; sleep 2) & exec /bin/sh -c 'exit 128'";
         case WUJI_ISH_CASE_PROCESS_TREE_CONTEXT_CLEAN:
-            return "exit 0";
+            return NULL;
     }
     return NULL;
 }
@@ -948,8 +944,129 @@ static WujiISHRunResult *run_arguments(const char *executable,
     );
 }
 
+struct process_tree_test_task {
+    struct task *task;
+    struct tgroup *group;
+};
+
+struct process_tree_test_release {
+    struct task *task;
+};
+
+static bool make_process_tree_test_task(uint64_t process_context,
+                                        bool zombie,
+                                        bool exiting,
+                                        struct process_tree_test_task *test_task) {
+    struct tgroup *group = calloc(1, sizeof(*group));
+    if (group == NULL)
+        return false;
+    struct task *task = task_create_(g_init_task);
+    if (task == NULL) {
+        free(group);
+        return false;
+    }
+    group->fs_context = process_context;
+    lock(&pids_lock);
+    task->group = group;
+    task->zombie = zombie;
+    task->exiting = exiting;
+    unlock(&pids_lock);
+    test_task->task = task;
+    test_task->group = group;
+    return true;
+}
+
+static void destroy_process_tree_test_task(struct process_tree_test_task *test_task) {
+    if (test_task->task != NULL) {
+        lock(&pids_lock);
+        struct task *listed = pid_get_task_zombie(test_task->task->pid);
+        if (listed == test_task->task)
+            task_destroy(test_task->task);
+        unlock(&pids_lock);
+    }
+    free(test_task->group);
+    *test_task = (struct process_tree_test_task) {};
+}
+
+static void *release_process_tree_test_task(void *context) {
+    struct process_tree_test_release *release = context;
+    struct timespec delay = {.tv_sec = 0, .tv_nsec = 200000000L};
+    nanosleep(&delay, NULL);
+    lock(&pids_lock);
+    struct task *listed = pid_get_task_zombie(release->task->pid);
+    if (listed == release->task)
+        listed->exiting = true;
+    unlock(&pids_lock);
+    return NULL;
+}
+
+static WujiISHRunResult *run_process_tree_self_test(WujiISHSelfTestCase test_case,
+                                                     size_t output_limit) {
+    struct WujiISHRunResult *result = make_result(output_limit);
+    if (result == NULL)
+        return NULL;
+    if (!g_booted || g_init_task == NULL) {
+        set_run_error(result, WUJI_ISH_FIXED_ERROR_NOT_PREPARED, "executor is not prepared");
+        return result;
+    }
+    static const char marker[] = "WUJI_TREE_NONZERO";
+    if (output_limit < sizeof(marker) - 1) {
+        set_run_error(result, WUJI_ISH_FIXED_ERROR_INVALID_INPUT, "output limit unavailable");
+        return result;
+    }
+
+    memcpy(result->stderr_stream.bytes, marker, sizeof(marker));
+    result->stderr_stream.length = sizeof(marker) - 1;
+    result->root_exited = true;
+    result->raw_status = 128 << 8;
+    result->final_kind = WUJI_ISH_FINAL_EXITED;
+    result->final_value = 128;
+    result->stdout_stream.eof = true;
+    result->stderr_stream.eof = true;
+
+    const uint64_t process_context = UINT64_MAX - 1024;
+    uint64_t task_process_context = process_context;
+    if (test_case == WUJI_ISH_CASE_PROCESS_TREE_CONTEXT_CLEAN)
+        task_process_context++;
+    result->process_context = process_context;
+
+    pthread_mutex_lock(&g_run_lock);
+    struct process_tree_test_task test_task = {0};
+    if (!make_process_tree_test_task(task_process_context, false, false, &test_task)) {
+        set_run_error(result, WUJI_ISH_FIXED_ERROR_INTERNAL, "process-tree test task unavailable");
+        goto finish;
+    }
+
+    pthread_t release_thread;
+    bool release_started = false;
+    struct process_tree_test_release release = {.task = test_task.task};
+    if (test_case == WUJI_ISH_CASE_PROCESS_TREE_TRANSIENT_NONZERO) {
+        if (pthread_create(
+                &release_thread, NULL, release_process_tree_test_task, &release
+            ) != 0) {
+            set_run_error(result, WUJI_ISH_FIXED_ERROR_INTERNAL,
+                          "process-tree release unavailable");
+            goto finish;
+        }
+        release_started = true;
+    }
+
+    observe_process_tree_after_terminal_barrier(result);
+    if (release_started)
+        pthread_join(release_thread, NULL);
+
+finish:
+    destroy_process_tree_test_task(&test_task);
+    pthread_mutex_unlock(&g_run_lock);
+    return result;
+}
+
 WujiISHRunResult *wuji_ish_run_self_test(WujiISHSelfTestCase test_case,
                                          size_t output_limit) {
+    if (test_case == WUJI_ISH_CASE_PROCESS_TREE_TRANSIENT_NONZERO ||
+        test_case == WUJI_ISH_CASE_PROCESS_TREE_PERSISTENT_NONZERO ||
+        test_case == WUJI_ISH_CASE_PROCESS_TREE_CONTEXT_CLEAN)
+        return run_process_tree_self_test(test_case, output_limit);
     const char *script = fixed_script(test_case);
     if (script == NULL)
         return NULL;
@@ -959,12 +1076,8 @@ WujiISHRunResult *wuji_ish_run_self_test(WujiISHSelfTestCase test_case,
         !append_argument(arguments, sizeof(arguments), &offset, "-c") ||
         !append_argument(arguments, sizeof(arguments), &offset, script))
         return NULL;
-    bool observe_process_tree =
-        test_case == WUJI_ISH_CASE_PROCESS_TREE_TRANSIENT_NONZERO ||
-        test_case == WUJI_ISH_CASE_PROCESS_TREE_PERSISTENT_NONZERO ||
-        test_case == WUJI_ISH_CASE_PROCESS_TREE_CONTEXT_CLEAN;
     return run_arguments_in_directory(
-        "/bin/sh", 3, arguments, output_limit, NULL, observe_process_tree
+        "/bin/sh", 3, arguments, output_limit, NULL, false
     );
 }
 
