@@ -455,14 +455,16 @@ jobs:
           ]
           for required in [
               ".wuji-stage-d-guest-git-probe-v1", "git", "init", "--bare",
-              "hash-object", "mktree", "commit-tree", "update-ref", "repack",
-              "verify-pack", "fsck", "cat-file", "nested/level/leaf",
+              "hash-object", "update-ref", "repack", "count-objects",
+              "fsck", "cat-file", "nested/level/leaf.git", "/etc/alpine-release",
               "cleanupVerified", "usedGuestRealFSPath",
           ]:
               if required not in guest_probe + contracts:
                   raise SystemExit("Stage D guest Git probe boundary missing: " + required)
           if "wuji_ish_stage_d_clone_capability_probe" in guest_probe:
               raise SystemExit("Stage D guest Git probe calls the host C capability probe")
+          if '"sh"' in guest_probe or '"-c"' in guest_probe:
+              raise SystemExit("Stage D guest Git probe bypasses the fixed executable map")
           snapshot_start = adapter.index("static int32_t snapshot_active_process_context_tasks")
           snapshot_end = adapter.index("static void observe_process_tree_after_terminal_barrier")
           snapshot = adapter[snapshot_start:snapshot_end]

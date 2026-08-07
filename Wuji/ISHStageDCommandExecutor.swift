@@ -424,9 +424,12 @@ enum StageDClonePipeline {
         let featureCodes = earliest.sorted {
             $0.value == $1.value ? $0.key.rawValue < $1.key.rawValue : $0.value < $1.value
         }.map(\.key)
+        let projected = projectedCloneCategory(for: featureCodes)
+        let filesystemSubcategory = featureCodes.compactMap(\.filesystemSubcategory).first
         return (
-            projectedCloneCategory(for: featureCodes),
-            featureCodes.compactMap(\.filesystemSubcategory).first,
+            projected,
+            projected == .filesystemFailure || projected == .mixedSignals
+                ? filesystemSubcategory : nil,
             featureCodes
         )
     }
@@ -976,38 +979,141 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
     private func guestGitProbe() async -> StageDGuestGitProbeExecution {
         let root = ".wuji-stage-d-guest-git-probe-v1"
         let repository = "\(root)/repo.git"
-        let commands: [(StageDGuestGitProbeStage, String, [String])] = [
-            (.isolatedRoot, "sh", ["-c", "test ! -e '\(root)' && mkdir -- '\(root)'"]),
-            (.bareRepository, "git", ["init", "--bare", "--quiet", repository]),
-            (.fixedObject, "sh", ["-c", "set -eu; root='\(root)'; repo=\"$root/repo.git\"; blob=$(printf '%s\\n' 'wuji-stage-d-guest-probe-v1' | git --git-dir=\"$repo\" hash-object -w --stdin); printf '%s\\n' \"$blob\" > \"$root/blob-id\"; tree=$(printf '100644 blob %s\\tprobe.txt\\n' \"$blob\" | git --git-dir=\"$repo\" mktree); GIT_AUTHOR_NAME='WujiProbe' GIT_AUTHOR_EMAIL='probe@invalid' GIT_AUTHOR_DATE='2000-01-01T00:00:00Z' GIT_COMMITTER_NAME='WujiProbe' GIT_COMMITTER_EMAIL='probe@invalid' GIT_COMMITTER_DATE='2000-01-01T00:00:00Z' git --git-dir=\"$repo\" commit-tree \"$tree\" -m 'wuji-stage-d-guest-probe-v1' > \"$root/commit-id\""]),
-            (.reference, "sh", ["-c", "set -eu; root='\(root)'; repo=\"$root/repo.git\"; commit=$(cat \"$root/commit-id\"); git --git-dir=\"$repo\" update-ref refs/heads/probe \"$commit\"; git --git-dir=\"$repo\" symbolic-ref HEAD refs/heads/probe"]),
-            (.indexPack, "sh", ["-c", "set -eu; repo='\(repository)'; git --git-dir=\"$repo\" repack -ad; set -- \"$repo\"/objects/pack/*.pack; test \"$#\" -eq 1; test -f \"$1\"; idx=${1%.pack}.idx; test -f \"$idx\"; git --git-dir=\"$repo\" verify-pack -q \"$idx\""]),
-            (.fsckRead, "sh", ["-c", "set -eu; root='\(root)'; repo=\"$root/repo.git\"; git --git-dir=\"$repo\" fsck --full --strict; commit=$(git --git-dir=\"$repo\" rev-parse refs/heads/probe); git --git-dir=\"$repo\" cat-file -e \"$commit^{commit}\"; blob=$(cat \"$root/blob-id\"); test \"$(git --git-dir=\"$repo\" cat-file -p \"$blob\")\" = 'wuji-stage-d-guest-probe-v1'"]),
-            (.nestedDirectory, "sh", ["-c", "set -eu; root='\(root)'; mkdir -p \"$root/nested/level/leaf\"; test -d \"$root/nested/level/leaf\"; rmdir \"$root/nested/level/leaf\" \"$root/nested/level\" \"$root/nested\""]),
-        ]
         var recorded: [StageDGuestGitProbeStepFacts] = []
         var rawSteps: [StageDRawStep] = []
         var stopped = false
-        for (stage, executable, arguments) in commands {
-            if stopped {
-                recorded.append(.init(
-                    stage: stage, state: .notRun, failureCategory: nil, safeFeatureCodes: []
-                ))
-                continue
-            }
-            let execution = await runGuestGitProbeStage(
-                stage: stage, executable: executable, arguments: arguments
-            )
+
+        func append(_ execution: (
+            fact: StageDGuestGitProbeStepFacts,
+            raw: StageDRawStep?
+        )) {
             recorded.append(execution.fact)
             if let raw = execution.raw { rawSteps.append(raw) }
             stopped = execution.fact.state != .succeeded
         }
 
-        let cleanup = await runGuestGitProbeStage(
-            stage: .cleanup,
-            executable: "sh",
-            arguments: ["-c", "set -eu; rm -rf -- '\(root)'; test ! -e '\(root)'"]
+        func execution(
+            _ stage: StageDGuestGitProbeStage,
+            _ executable: String,
+            _ arguments: [String]
+        ) async -> (fact: StageDGuestGitProbeStepFacts, raw: StageDRawStep?) {
+            if stopped {
+                return (.init(
+                    stage: stage, state: .notRun, failureCategory: nil, safeFeatureCodes: []
+                ), nil)
+            }
+            return await runGuestGitProbeStage(
+                stage: stage, executable: executable, arguments: arguments
+            )
+        }
+
+        append(await execution(
+            .isolatedRoot, "git", ["init", "--bare", "--quiet", "\(root)/scaffold.git"]
+        ))
+        append(await execution(
+            .bareRepository, "git", ["init", "--bare", "--quiet", repository]
+        ))
+
+        var objectID: String?
+        var objectExecution = await execution(
+            .fixedObject,
+            "git",
+            ["--git-dir=\(repository)", "hash-object", "-w", "/etc/alpine-release"]
         )
+        if objectExecution.fact.state == .succeeded {
+            let value = objectExecution.raw?.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                ?? ""
+            if Self.validGuestGitObjectID(value) {
+                objectID = value
+            } else {
+                objectExecution = (.init(
+                    stage: .fixedObject, state: .failed, failureCategory: .gitObject,
+                    safeFeatureCodes: []
+                ), objectExecution.raw)
+            }
+        }
+        append(objectExecution)
+
+        append(await execution(
+            .reference,
+            "git",
+            ["--git-dir=\(repository)", "update-ref", "refs/tags/wuji-probe-object", objectID ?? "invalid"]
+        ))
+
+        var packExecution = await execution(
+            .indexPack, "git", ["--git-dir=\(repository)", "repack", "-ad"]
+        )
+        if packExecution.fact.state == .succeeded {
+            if let raw = packExecution.raw { rawSteps.append(raw) }
+            packExecution = await runGuestGitProbeStage(
+                stage: .indexPack,
+                executable: "git",
+                arguments: ["--git-dir=\(repository)", "count-objects", "-v"]
+            )
+            if packExecution.fact.state == .succeeded,
+               !Self.validGuestGitPackSummary(packExecution.raw?.stdout ?? "") {
+                packExecution = (.init(
+                    stage: .indexPack, state: .failed, failureCategory: .gitIndexPack,
+                    safeFeatureCodes: []
+                ), packExecution.raw)
+            }
+        }
+        append(packExecution)
+
+        var fsckExecution = await execution(
+            .fsckRead, "git", ["--git-dir=\(repository)", "fsck", "--full", "--strict"]
+        )
+        if fsckExecution.fact.state == .succeeded {
+            if let raw = fsckExecution.raw { rawSteps.append(raw) }
+            fsckExecution = await runGuestGitProbeStage(
+                stage: .fsckRead,
+                executable: "git",
+                arguments: ["--git-dir=\(repository)", "cat-file", "-p", objectID ?? "invalid"]
+            )
+            if fsckExecution.fact.state == .succeeded,
+               fsckExecution.raw?.stdout != "3.21.0\n" {
+                fsckExecution = (.init(
+                    stage: .fsckRead, state: .failed, failureCategory: .gitFsckRead,
+                    safeFeatureCodes: []
+                ), fsckExecution.raw)
+            }
+        }
+        append(fsckExecution)
+
+        var nestedExecution = await execution(
+            .nestedDirectory,
+            "git",
+            ["init", "--bare", "--quiet", "\(root)/nested/level/leaf.git"]
+        )
+        if nestedExecution.fact.state == .succeeded {
+            if let raw = nestedExecution.raw { rawSteps.append(raw) }
+            nestedExecution = await runGuestGitProbeStage(
+                stage: .nestedDirectory,
+                executable: "git",
+                arguments: ["--git-dir=\(root)/nested/level/leaf.git", "rev-parse", "--is-bare-repository"]
+            )
+            if nestedExecution.fact.state == .succeeded,
+               nestedExecution.raw?.stdout.trimmingCharacters(in: .whitespacesAndNewlines) != "true" {
+                nestedExecution = (.init(
+                    stage: .nestedDirectory, state: .failed,
+                    failureCategory: .nestedDirectory, safeFeatureCodes: []
+                ), nestedExecution.raw)
+            }
+        }
+        append(nestedExecution)
+
+        var cleanup = await runGuestGitProbeStage(
+            stage: .cleanup,
+            executable: "rm",
+            arguments: ["-rf", "--", root]
+        )
+        if cleanup.fact.state == .succeeded,
+           Self.nodeType(at: cloneRootURL.appendingPathComponent(root, isDirectory: true)) != .missing {
+            cleanup = (.init(
+                stage: .cleanup, state: .unknown, failureCategory: .cleanup,
+                safeFeatureCodes: []
+            ), cleanup.raw)
+        }
         recorded.append(cleanup.fact)
         if let raw = cleanup.raw { rawSteps.append(raw) }
         let cleanupVerified = cleanup.fact.state == .succeeded
@@ -1022,6 +1128,23 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
             ),
             steps: rawSteps
         )
+    }
+
+    private static func validGuestGitObjectID(_ value: String) -> Bool {
+        value.utf8.count == 40 && value.unicodeScalars.allSatisfy {
+            CharacterSet(charactersIn: "0123456789abcdef").contains($0)
+        }
+    }
+
+    private static func validGuestGitPackSummary(_ value: String) -> Bool {
+        var counts: [String: Int] = [:]
+        for line in value.split(separator: "\n") {
+            let parts = line.split(separator: ":", maxSplits: 1).map(String.init)
+            if parts.count == 2 {
+                counts[parts[0]] = Int(parts[1].trimmingCharacters(in: .whitespaces))
+            }
+        }
+        return counts["packs"] == 1 && (counts["in-pack"] ?? 0) >= 1
     }
 
     private func runGuestGitProbeStage(

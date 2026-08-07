@@ -624,7 +624,9 @@ actor StageDTaskStore {
             return outcome.safeFeatureCodes.isEmpty
         }
         let projected = StageDClonePipeline.projectedCloneCategory(for: outcome.safeFeatureCodes)
-        let filesystem = outcome.safeFeatureCodes.compactMap(\.filesystemSubcategory).first
+        let matchedFilesystem = outcome.safeFeatureCodes.compactMap(\.filesystemSubcategory).first
+        let filesystem = projected == .filesystemFailure || projected == .mixedSignals
+            ? matchedFilesystem : nil
         if outcome.category == .terminalBarrierFailure {
             return outcome.capturedProcessCategory == projected
                 && outcome.filesystemSubcategory == filesystem
