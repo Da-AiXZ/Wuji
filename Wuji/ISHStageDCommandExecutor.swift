@@ -1008,29 +1008,62 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
         }
 
         append(await execution(
-            .isolatedRoot, "git", ["init", "--bare", "--quiet", "\(root)/scaffold.git"]
+            .isolatedRoot, "git",
+            ["init", "--bare", "--quiet", "--initial-branch=wuji-probe", "\(root)/scaffold.git"]
         ))
         append(await execution(
-            .bareRepository, "git", ["init", "--bare", "--quiet", repository]
+            .bareRepository, "git",
+            ["init", "--bare", "--quiet", "--initial-branch=wuji-probe", repository]
         ))
 
         var objectID: String?
         var objectExecution = await execution(
             .fixedObject,
             "git",
-            ["--git-dir=\(repository)", "hash-object", "-w", "/etc/alpine-release"]
+            ["--git-dir=\(repository)", "hash-object", "\(repository)/HEAD"]
         )
         if objectExecution.fact.state == .succeeded {
             let value = objectExecution.raw?.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
                 ?? ""
             if Self.validGuestGitObjectID(value) {
                 objectID = value
+                if let raw = objectExecution.raw { rawSteps.append(raw) }
+                objectExecution = await runGuestGitProbeStage(
+                    stage: .fixedObject,
+                    executable: "git",
+                    arguments: [
+                        "--git-dir=\(repository)", "hash-object", "-w", "\(repository)/HEAD",
+                    ]
+                )
+                let written = objectExecution.raw?.stdout
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if objectExecution.fact.state != .succeeded || written != value {
+                    objectExecution = (.init(
+                        stage: .fixedObject,
+                        state: objectExecution.fact.state == .unknown ? .unknown : .failed,
+                        failureCategory: objectExecution.fact.failureCategory ?? .gitObject,
+                        safeFeatureCodes: Self.guestGitFeatureCodes(
+                            .guestGitObjectWriteUnavailable,
+                            appending: objectExecution.fact.safeFeatureCodes
+                        )
+                    ), objectExecution.raw)
+                }
             } else {
                 objectExecution = (.init(
                     stage: .fixedObject, state: .failed, failureCategory: .gitObject,
-                    safeFeatureCodes: []
+                    safeFeatureCodes: [.guestGitObjectReadUnavailable]
                 ), objectExecution.raw)
             }
+        } else {
+            objectExecution = (.init(
+                stage: .fixedObject,
+                state: objectExecution.fact.state,
+                failureCategory: objectExecution.fact.failureCategory ?? .gitObject,
+                safeFeatureCodes: Self.guestGitFeatureCodes(
+                    .guestGitObjectReadUnavailable,
+                    appending: objectExecution.fact.safeFeatureCodes
+                )
+            ), objectExecution.raw)
         }
         append(objectExecution)
 
@@ -1134,6 +1167,15 @@ final class ISHStageDCommandExecutor: StageDCommandExecuting, @unchecked Sendabl
         value.utf8.count == 40 && value.unicodeScalars.allSatisfy {
             CharacterSet(charactersIn: "0123456789abcdef").contains($0)
         }
+    }
+
+    private static func guestGitFeatureCodes(
+        _ first: StageDCloneSafeFeatureCode,
+        appending values: [StageDCloneSafeFeatureCode]
+    ) -> [StageDCloneSafeFeatureCode] {
+        var result = [first]
+        for value in values where !result.contains(value) { result.append(value) }
+        return result
     }
 
     private static func validGuestGitPackSummary(_ value: String) -> Bool {

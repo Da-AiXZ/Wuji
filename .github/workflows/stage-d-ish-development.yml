@@ -413,6 +413,7 @@ jobs:
               "StageDCloneCapabilityProbeFacts", "StageDCloneResidualFacts",
               "StageDGuestGitProbeFacts", "StageDGuestGitProbeStage",
               "StageDCloneSafeFeatureCode", "mixed_signals",
+              "guest_git_object_read_unavailable", "guest_git_object_write_unavailable",
               "permission_readonly", "name_path_limit", "filemode_chmod",
               "create_mkdir_open", "destination_state", "capacity_inode",
               "bind_identity", "generic",
@@ -456,7 +457,7 @@ jobs:
           for required in [
               ".wuji-stage-d-guest-git-probe-v1", "git", "init", "--bare",
               "hash-object", "update-ref", "repack", "count-objects",
-              "fsck", "cat-file", "nested/level/leaf.git", "/etc/alpine-release",
+              "fsck", "cat-file", "nested/level/leaf.git", "--initial-branch=wuji-probe",
               "cleanupVerified", "usedGuestRealFSPath",
           ]:
               if required not in guest_probe + contracts:

@@ -344,6 +344,8 @@ enum StageDCloneSafeFeatureCode: String, Codable, CaseIterable, Equatable, Hasha
     case filesystemCapacityInode = "filesystem_capacity_inode"
     case filesystemBindIdentity = "filesystem_bind_identity"
     case filesystemGeneric = "filesystem_generic"
+    case guestGitObjectReadUnavailable = "guest_git_object_read_unavailable"
+    case guestGitObjectWriteUnavailable = "guest_git_object_write_unavailable"
 
     var filesystemSubcategory: StageDCloneFilesystemSubcategory? {
         switch self {
@@ -356,7 +358,8 @@ enum StageDCloneSafeFeatureCode: String, Codable, CaseIterable, Equatable, Hasha
         case .filesystemBindIdentity: return .bindIdentity
         case .filesystemGeneric: return .generic
         case .resolverNetwork, .capabilityUnavailable, .remoteAccess,
-                .checkoutWorktree, .protocolFailure:
+                .checkoutWorktree, .protocolFailure, .guestGitObjectReadUnavailable,
+                .guestGitObjectWriteUnavailable:
             return nil
         }
     }
